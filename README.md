@@ -262,6 +262,45 @@ uv run python -m marvinpro_deploy.frozen_chunk_test_client \
 
 此测试会执行模型产生的动作。必须清空工作区、保持急停可触及，并核对确认页；不要首次使用 `--yes`。
 
+需要隔离 `±0.03 rad` 诊断包络时，可以加载同一个 version 2 JSON 并增加
+`--target-source raw`。客户端会先验证原始节点的硬限位、bridge步长包络、离散速度和加速度，再显示
+最大锚点行程；任一检查超限都不会进入执行。原始节点也应先做15 Hz离散回放，自动回锚并切回None后，
+再做100 Hz插值回放。
+
+```bash
+# Apex Input Mode 先保持 None；准备完成后再按提示切到 Custom
+PYTHONPATH=/home/jh/TianJi_data_collector/MarvinPro_deploy/src \
+uv run python -m marvinpro_deploy.frozen_chunk_test_client \
+  --robot-host 6.6.7.100 \
+  --load-plan /tmp/marvinpro_red_cones_chunk_ab_v2.json \
+  --target-source raw \
+  --playback-mode discrete
+
+# 第一次自动回锚并切回 None 后，再执行第二次
+PYTHONPATH=/home/jh/TianJi_data_collector/MarvinPro_deploy/src \
+uv run python -m marvinpro_deploy.frozen_chunk_test_client \
+  --robot-host 6.6.7.100 \
+  --load-plan /tmp/marvinpro_red_cones_chunk_ab_v2.json \
+  --target-source raw \
+  --playback-mode interpolated
+```
+
+若要验证机器人是否因为跟不上原始时间轴而产生错位，保持 raw 节点和100 Hz插值不变，只把播放时长
+拉长2倍：
+
+```bash
+PYTHONPATH=/home/jh/TianJi_data_collector/MarvinPro_deploy/src \
+uv run python -m marvinpro_deploy.frozen_chunk_test_client \
+  --robot-host 6.6.7.100 \
+  --load-plan /tmp/marvinpro_red_cones_chunk_ab_v2.json \
+  --target-source raw \
+  --playback-mode interpolated \
+  --playback-time-scale 2.0
+```
+
+这会把同一计划从 `0.667 s` 拉长到 `1.333 s`，最大速度减半、最大加速度降为四分之一；参数不允许
+小于 `1.0`，因此不能通过该入口加速计划。
+
 ## 本地测试
 
 ```bash

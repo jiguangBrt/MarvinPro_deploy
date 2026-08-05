@@ -2,10 +2,57 @@
 
 更新时间：2026-08-05
 
-## 当前状态
+## 2026-08-05 收工快照
 
-- 本目录是独立 Git 仓库，基线提交为 `8fb4232 Initial Marvin Pro rollout deployment`。
-- 基线之后新增了以下诊断代码：
+当前排查目标是解释“持续 rollout 几乎每步颤抖”。截至收工，证据不支持把官方低层控制器列为首要
+嫌疑，已经确认或高度怀疑的是以下四个项目侧因素：
+
+1. 15 Hz 离散绝对位置目标形成阶梯输入；改成100 Hz插值后，多项真机指标改善。
+2. 原始policy chunk本身有较高的速度和二阶变化，简单插值只改变发送连续性，不改变轨迹总时长。
+3. 客户端按墙钟推进动作，不等待机器人达到上一目标；原始chunk回放中右臂 `Joint4_R` 出现明显表观
+   跟踪滞后。
+4. 持续rollout的推理约占2至3个15 Hz节点，但新结果到达后仍从 `new[0]` 硬替换旧计划，没有延迟
+   索引补偿、边界连续化或plan underrun消除。
+
+当前尚不能下的结论：
+
+- 不能把报告的 `apparent tracking error` 直接解释为低层伺服误差；约11 Hz相机采样和传输相位包含
+  在该数值内。
+- 没有证据表明官方Home的 `0.5 rad/s^2` 规划上限也是 `marvin_robot_node` 的硬截断上限；Custom
+  路径绕过了Home轨迹规划器。
+- `24/140` 是冻结诊断客户端 `±0.03 rad` 包络产生的裁剪，不是bridge裁剪。bridge对超出实时反馈
+  `±0.12 rad` 的命令会拒绝而非修改；本次raw计划没有触发该拒绝条件。
+- 单个冻结chunk的结果不足以证明所有模型输出都过快；应先完成同一chunk的时间尺度对照。
+
+用于明日严格复现的计划已经从 `/tmp` 固化到：
+
+```text
+/home/jh/TianJi_data_collector/MarvinPro_deploy/artifacts/marvinpro_red_cones_chunk_ab_v2.json
+SHA-256: e72510cbba1a4a18517bbb7b76de81d9847128fc0907558f56b5ac662e11c6d0
+```
+
+该文件包含同一次推理的原始节点和有界节点，明日不要重新捕获计划，否则无法与今晚数据做严格对照。
+保存的锚点按 `Joint1_L..Joint7_L, Joint1_R..Joint7_R` 排列为：
+
+```text
+[1.697043, -1.101982, -1.091558, -1.995128, -0.374360, 0.135180, 0.554539,
+ -1.706437, -1.094713, 1.097878, -1.990542, 0.378431, 0.137912, -0.551586]
+```
+
+若机器人不在该姿态的 `0.01 rad` 内，客户端会在发动作前退出；不要通过放宽门控强行执行，应先用
+Apex的安全方式回到测试姿态，或明确放弃严格同计划对照并重新建立一套基线。
+
+## 代码与运行状态
+
+- 本目录是独立 Git 仓库；此前诊断提交为 `11a1aac Add motion smoothness diagnostics`，更早基线为
+  `8fb4232 Initial Marvin Pro rollout deployment`。
+- 本次收工快照包含：
+  - `frozen_chunk_test_client.py`：增加 `--target-source raw` 和只允许放慢的
+    `--playback-time-scale`。
+  - `README.md`：增加raw回放和2倍慢速回放命令。
+  - `_HANDOFF.md`：本次实验数据和明日计划。
+  - `artifacts/marvinpro_red_cones_chunk_ab_v2.json`：固定的version 2 A/B计划。
+- 已提交的诊断代码包括：
   - `src/marvinpro_deploy/hold_test_client.py`
   - `src/marvinpro_deploy/motion_profile.py`
   - `src/marvinpro_deploy/trajectory_test_client.py`
@@ -27,6 +74,10 @@
   - Apex Input Mode Custom：`input_mode=3`
   - 关节阻抗模式：`robot_state=(3, 3)`、`arm_state=(3, 3)`
   - 旧文档中的 `(2, 2)` 不适用于当前控制器。
+- 训练数据集 `stack_red_cones/meta/info.json` 明确记录 `fps=15`，三路视频也均为15 Hz。因此将模型
+  节点解释为15 Hz时间语义是有数据依据的；这不代表机器人必须用15 Hz阶梯位置命令执行节点。
+- bridge的完整policy观测在 `/quad_tile/compressed` 回调中形成，实测相机约 `11.4 Hz`；关节状态
+  虽约96 Hz，但交给policy和客户端统计的是图像时刻锁存的最新关节状态。
 
 ## 已确认的控制链
 
@@ -168,6 +219,27 @@ jerk 轨迹：`0 -> +0.04 -> -0.04 -> 0 rad`。第一组客户端命令更新为
 因果因素；但插值后最大观测加速度仍高于官方Home限制，且跟踪误差仍明显，说明只提高频率不能完整
 解决问题。
 
+随后绕过 `±0.03 rad` 诊断裁剪，直接回放相同JSON中的原始policy节点。原始计划相对锚点最大行程
+`0.095436 rad`、最大相邻差 `0.013171 rad`，位于bridge的 `0.12 rad` 实时拒绝包络和URDF硬限位内。
+24个裁剪值实际影响后7/10个节点，集中在右臂五个关节。
+
+| 指标 | raw 15 Hz离散 | raw 100 Hz插值 | 变化 |
+| --- | ---: | ---: | ---: |
+| 观测单步p95 | `0.004223 rad` | `0.004060 rad` | 降低约 `3.9%` |
+| 观测单步最大值 | `0.007870 rad` | `0.007912 rad` | 基本不变 |
+| 速度p95 | `0.063115 rad/s` | `0.067246 rad/s` | 增加约 `6.5%` |
+| 速度最大值 | `0.128952 rad/s` | `0.155151 rad/s` | 增加约 `20.3%` |
+| 加速度p95 | `0.430085 rad/s^2` | `0.400496 rad/s^2` | 降低约 `6.9%` |
+| 加速度最大值 | `0.749478 rad/s^2` | `0.758374 rad/s^2` | 基本不变 |
+| 表观跟踪误差RMS | `0.018937 rad` | `0.012923 rad` | 降低约 `31.8%` |
+| 表观跟踪误差最大值 | `0.069384 rad` | `0.050226 rad` | 降低约 `27.6%` |
+| 自动回锚最大误差 | `0.003479 rad` | `0.002678 rad` | 降低约 `23.0%` |
+
+raw两组最大表观误差都转移到 `Joint4_R`。插值显著改善跟踪误差，却没有降低速度/加速度峰值，说明
+原始计划的时间尺度和右臂跟踪滞后比 `±0.03 rad` 裁剪更值得怀疑。报告中的表观误差把相机采样延迟
+包含在内，不能视为低层伺服器的精确误差；下一项隔离测试是保持raw节点与100 Hz插值不变，仅用
+`--playback-time-scale 2.0` 将总时长从 `0.667 s` 拉长至 `1.333 s`。
+
 结合此前重规划边界离线诊断，当前已确认三个相互叠加的项目侧原因：
 
 1. 15 Hz离散绝对目标形成阶梯输入。
@@ -200,69 +272,102 @@ uv run python -m marvinpro_deploy.hold_test_client \
 `HOLD`。测试结束后必须先在 Apex 切回 None。异常时优先切 None 或急停，不把 `Ctrl+C` 作为正常
 停机步骤。
 
-## 下一步实施
+## 明日测试顺序
 
-暂时不要先修改官方控制器，也不要直接给模型输出加低通滤波。确定性慢速轨迹测试已经完成，结果确认
-15 Hz 离散目标更新是一个实际因素。
+### 1. 第一优先级：原始chunk的2倍慢速对照
 
-确定性轨迹的复现命令如下；先用 `--command-hz 15`，再在相同姿态改为 `100`：
+测试问题：在节点、路径、100 Hz插值、bridge和官方控制链全部不变时，只把轨迹时间拉长2倍，右臂
+跟踪和主观平滑度是否明显改善？这是当前用于验证“机器人执行跟不上计划时间轴”的最小变量实验。
 
-```bash
-cd /home/jh/OpenPI_UR/openpi
-PYTHONPATH=/home/jh/TianJi_data_collector/MarvinPro_deploy/src \
-uv run python -m marvinpro_deploy.trajectory_test_client \
-  --robot-host 6.6.7.100 \
-  --command-hz 15
-```
-
-真实冻结policy chunk对照已经完成。下一阶段不再需要扩大真机诊断幅度，应转为实现并分项验证：
-
-1. 保持模型节点的15 Hz时间语义，在节点间生成100 Hz目标。
-2. 用速度、加速度和jerk受限的轨迹整形代替逐点硬裁剪。
-3. 按推理耗时选择新chunk的时间索引，并在旧计划与新计划之间做连续衔接，而不是从 `new[0]` 硬替换。
-4. 每项均应有独立开关和日志，先短时真机测试，再组合启用。
-
-冻结 chunk 客户端现已改为严格 A/B。它在 Input Mode None 时 warmup 并冻结一次真实 policy 输出；
-夹爪保持不变；JSON 同时保存原始 policy 节点和限制在推理姿态 `±0.03 rad` 的实际回放节点，并分别
-报告两者的离散速度/加速度。第一次按 15 Hz 离散发送有界节点，自动返回锚点；第二次加载同一个 JSON，
-保持相同模型时间轴，以 100 Hz 线性插值发送同一组有界节点。
-
-2026-08-05 只读检查了已有的 `/tmp/marvinpro_red_cones_chunk_ab.json`：该文件创建于 18:00:37，
-早于随后 18:02 的捕获尝试，是旧的 version 1 格式。其有界计划在 140 个手臂节点值中裁剪了 23 个，
-离散最大速度 `0.181587 rad/s`，最大加速度 `2.423854 rad/s^2`；后者超过诊断安全上限
-`2.0 rad/s^2`，不得直接执行。计划格式已升级到 version 2，同时保存原始 policy 节点和有界回放
-节点并分别报告动态统计。旧 version 1 文件会被明确拒绝加载，新实验使用 `_v2.json` 文件名。
-
-第一次捕获并离散回放：
+前置条件：bridge继续以 `--allow-motion --publish-hz 100` 运行；Apex先保持Input Mode None；机器人
+回到与保存计划相符的锚点附近，客户端会检查最大姿态漂移 `0.01 rad`。
 
 ```bash
 cd /home/jh/OpenPI_UR/openpi
+
 PYTHONPATH=/home/jh/TianJi_data_collector/MarvinPro_deploy/src \
 uv run python -m marvinpro_deploy.frozen_chunk_test_client \
   --robot-host 6.6.7.100 \
-  --policy-host 192.168.50.73 \
-  --capture-plan /tmp/marvinpro_red_cones_chunk_ab_v2.json \
-  --playback-mode discrete
+  --load-plan /home/jh/TianJi_data_collector/MarvinPro_deploy/artifacts/marvinpro_red_cones_chunk_ab_v2.json \
+  --target-source raw \
+  --playback-mode interpolated \
+  --playback-time-scale 2.0
 ```
 
-回到 None 后加载同一计划做插值回放：
+确认页应显示：
 
-```bash
-PYTHONPATH=/home/jh/TianJi_data_collector/MarvinPro_deploy/src \
-uv run python -m marvinpro_deploy.frozen_chunk_test_client \
-  --robot-host 6.6.7.100 \
-  --load-plan /tmp/marvinpro_red_cones_chunk_ab_v2.json \
-  --playback-mode interpolated
-```
+- `target source: raw`
+- `playback time scale: 2.00x`
+- `effective knot rate: 7.50Hz`
+- `playback duration: 1.333s`
+- `selected effective max velocity: 0.09878rad/s`
+- `selected effective max acceleration: 0.25436rad/s^2`
 
-不要把提高频率单独解释成完整修复方案；冻结chunk A/B已经证明插值有效但不足。
+输入 `INTERPOLATE` 后观察，等待自动回锚完成再切回None。需要保存完整报告，同时人工记录：是否仍有
+逐点颤抖、主要发生在哪条手臂/哪个阶段、相对今晚1倍速是否明显改善。
+
+对照基线是今晚的raw 100 Hz、1倍速结果：
+
+| 指标 | 1倍速基线 | 2倍速待测 |
+| --- | ---: | ---: |
+| 唯一观测样本 | `13` | 待填 |
+| 观测单步p95 | `0.004060 rad` | 待填 |
+| 观测单步最大值 | `0.007912 rad` | 待填 |
+| 速度p95 | `0.067246 rad/s` | 待填 |
+| 速度最大值 | `0.155151 rad/s` | 待填 |
+| 加速度p95 | `0.400496 rad/s^2` | 待填 |
+| 加速度最大值 | `0.758374 rad/s^2` | 待填 |
+| 表观跟踪误差RMS | `0.012923 rad` | 待填 |
+| 表观跟踪误差最大值 | `0.050226 rad (Joint4_R)` | 待填 |
+| 自动回锚最大误差 | `0.002678 rad` | 待填 |
+
+判据：若主观颤抖、RMS和 `Joint4_R` 最大误差均明显下降，则原始时间尺度下的跟踪滞后得到支持；
+若仅表观误差变化而主观运动无改善，需要先改进高频目标/反馈配对测量；若完全不改善，则转向对
+`Joint4_R` 做无policy的确定性轨迹对照，检查关节负载或阻抗响应。
+
+### 2. 第二优先级：持续rollout重规划边界
+
+第一项完成前不要同时修改轨迹形状和重规划逻辑。之后先增加只读日志，不立即改变真机动作：
+
+1. 每次推理记录观测年龄、端到端推理耗时及其折算的15 Hz节点数。
+2. 记录被替换时旧计划剩余节点、上一已发送目标，以及 `new[0..4]` 分别与当前目标的边界差。
+3. 记录每次 `action plan empty`、measured-pose hold持续时间和新计划恢复时的跳变量。
+4. 记录机器人反馈与上一实际发送目标的误差，避免再把“即将发送的目标”当作同步目标。
+
+只读数据确认后再做单变量A/B：先仅按推理延迟选择 `new[k]`，不做滤波；然后再单独增加旧/新计划
+边界连续化。每项必须能通过命令行开关恢复旧行为，并先做dry-run边界统计，再做短时真机测试。
+
+### 3. 后续修复顺序
+
+若前两项证实时间尺度和重规划均有贡献，实施顺序为：
+
+1. 保持模型15 Hz语义，在节点之间输出100 Hz连续目标。
+2. 用延迟对应的新chunk索引替代固定 `new[0]`。
+3. 消除plan underrun造成的“测量姿态hold -> 新计划”切换。
+4. 最后才引入速度、加速度和jerk受限整形；不要再使用逐点硬裁剪作为轨迹整形器。
+
+暂时不要修改官方控制器参数，也不要把提高bridge频率单独解释成完整修复。恒定保持已经证明官方链路
+能够稳定保持，冻结chunk则证明100 Hz插值有效但不足。
+
+### 旧计划文件说明
+
+`/tmp/marvinpro_red_cones_chunk_ab.json` 是version 1旧文件，其有界计划裁剪23/140个手臂节点值，
+最大速度 `0.181587 rad/s`、最大加速度 `2.423854 rad/s^2`，超过诊断安全上限，客户端会拒绝加载。
+明日只使用仓库 `artifacts/` 下SHA-256已记录的version 2文件。
 
 ## 已完成验证
 
 - `ruff check src tests`：通过。
 - `python3 -m unittest discover -s tests -v`：19 项通过。
+- `python3 -m py_compile src/marvinpro_deploy/frozen_chunk_test_client.py`：通过。
+- `--playback-time-scale 2.0` 参数解析通过；小于 `1.0` 的加速请求会在连接机器人前拒绝。
+- 固化后的version 2计划通过JSON解析，大小 `9169 bytes`，且SHA-256与今晚实际执行的 `/tmp` 文件一致。
 - 本地假 bridge 集成测试：收到 13 条恒定目标命令，16 维目标逐值完全一致；Input Mode 离开 Custom
   后客户端自动停止并输出统计。
 - 本地假 bridge 轨迹测试：收到 41 条命令，只有指定关节发生变化，覆盖预期正负幅度并严格返回起点。
 - 本地冻结 chunk A/B 集成测试：离散阶段只发送保存的模型节点，插值阶段发送节点间目标；两次使用
   同一个 JSON 计划并自动返回相同锚点。
+- raw源假bridge集成测试确认客户端选择未裁剪节点，同时仍执行硬限位、bridge包络和动态上限检查，
+  并在结束后返回锚点。
+
+截至收工尚未执行 `--playback-time-scale 2.0` 真机测试；这是明日第一项，不要把它误记为已完成。

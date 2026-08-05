@@ -1,8 +1,8 @@
 """A/B playback of one saved OpenPI action chunk without replanning.
 
-Capture mode calls the policy once while Apex Input Mode is None and saves a
-bounded JSON plan. Replay the same plan first as discrete 15 Hz targets, then
-from the same anchor pose with 100 Hz linear interpolation.
+Capture mode calls the policy once while Apex Input Mode is None and saves both
+raw and bounded JSON plans. Replay either source first as discrete 15 Hz
+targets, then from the same anchor pose with 100 Hz linear interpolation.
 """
 
 from __future__ import annotations
@@ -174,16 +174,20 @@ def _confirm(
     *,
     raw_stats: ChunkStats,
     playback_stats: ChunkStats,
+    selected_stats: ChunkStats,
     clipped_values: int,
     plan_duration: float,
     model_hz: float,
+    effective_knot_hz: float,
     prompt: str,
     anchor_drift: float,
+    max_anchor_excursion: float,
     bridge_publish_hz: float,
     inference_wall_ms: float | None,
 ) -> None:
     print("\nFROZEN POLICY CHUNK A/B TEST")
     print(f"  playback mode: {args.playback_mode}")
+    print(f"  target source: {args.target_source}")
     print(f"  plan file: {args.capture_plan or args.load_plan}")
     print(f"  prompt: {prompt}")
     print(f"  input_mode: {observation.input_mode}")
@@ -191,17 +195,22 @@ def _confirm(
     print(f"  arm_state: {observation.arm_state}")
     print(f"  bridge publish rate: {bridge_publish_hz:.1f}Hz")
     print(f"  model knot rate: {model_hz:.1f}Hz")
-    playback_hz = model_hz if args.playback_mode == "discrete" else args.command_hz
+    print(f"  playback time scale: {args.playback_time_scale:.2f}x")
+    print(f"  effective knot rate: {effective_knot_hz:.2f}Hz")
+    playback_hz = effective_knot_hz if args.playback_mode == "discrete" else args.command_hz
     print(f"  playback target update rate: {playback_hz:.1f}Hz")
     print(f"  interpolation/return command rate: {args.command_hz:.1f}Hz")
     print(f"  playback duration: {plan_duration:.3f}s")
     if inference_wall_ms is not None:
         print(f"  policy inference wall time: {inference_wall_ms:.1f}ms")
     print(f"  max pose drift from saved anchor: {anchor_drift:.6f}rad")
+    print(f"  selected-plan max anchor excursion: {max_anchor_excursion:.6f}rad")
     print(f"  raw policy max velocity: {raw_stats.max_velocity:.5f}rad/s")
     print(f"  raw policy max acceleration: {raw_stats.max_acceleration:.5f}rad/s^2")
     print(f"  bounded playback max velocity: {playback_stats.max_velocity:.5f}rad/s")
     print(f"  bounded playback max acceleration: {playback_stats.max_acceleration:.5f}rad/s^2")
+    print(f"  selected effective max velocity: {selected_stats.max_velocity:.5f}rad/s")
+    print(f"  selected effective max acceleration: {selected_stats.max_acceleration:.5f}rad/s^2")
     print(f"  arm knot values clipped during capture: {clipped_values}")
     print("  grippers stay fixed; no policy replanning occurs.")
     print(f"  after playback the robot automatically returns to the anchor in {args.return_seconds:.1f}s.")
@@ -361,6 +370,7 @@ def _return_to_anchor(
 
 def _print_report(
     mode: str,
+    playback_time_scale: float,
     samples: list[ChunkSample],
     anchor: tuple[float, ...],
     final_joints: tuple[float, ...] | None,
@@ -393,6 +403,7 @@ def _print_report(
     worst_flat = int(np.argmax(np.abs(apparent_error)))
     worst_joint = JOINT_NAMES[worst_flat % len(JOINT_NAMES)]
     print(f"\nFrozen policy chunk report ({mode})")
+    print(f"  playback time scale: {playback_time_scale:.2f}x")
     print(f"  unique observation samples: {len(samples)}")
     print(f"  observed step |dq|: p95={percentile(increments, 95):.6f}, "
           f"max={percentile(increments, 100):.6f} rad")
@@ -463,18 +474,18 @@ def run(args: argparse.Namespace) -> int:
                 anchor_observation.gripper_raw_left,
                 anchor_observation.gripper_raw_right,
             )
-            raw_knots, knots, clipped_values = _prepare_knots(
+            raw_knots, bounded_knots, clipped_values = _prepare_knots(
                 actions, anchor, anchor_observation.joints, args
             )
             raw_stats = _chunk_stats(raw_knots, args.model_hz)
-            playback_stats = _chunk_stats(knots, args.model_hz)
+            bounded_stats = _chunk_stats(bounded_knots, args.model_hz)
             model_hz = args.model_hz
             prompt = args.prompt
             plan_path = Path(args.capture_plan)
             _write_plan(
                 plan_path,
                 raw_knots=raw_knots,
-                playback_knots=knots,
+                playback_knots=bounded_knots,
                 model_hz=model_hz,
                 prompt=prompt,
                 clipped_values=clipped_values,
@@ -483,46 +494,65 @@ def run(args: argparse.Namespace) -> int:
             LOGGER.info("saved frozen plan to %s", plan_path)
         else:
             plan_path = Path(args.load_plan)
-            raw_knots, knots, model_hz, clipped_values, prompt = _read_plan(plan_path)
+            raw_knots, bounded_knots, model_hz, clipped_values, prompt = _read_plan(plan_path)
             raw_knots = _replace_grippers(raw_knots, current_action)
-            anchor = knots[0]
-            knots = _replace_grippers(knots, current_action)
-            anchor = knots[0]
+            bounded_knots = _replace_grippers(bounded_knots, current_action)
+            anchor = bounded_knots[0]
             raw_stats = _chunk_stats(raw_knots, model_hz)
-            playback_stats = _chunk_stats(knots, model_hz)
-            anchor_joints = action_arms(anchor)
-            for knot in knots:
-                validate_action(
-                    knot,
-                    anchor_joints,
-                    max_joint_step_rad=0.08,
-                    joint_limit_margin_rad=args.joint_limit_margin_rad,
-                )
+            bounded_stats = _chunk_stats(bounded_knots, model_hz)
+
+        if args.target_source == "raw":
+            knots = raw_knots
+        else:
+            knots = bounded_knots
+        effective_knot_hz = model_hz / args.playback_time_scale
+        selected_stats = _chunk_stats(knots, effective_knot_hz)
+        anchor = knots[0]
+        anchor_joints = action_arms(anchor)
+        for knot in knots:
+            validate_action(
+                knot,
+                anchor_joints,
+                max_joint_step_rad=hello.max_joint_step_rad,
+                joint_limit_margin_rad=args.joint_limit_margin_rad,
+            )
+        selected_arms = np.asarray([action_arms(knot) for knot in knots], dtype=np.float64)
+        max_anchor_excursion = float(
+            np.max(np.abs(selected_arms - selected_arms[0]))
+        )
 
         LOGGER.info(
-            "frozen dynamics: raw max_velocity=%.5frad/s max_acceleration=%.5frad/s^2; "
-            "bounded max_velocity=%.5frad/s max_acceleration=%.5frad/s^2; clipped=%d/%d",
+            "frozen dynamics: source=%s time_scale=%.2fx max_excursion=%.5frad; "
+            "raw max_velocity=%.5frad/s max_acceleration=%.5frad/s^2; "
+            "bounded max_velocity=%.5frad/s max_acceleration=%.5frad/s^2; "
+            "selected effective max_velocity=%.5frad/s max_acceleration=%.5frad/s^2; "
+            "clipped=%d/%d",
+            args.target_source,
+            args.playback_time_scale,
+            max_anchor_excursion,
             raw_stats.max_velocity,
             raw_stats.max_acceleration,
-            playback_stats.max_velocity,
-            playback_stats.max_acceleration,
+            bounded_stats.max_velocity,
+            bounded_stats.max_acceleration,
+            selected_stats.max_velocity,
+            selected_stats.max_acceleration,
             clipped_values,
             (len(knots) - 1) * 14,
         )
-        if playback_stats.max_velocity > args.safety_max_velocity_rad_s + 1e-9:
+        if selected_stats.max_velocity > args.safety_max_velocity_rad_s + 1e-9:
             raise RolloutError(
-                f"bounded chunk max velocity {playback_stats.max_velocity:.5f}rad/s exceeds "
+                f"selected chunk max velocity {selected_stats.max_velocity:.5f}rad/s exceeds "
                 f"diagnostic safety cap "
                 f"{args.safety_max_velocity_rad_s:.5f}rad/s; plan was not executed"
             )
-        if playback_stats.max_acceleration > args.safety_max_acceleration_rad_s2 + 1e-9:
+        if selected_stats.max_acceleration > args.safety_max_acceleration_rad_s2 + 1e-9:
             raise RolloutError(
-                f"bounded chunk max acceleration {playback_stats.max_acceleration:.5f}rad/s^2 "
+                f"selected chunk max acceleration {selected_stats.max_acceleration:.5f}rad/s^2 "
                 f"exceeds diagnostic safety cap {args.safety_max_acceleration_rad_s2:.5f}rad/s^2; "
                 "plan was not executed"
             )
 
-        plan = FrozenLinearPlan(knots, model_hz)
+        plan = FrozenLinearPlan(knots, effective_knot_hz)
         current = connection.latest(args.max_observation_age)
         pre_gate_drift = float(
             np.max(np.abs(np.asarray(current.joints) - np.asarray(action_arms(anchor))))
@@ -548,12 +578,15 @@ def run(args: argparse.Namespace) -> int:
             args,
             ready,
             raw_stats=raw_stats,
-            playback_stats=playback_stats,
+            playback_stats=bounded_stats,
+            selected_stats=selected_stats,
             clipped_values=clipped_values,
             plan_duration=plan.duration,
             model_hz=model_hz,
+            effective_knot_hz=effective_knot_hz,
             prompt=prompt,
             anchor_drift=anchor_drift,
+            max_anchor_excursion=max_anchor_excursion,
             bridge_publish_hz=hello.publish_hz,
             inference_wall_ms=inference_wall_ms,
         )
@@ -561,7 +594,7 @@ def run(args: argparse.Namespace) -> int:
         command_id = _settle_at_anchor(connection, args, 0, anchor)
         if args.playback_mode == "discrete":
             command_id = _play_discrete(
-                connection, args, knots, model_hz, command_id, samples
+                connection, args, knots, effective_knot_hz, command_id, samples
             )
         else:
             command_id = _play_interpolated(connection, args, plan, command_id, samples)
@@ -597,7 +630,7 @@ def run(args: argparse.Namespace) -> int:
             time.sleep(1.0 / args.command_hz)
 
         LOGGER.info("Input Mode is no longer Custom; disconnecting frozen chunk client")
-        _print_report(args.playback_mode, samples, anchor, final_joints)
+        _print_report(args.playback_mode, args.playback_time_scale, samples, anchor, final_joints)
         return 0
     except KeyboardInterrupt:
         reason = "operator interrupted frozen chunk test"
@@ -606,19 +639,19 @@ def run(args: argparse.Namespace) -> int:
             reason,
         )
         if anchor is not None:
-            _print_report(args.playback_mode, samples, anchor, final_joints)
+            _print_report(args.playback_mode, args.playback_time_scale, samples, anchor, final_joints)
         return 130
     except (ConnectionError, OSError, ProtocolError, RolloutError, SafetyError, ValueError) as exc:
         reason = f"frozen chunk test aborted: {exc}"
         LOGGER.error(reason)
         if anchor is not None:
-            _print_report(args.playback_mode, samples, anchor, final_joints)
+            _print_report(args.playback_mode, args.playback_time_scale, samples, anchor, final_joints)
         return 1
     except Exception as exc:
         reason = f"frozen chunk test aborted by unexpected error: {exc}"
         LOGGER.exception(reason)
         if anchor is not None:
-            _print_report(args.playback_mode, samples, anchor, final_joints)
+            _print_report(args.playback_mode, args.playback_time_scale, samples, anchor, final_joints)
         return 1
     finally:
         if connection is not None:
@@ -637,6 +670,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     source.add_argument("--load-plan", help="load the exact JSON plan captured by the first run")
     parser.add_argument("--overwrite-plan", action="store_true")
     parser.add_argument("--playback-mode", choices=("discrete", "interpolated"), required=True)
+    parser.add_argument("--target-source", choices=("bounded", "raw"), default="bounded")
+    parser.add_argument(
+        "--playback-time-scale",
+        type=float,
+        default=1.0,
+        help="stretch playback duration by this factor; values below 1 (speed-up) are rejected",
+    )
     parser.add_argument("--chunk-steps", type=int, default=10)
     parser.add_argument("--model-hz", type=float, default=15.0)
     parser.add_argument("--command-hz", type=float, default=100.0)
@@ -662,6 +702,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("chunk-steps must be in [1, 10]")
     positive = (
         args.model_hz,
+        args.playback_time_scale,
         args.command_hz,
         args.min_bridge_hz,
         args.max_model_offset_rad,
@@ -674,6 +715,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     if any(value <= 0 for value in positive):
         parser.error("rates, limits, durations, and timeouts must be positive")
+    if args.playback_time_scale < 1.0:
+        parser.error("playback-time-scale must be at least 1.0; this diagnostic cannot speed up plans")
     if args.max_model_offset_rad > 0.08:
         parser.error("max-model-offset-rad must not exceed 0.08")
     if args.command_hz < args.min_bridge_hz:
