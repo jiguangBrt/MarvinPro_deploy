@@ -157,6 +157,111 @@ hold，不会重复执行过时的预测动作。
 
 bridge 使用 pickle 传输 JPEG 和数据结构，只能暴露在可信的机器人私有网络，不应映射到公网。
 
+## 锁存姿态保持诊断
+
+该测试不连接 policy server。客户端只在开始时读取一次当前姿态，之后持续发送完全相同的绝对关节
+目标，用于区分 Custom/bridge 控制链抖动和模型轨迹抖动。
+
+先启动允许控制的 bridge。在 Apex 完成关节阻抗模式，但暂时保持 Input Mode 为 None：
+
+```bash
+cd /home/jh/TianJi_data_collector/MarvinPro_deploy
+./scripts/run_bridge_on_controller.sh --allow-motion
+```
+
+另一个终端运行：
+
+```bash
+cd /home/jh/OpenPI_UR/openpi
+PYTHONPATH=/home/jh/TianJi_data_collector/MarvinPro_deploy/src \
+uv run python -m marvinpro_deploy.hold_test_client \
+  --robot-host 6.6.7.100 \
+  --duration 10
+```
+
+客户端显示正在等待后，把 Apex Input Mode 切到 Custom。核对屏幕上的模式和锁存关节值，现场安全后
+输入 `HOLD`。10 秒结束时客户端会继续发送同一个目标；此时先在 Apex 把 Input Mode 切回 None。
+客户端检测到后退出并打印各关节峰峰值、标准差和最大跟踪误差。异常时优先切回 None 或使用急停，
+不要依赖 `Ctrl+C` 作为正常停止步骤。
+
+第一次使用默认的 15 Hz bridge。切回 None、停止 bridge 后，可以用 100 Hz 重复相同测试：
+
+```bash
+./scripts/run_bridge_on_controller.sh --allow-motion --publish-hz 100
+```
+
+如果 15 Hz 抖动而 100 Hz 明显改善，bridge 的低频目标发布是主要因素；如果两次都稳定，而 rollout
+会抖，问题位于模型动作或重规划衔接；如果两次恒定目标都抖，则继续检查 Custom 控制链和阻抗参数。
+
+## 确定性慢速轨迹诊断
+
+该测试同样不连接 policy server。保持 bridge 以 100 Hz 运行，默认只让 `Joint7_L` 在当前姿态附近按
+最小 jerk 曲线完成 `0 -> +0.04 -> -0.04 -> 0 rad`，总时长 8 秒。理论峰值速度
+`0.0375 rad/s`、峰值加速度小于 `0.06 rad/s^2`，均低于官方 Home 限制。
+
+先用 15 Hz 客户端目标更新运行：
+
+```bash
+cd /home/jh/OpenPI_UR/openpi
+PYTHONPATH=/home/jh/TianJi_data_collector/MarvinPro_deploy/src \
+uv run python -m marvinpro_deploy.trajectory_test_client \
+  --robot-host 6.6.7.100 \
+  --command-hz 15
+```
+
+客户端等待时将 Apex 切到 Custom，核对目标关节、幅度、bridge 频率和状态后输入 `MOVE`。轨迹返回
+起点后，先将 Apex 切回 None。随后使用完全相同的姿态和参数，把 `--command-hz` 改为 `100` 再做一次。
+
+- 15 Hz 有阶梯顿挫而 100 Hz 平滑：客户端目标更新离散度是主要因素。
+- 两次确定性轨迹都平滑，但 rollout 抖：模型动作或异步重规划衔接是主要因素。
+- 100 Hz 确定性轨迹仍抖：继续检查 bridge/ROS 动态指令路径和阻抗响应。
+
+不要使用 `--yes` 跳过首次真机确认。异常时优先切回 None 或急停。
+
+## 单个冻结 Policy Chunk 诊断
+
+该测试连接真实 policy，但只保存一次 10 步输出，执行期间不再推理、不替换 chunk，并保持夹爪目标不变。
+JSON 同时保存原始 policy 节点和限制在推理姿态 `±0.03 rad` 的实际回放节点。先按 15 Hz 直接发送
+有界回放节点，自动用最小 jerk 返回推理姿态；再加载同一个 JSON，以相同 15 Hz 时间轴做 100 Hz
+线性插值回放。
+两次的模型目标和总时长相同，唯一变量是目标更新方式。
+
+保持 bridge 为 100 Hz，Apex Input Mode 先设为 None，然后运行：
+
+```bash
+cd /home/jh/OpenPI_UR/openpi
+PYTHONPATH=/home/jh/TianJi_data_collector/MarvinPro_deploy/src \
+uv run python -m marvinpro_deploy.frozen_chunk_test_client \
+  --robot-host 6.6.7.100 \
+  --policy-host 192.168.50.73 \
+  --capture-plan /tmp/marvinpro_red_cones_chunk_ab_v2.json \
+  --playback-mode discrete
+```
+
+客户端完成 warmup 和冻结推理后会提示切换 Custom。切换后核对原始 policy 与有界回放各自的离散
+速度、加速度、裁剪数量和姿态漂移，再输入 `DISCRETE`。程序按 15 Hz 回放，然后用 2 秒最小 jerk
+轨迹自动返回推理姿态；看到提示后切回 None。若计划超过诊断安全上限 `0.45 rad/s` 或
+`2.0 rad/s^2`，程序只保存 JSON 并拒绝运动。
+
+回到 None 后，从同一姿态加载完全相同的计划：
+
+```bash
+PYTHONPATH=/home/jh/TianJi_data_collector/MarvinPro_deploy/src \
+uv run python -m marvinpro_deploy.frozen_chunk_test_client \
+  --robot-host 6.6.7.100 \
+  --load-plan /tmp/marvinpro_red_cones_chunk_ab_v2.json \
+  --playback-mode interpolated
+```
+
+切到 Custom 并核对确认页后输入 `INTERPOLATE`。第二次保持同样的模型 15 Hz 时间语义，只把相邻节点
+之间细分为 100 Hz 目标，结束后同样自动返回锚点，再切回 None。
+
+- 15 Hz 离散回放抖、100 Hz 插值平滑：低频阶梯目标是该 chunk 不平滑的主要因素。
+- 两次都抖：模型 chunk 自身的节点变化或简单线性插值仍不合适，需要速度/加速度/jerk 轨迹整形。
+- 两次都平滑而持续 rollout 抖：异步重规划延迟和 chunk 边界替换是主要因素。
+
+此测试会执行模型产生的动作。必须清空工作区、保持急停可触及，并核对确认页；不要首次使用 `--yes`。
+
 ## 本地测试
 
 ```bash

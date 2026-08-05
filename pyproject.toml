@@ -12,6 +12,9 @@ dependencies = [
 [project.scripts]
 marvinpro-rollout = "marvinpro_deploy.rollout_client:main"
 marvinpro-bridge = "marvinpro_deploy.robot_bridge:main"
+marvinpro-hold-test = "marvinpro_deploy.hold_test_client:main"
+marvinpro-trajectory-test = "marvinpro_deploy.trajectory_test_client:main"
+marvinpro-frozen-chunk-test = "marvinpro_deploy.frozen_chunk_test_client:main"
 
 [build-system]
 requires = ["hatchling"]
