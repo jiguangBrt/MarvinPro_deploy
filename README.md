@@ -122,9 +122,9 @@ uv run python -m marvinpro_deploy.rollout_client \
   --episode-seconds 5
 ```
 
-程序打印实机状态后，必须手动输入 `EXECUTE` 才开始动作。5 秒动作结束后客户端会持续发送当前反馈
-位姿作为 hold，并提示切换模式。此时在 Apex 把 Input Mode 切回 **None**；客户端检测到模式不再是
-Custom 后才断开。最后再用 `Ctrl+C` 停止 bridge。
+程序打印实机状态后，必须手动输入 `EXECUTE` 才开始动作。5 秒动作结束后客户端只采样一次当前反馈
+位姿，并持续发送这个固定目标作为 hold；它不会继续跟随后续反馈更新目标。此时在 Apex 把 Input Mode
+切回 **None**；客户端检测到模式不再是 Custom 后才断开。最后再用 `Ctrl+C` 停止 bridge。
 
 确认短 rollout 正常后再逐步增加 `--episode-seconds`。不建议首次执行使用 `--yes` 跳过确认。
 
@@ -156,6 +156,102 @@ hold，不会重复执行过时的预测动作。
 `0.08 rad/15 Hz` 已允许约 `1.2 rad/s` 的最坏目标变化。
 
 bridge 使用 pickle 传输 JPEG 和数据结构，只能暴露在可信的机器人私有网络，不应映射到公网。
+
+## 持续 rollout 的慢速插值诊断
+
+> **失败实验，禁止继续真机复现。** 2026-08-07 真机结果出现约1.33秒周期的明显回弹和77个手臂
+> 裁剪tick。以下命令仅保留用于复现实验参数，不应再次带 `--execute` 运行。后续测试必须先改为按
+> 实际已发送目标衔接新计划，并缩短open-loop段。
+
+该模式用于验证冻结 chunk 中已经改善明显的两项设置能否降低持续重规划时的颤抖：保持模型节点的
+15 Hz 时间语义，把时间拉长 2 倍，并在节点之间以 100 Hz 线性插值。它是显式诊断开关，默认
+`discrete` rollout 行为不变。
+
+新模式不会在一个已选动作段的中间覆盖旧计划。本项诊断每次完整消费 policy 输出的全部 10 个节点；
+从上一段末目标到下一段 `action[0]` 也作为一个节点间隔插值。每段持续 `10 / 7.5 = 1.333 s`，当队列还剩
+`0.30 s` 时开始推理下一段，推理返回后追加到队尾。当前最终配置实测约 `153-173 ms` 的推理延迟下
+仍有 `13-15` 个 100 Hz 点留在队列中。
+
+先确保 bridge 明确以 100 Hz 运行，Apex Input Mode 保持 None：
+
+```bash
+cd /home/jh/TianJi_data_collector/MarvinPro_deploy
+./scripts/run_bridge_on_controller.sh --allow-motion --publish-hz 100
+```
+
+本次已经执行过的5秒真机失败参数如下，仅供记录：
+
+```bash
+cd /home/jh/OpenPI_UR/openpi
+PYTHONPATH=/home/jh/TianJi_data_collector/MarvinPro_deploy/src \
+uv run python -m marvinpro_deploy.rollout_client \
+  --robot-host 6.6.7.100 \
+  --policy-host 192.168.50.73 \
+  --execute \
+  --episode-seconds 5 \
+  --playback-mode interpolated \
+  --control-hz 100 \
+  --model-hz 15 \
+  --playback-time-scale 2 \
+  --execute-steps 10 \
+  --chunk-prefetch-seconds 0.30 \
+  --log-level DEBUG
+```
+
+客户端完成 warmup 后会明确提示切到 Custom。确认页必须显示 `effective knot rate: 7.50Hz`、
+`command rate: 100.0Hz` 和 `selected chunk: 10 knots over 1.333s`，再输入 `EXECUTE`。结束时按提示先
+切回 None。`chunk_append_diag` 中稳态 `underruns_since_last` 应为 `0`，`queued_before` 应大于 `0`；
+若前者非零，先增大 `--chunk-prefetch-seconds`，不要放宽关节限幅。
+
+## 同步执行、到位、保持、重观测诊断
+
+该模式用于隔离周期回弹是否来自异步chunk错位。它严格按以下顺序运行，不提前采集下一段观测，也不在
+当前chunk运动期间推理：
+
+```text
+完整发送当前chunk -> 锁存末目标 -> 等待全部14个臂关节到位 -> 稳定保持
+-> 等待一帧新的图像/关节观测 -> 远程推理 -> 执行下一chunk
+```
+
+同步等待和远程推理期间，客户端持续发送上一chunk的末目标。它不会用不断变化的测量姿态覆盖末目标，
+因此机器人可以继续跟踪到位。到episode时限后不会启动新chunk，但已经启动的chunk仍会完整执行、到位
+并完成重观测，所以实际结束时间可能超过 `--episode-seconds`。
+
+先在 Apex 保持 Input Mode 为 None，启动100 Hz bridge：
+
+```bash
+cd /home/jh/TianJi_data_collector/MarvinPro_deploy
+./scripts/run_bridge_on_controller.sh --allow-motion --publish-hz 100
+```
+
+另一个终端运行首轮6秒、2倍时间尺度测试：
+
+```bash
+cd /home/jh/OpenPI_UR/openpi
+PYTHONPATH=/home/jh/TianJi_data_collector/MarvinPro_deploy/src \
+uv run python -m marvinpro_deploy.rollout_client \
+  --robot-host 6.6.7.100 \
+  --policy-host 192.168.50.73 \
+  --execute \
+  --episode-seconds 6 \
+  --rollout-schedule synchronized \
+  --playback-mode interpolated \
+  --control-hz 100 \
+  --model-hz 15 \
+  --playback-time-scale 2 \
+  --execute-steps 10
+```
+
+默认到位条件是所有臂关节误差不超过 `0.01 rad` 并连续保持 `0.20 s`，随后再稳定保持 `0.20 s`，每个
+阶段最长等待 `5 s`。夹爪不参与到位判断。终端会逐chunk显示推理时间、首节点边界差、到位耗时和最终
+误差；episode结束后按提示将 Input Mode 切回 None。
+
+结束等待阶段同样只锁存一次当前测量姿态。固定目标会一直保持到 Input Mode 离开 Custom，不会把残余
+运动中的后续反馈再次变成新目标，从而避免结束阶段的单向漂移。该修复已通过短时2.0x真机回归确认。
+
+若出现 `tracking timeout`，不要直接放宽误差阈值或关节步长。先记录超时关节、误差和
+`arm-clipped ticks`，因为这表示10节点open-loop末目标在当前设置下未能可靠实现。只有确认2.0x时周期
+回弹消失后，才保持其他参数不变依次改成 `--playback-time-scale 1.5` 和 `1.0` 做对照。
 
 ## 锁存姿态保持诊断
 
