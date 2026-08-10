@@ -10,6 +10,7 @@ import math
 import socket
 import threading
 import time
+import uuid
 
 import numpy as np
 from openpi_client import image_tools
@@ -27,12 +28,27 @@ from .config import (
 from .image_processing import ImageError, decode_and_split
 from .joint_mapping import build_state16
 from .motion_profile import FrozenLinearPlan
+from .rtc import (
+    DelayEstimator,
+    RTC_EXECUTION_HORIZON,
+    RTC_HORIZON,
+    RtcError,
+    build_rtc_request,
+    parse_rtc_response,
+)
 from .protocol import (
     ActionCommand,
     BridgeHello,
+    HoldPositionCommand,
+    LoadTrajectoryCommand,
     ProtocolError,
     RobotObservation,
+    RobotStateUpdate,
+    ResumeTrajectoryCommand,
+    StageRtcChunkCommand,
     StopCommand,
+    TrajectoryEvent,
+    TrajectoryHeartbeat,
     recv_message,
     require_current_version,
     send_message,
@@ -60,8 +76,12 @@ class RobotConnection:
 
         self._send_lock = threading.Lock()
         self._condition = threading.Condition()
-        self._latest: RobotObservation | None = None
-        self._latest_received = 0.0
+        self._latest_observation: RobotObservation | None = None
+        self._latest_observation_received = 0.0
+        self._latest_state: RobotStateUpdate | None = None
+        self._latest_state_received = 0.0
+        self._events: deque[TrajectoryEvent] = deque()
+        self._last_event_seq = 0
         self._error: BaseException | None = None
         self._closed = False
         self._receiver = threading.Thread(target=self._receive_loop, name="robot-observations", daemon=True)
@@ -73,12 +93,23 @@ class RobotConnection:
                 message = recv_message(self._socket)
                 if message is None:
                     raise ConnectionError("robot bridge closed the connection")
-                if not isinstance(message, RobotObservation):
-                    raise ProtocolError(f"unexpected bridge message {type(message).__name__}")
                 require_current_version(message)
                 with self._condition:
-                    self._latest = message
-                    self._latest_received = time.monotonic()
+                    received = time.monotonic()
+                    if isinstance(message, RobotObservation):
+                        if self._latest_observation is None or message.seq > self._latest_observation.seq:
+                            self._latest_observation = message
+                            self._latest_observation_received = received
+                    elif isinstance(message, RobotStateUpdate):
+                        if self._latest_state is None or message.state_seq > self._latest_state.state_seq:
+                            self._latest_state = message
+                            self._latest_state_received = received
+                    elif isinstance(message, TrajectoryEvent):
+                        if message.event_seq > self._last_event_seq:
+                            self._events.append(message)
+                            self._last_event_seq = message.event_seq
+                    else:
+                        raise ProtocolError(f"unexpected bridge message {type(message).__name__}")
                     self._condition.notify_all()
         except BaseException as exc:
             with self._condition:
@@ -90,11 +121,71 @@ class RobotConnection:
         with self._condition:
             if self._error is not None:
                 raise RolloutError(f"robot bridge receive failed: {self._error}")
-            if self._latest is None:
+            if self._latest_observation is None:
                 raise RolloutError("no robot observation received")
-            if max_local_age_s is not None and time.monotonic() - self._latest_received > max_local_age_s:
+            if (
+                max_local_age_s is not None
+                and time.monotonic() - self._latest_observation_received > max_local_age_s
+            ):
                 raise RolloutError("latest robot observation is stale on the rollout client")
-            return self._latest
+            return self._latest_observation
+
+    def latest_state(self, max_local_age_s: float | None = None) -> RobotStateUpdate:
+        with self._condition:
+            if self._error is not None:
+                raise RolloutError(f"robot bridge receive failed: {self._error}")
+            if self._latest_state is None:
+                raise RolloutError("no robot state update received")
+            if max_local_age_s is not None and time.monotonic() - self._latest_state_received > max_local_age_s:
+                raise RolloutError("latest robot state is stale on the rollout client")
+            return self._latest_state
+
+    def wait_for_state(
+        self,
+        *,
+        timeout_s: float,
+        newer_than: int | None = None,
+        require_motion_gate: bool = False,
+    ) -> RobotStateUpdate:
+        deadline = time.monotonic() + timeout_s
+        with self._condition:
+            while True:
+                if self._error is not None:
+                    raise RolloutError(f"robot bridge receive failed: {self._error}")
+                state = self._latest_state
+                is_new = state is not None and (newer_than is None or state.state_seq > newer_than)
+                gate_ok = state is not None and (not require_motion_gate or state.motion_gate_open)
+                if is_new and gate_ok:
+                    return state
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RolloutError("timed out waiting for robot state")
+                self._condition.wait(timeout=min(remaining, 0.25))
+
+    def wait_for_event(
+        self,
+        *,
+        timeout_s: float,
+        event_types: tuple[str, ...] | None = None,
+        newer_than: int | None = None,
+    ) -> TrajectoryEvent:
+        deadline = time.monotonic() + timeout_s
+        with self._condition:
+            while True:
+                if self._error is not None:
+                    raise RolloutError(f"robot bridge receive failed: {self._error}")
+                for event in tuple(self._events):
+                    if newer_than is not None and event.event_seq <= newer_than:
+                        self._events.popleft()
+                        continue
+                    if event_types is None or event.event_type in event_types:
+                        self._events.remove(event)
+                        return event
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    expected = "any" if event_types is None else ",".join(event_types)
+                    raise RolloutError(f"timed out waiting for trajectory event ({expected})")
+                self._condition.wait(timeout=min(remaining, 0.25))
 
     def wait_for_observation(
         self,
@@ -108,7 +199,7 @@ class RobotConnection:
             while True:
                 if self._error is not None:
                     raise RolloutError(f"robot bridge receive failed: {self._error}")
-                observation = self._latest
+                observation = self._latest_observation
                 is_new = observation is not None and (newer_than is None or observation.seq > newer_than)
                 gate_ok = observation is not None and (not require_motion_gate or observation.motion_gate_open)
                 if is_new and gate_ok:
@@ -122,10 +213,13 @@ class RobotConnection:
                 self._condition.wait(timeout=min(remaining, 0.5))
 
     def send_action(self, command: ActionCommand) -> None:
+        self.send(command)
+
+    def send(self, message) -> None:
         with self._condition:
             if self._error is not None:
                 raise RolloutError(f"robot bridge receive failed: {self._error}")
-        send_message(self._socket, command, self._send_lock)
+        send_message(self._socket, message, self._send_lock)
 
     def close(self, reason: str) -> None:
         with self._condition:
@@ -531,8 +625,11 @@ def _confirm_execution(args: argparse.Namespace, observation: RobotObservation) 
             print(f"  tracking settle time: {args.tracking_settle_seconds:.2f}s")
             print(f"  post-track hold: {args.post_track_hold_seconds:.2f}s")
             print(f"  tracking timeout: {args.tracking_timeout:.1f}s")
-        else:
+        elif args.rollout_schedule == "prefetch":
             print(f"  next-chunk inference lead: {args.chunk_prefetch_seconds:.2f}s")
+        else:
+            print(f"  rollout schedule: bridge-owned {args.rollout_schedule}")
+            print("  physical checkpoint: 4 actions" if args.rollout_schedule == "rtc" else "  full-chunk checkpoint")
     print("Keep the emergency stop reachable. Switch Input Mode to None before stopping the bridge.")
     if args.yes:
         return
@@ -866,6 +963,521 @@ def _run_synchronized_schedule(
     return inference_count
 
 
+class _CommandIds:
+    def __init__(self) -> None:
+        self._value = 0
+
+    def next(self) -> int:
+        self._value += 1
+        return self._value
+
+
+class _TrajectoryHeartbeat:
+    def __init__(self, connection: RobotConnection, session_id: str, stop: threading.Event) -> None:
+        self.connection = connection
+        self.session_id = session_id
+        self.stop = stop
+        self.error: BaseException | None = None
+        self._version_lock = threading.Lock()
+        self._timeline_version: int | None = None
+        self._thread = threading.Thread(target=self._run, name="trajectory-heartbeat", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def join(self) -> None:
+        self._thread.join(timeout=1.0)
+
+    def update_version(self, timeline_version: int) -> None:
+        with self._version_lock:
+            self._timeline_version = int(timeline_version)
+
+    def _run(self) -> None:
+        try:
+            while not self.stop.wait(0.10):
+                with self._version_lock:
+                    timeline_version = self._timeline_version
+                if timeline_version is not None:
+                    self.connection.send(TrajectoryHeartbeat(self.session_id, timeline_version))
+        except BaseException as exc:
+            self.error = exc
+            self.stop.set()
+
+
+def _actions_tuple(actions: np.ndarray) -> tuple[tuple[float, ...], ...]:
+    values = np.asarray(actions, dtype=np.float64)
+    if values.shape != (RTC_HORIZON, 16) or not np.isfinite(values).all():
+        raise RolloutError(f"trajectory actions must have shape ({RTC_HORIZON}, 16), got {values.shape}")
+    return tuple(tuple(float(value) for value in row) for row in values)
+
+
+def _load_bridge_trajectory(
+    connection: RobotConnection,
+    command_ids: _CommandIds,
+    *,
+    session_id: str,
+    plan_id: str,
+    expected_timeline_version: int,
+    observation_seq: int,
+    actions: np.ndarray,
+    knot_hz: float,
+    checkpoint_horizon: int,
+    timeout_s: float,
+) -> TrajectoryEvent:
+    connection.send(
+        LoadTrajectoryCommand(
+            command_id=command_ids.next(),
+            observation_seq=observation_seq,
+            session_id=session_id,
+            plan_id=plan_id,
+            expected_timeline_version=expected_timeline_version,
+            knots=_actions_tuple(actions),
+            knot_hz=knot_hz,
+            checkpoint_horizon=checkpoint_horizon,
+            execute=True,
+        )
+    )
+    event = connection.wait_for_event(
+        timeout_s=timeout_s,
+        event_types=("trajectory_loaded", "trajectory_command_rejected", "trajectory_stopped"),
+    )
+    if event.event_type != "trajectory_loaded" or event.plan_id != plan_id:
+        raise RolloutError(f"bridge rejected trajectory {plan_id}: {event.detail}")
+    return event
+
+
+def _wait_checkpoint_observation(
+    connection: RobotConnection,
+    event: TrajectoryEvent,
+    *,
+    timeout_s: float,
+    max_source_age_s: float,
+    max_state_image_skew_s: float,
+) -> RobotObservation:
+    if event.stable_monotonic is None:
+        raise RolloutError("checkpoint event has no stable timestamp")
+    deadline = time.monotonic() + timeout_s
+    newer_than = event.observation_seq_at_stable
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RolloutError("timed out waiting for a fresh checkpoint image")
+        observation = connection.wait_for_observation(
+            timeout_s=remaining,
+            newer_than=newer_than,
+            require_motion_gate=True,
+        )
+        newer_than = observation.seq
+        if observation.captured_monotonic <= event.stable_monotonic:
+            continue
+        sampled = observation.extra.get("state_sampled_monotonic")
+        if sampled is None or abs(observation.captured_monotonic - float(sampled)) > max_state_image_skew_s:
+            continue
+        validate_observation(observation, max_source_age_s)
+        return observation
+
+
+def _wait_bridge_tracking(
+    connection: RobotConnection,
+    *,
+    tolerance_rad: float,
+    settle_seconds: float,
+    timeout_s: float,
+) -> tuple[RobotStateUpdate, float]:
+    deadline = time.monotonic() + timeout_s
+    stable_source_time: float | None = None
+    last_seq: int | None = None
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RolloutError("timed out waiting for bridge hold tracking")
+        state = connection.wait_for_state(timeout_s=remaining, newer_than=last_seq, require_motion_gate=True)
+        last_seq = state.state_seq
+        if state.raw_reference is None:
+            stable_source_time = None
+            continue
+        error = _arm_delta(state.raw_reference, build_state16(
+            state.joints, state.gripper_raw_left, state.gripper_raw_right
+        ))
+        if error <= tolerance_rad:
+            if stable_source_time is None:
+                stable_source_time = state.sampled_monotonic
+            if state.sampled_monotonic - stable_source_time >= settle_seconds:
+                return state, stable_source_time
+        else:
+            stable_source_time = None
+
+
+def _hold_bridge_position(
+    connection: RobotConnection,
+    command_ids: _CommandIds,
+    *,
+    session_id: str,
+    reason: str,
+    timeout_s: float,
+) -> TrajectoryEvent:
+    state = connection.latest_state(max_local_age_s=0.50)
+    try:
+        refreshed = connection.wait_for_state(
+            timeout_s=min(0.50, timeout_s),
+            newer_than=state.state_seq,
+        )
+        if refreshed.session_id == session_id:
+            state = refreshed
+    except RolloutError as exc:
+        if "timed out waiting" not in str(exc):
+            raise
+    action = state.raw_reference or state.sent_target or build_state16(
+        state.joints, state.gripper_raw_left, state.gripper_raw_right
+    )
+    connection.send(
+        HoldPositionCommand(
+            command_id=command_ids.next(),
+            session_id=session_id,
+            expected_timeline_version=state.timeline_version,
+            action=tuple(action),
+            execute=True,
+            reason=reason,
+        )
+    )
+    event = connection.wait_for_event(
+        timeout_s=timeout_s,
+        event_types=("holding", "trajectory_command_rejected", "trajectory_stopped"),
+    )
+    if event.event_type != "holding":
+        raise RolloutError(f"bridge could not enter fixed hold: {event.detail}")
+    return event
+
+
+def _fresh_observation_after_source_time(
+    connection: RobotConnection,
+    source_time: float,
+    *,
+    timeout_s: float,
+    max_source_age_s: float,
+    max_state_image_skew_s: float,
+) -> RobotObservation:
+    synthetic = TrajectoryEvent(
+        event_seq=-1,
+        event_type="local_tracking_ready",
+        emitted_monotonic=source_time,
+        session_id="",
+        plan_id="",
+        timeline_version=0,
+        phase=0.0,
+        stable_monotonic=source_time,
+        observation_seq_at_stable=connection.latest().seq,
+    )
+    return _wait_checkpoint_observation(
+        connection,
+        synthetic,
+        timeout_s=timeout_s,
+        max_source_age_s=max_source_age_s,
+        max_state_image_skew_s=max_state_image_skew_s,
+    )
+
+
+def _run_bridge_synchronized(
+    args: argparse.Namespace,
+    connection: RobotConnection,
+    policy,
+    command_ids: _CommandIds,
+    heartbeat: _TrajectoryHeartbeat,
+    *,
+    session_id: str,
+    initial_observation: RobotObservation,
+    initial_actions: np.ndarray | None,
+    episode_deadline: float,
+) -> int:
+    inference_count = 0
+    observation = initial_observation
+    actions = initial_actions
+    effective_knot_hz = args.model_hz / args.playback_time_scale
+    while time.monotonic() < episode_deadline:
+        if heartbeat.error is not None:
+            raise RolloutError(f"trajectory heartbeat failed: {heartbeat.error}")
+        if actions is None:
+            actions, timing = infer_actions(policy, observation, args.prompt)
+            inference_count += 1
+            LOGGER.info("synchronized fallback inference wall_ms=%.1f", timing["wall_ms"])
+        state = connection.latest_state(max_local_age_s=0.50)
+        plan_id = f"sync-{uuid.uuid4().hex}"
+        loaded = _load_bridge_trajectory(
+            connection,
+            command_ids,
+            session_id=session_id,
+            plan_id=plan_id,
+            expected_timeline_version=state.timeline_version,
+            observation_seq=observation.seq,
+            actions=actions,
+            knot_hz=effective_knot_hz,
+            checkpoint_horizon=RTC_HORIZON,
+            timeout_s=args.tracking_timeout,
+        )
+        heartbeat.update_version(loaded.timeline_version)
+        event = connection.wait_for_event(
+            timeout_s=args.tracking_timeout + RTC_HORIZON / effective_knot_hz,
+            event_types=("checkpoint_ready", "trajectory_stopped", "trajectory_command_rejected"),
+        )
+        if event.event_type != "checkpoint_ready":
+            raise RolloutError(f"synchronized bridge trajectory failed: {event.detail}")
+        if time.monotonic() >= episode_deadline:
+            break
+        observation = _wait_checkpoint_observation(
+            connection,
+            event,
+            timeout_s=args.tracking_timeout,
+            max_source_age_s=args.max_source_age,
+            max_state_image_skew_s=args.max_state_image_skew,
+        )
+        actions = None
+    return inference_count
+
+
+def _run_trajectory_schedule(
+    args: argparse.Namespace,
+    connection: RobotConnection,
+    policy,
+    observation: RobotObservation,
+    warmup_latencies_ms: list[float],
+) -> int:
+    session_id = uuid.uuid4().hex
+    command_ids = _CommandIds()
+    heartbeat_stop = threading.Event()
+    heartbeat = _TrajectoryHeartbeat(connection, session_id, heartbeat_stop)
+    estimator = DelayEstimator()
+    for latency_ms in warmup_latencies_ms:
+        estimator.record_seconds(latency_ms / 1000.0)
+    effective_knot_hz = args.model_hz / args.playback_time_scale
+    inference_count = 0
+    fallback = args.rollout_schedule == "tracking"
+
+    actions, timing = infer_actions(policy, observation, args.prompt)
+    inference_count += 1
+    estimator.record_seconds(timing["wall_ms"] / 1000.0)
+    first_plan_id = f"plan-{uuid.uuid4().hex}"
+    loaded = _load_bridge_trajectory(
+        connection,
+        command_ids,
+        session_id=session_id,
+        plan_id=first_plan_id,
+        expected_timeline_version=connection.latest_state(max_local_age_s=0.50).timeline_version,
+        observation_seq=observation.seq,
+        actions=actions,
+        knot_hz=effective_knot_hz,
+        checkpoint_horizon=RTC_HORIZON if fallback else RTC_EXECUTION_HORIZON,
+        timeout_s=args.tracking_timeout,
+    )
+    LOGGER.info("bridge trajectory session %s loaded at version %d", session_id, loaded.timeline_version)
+    heartbeat.update_version(loaded.timeline_version)
+    heartbeat.start()
+    episode_deadline = time.monotonic() + args.episode_seconds
+
+    try:
+        if fallback:
+            first_checkpoint = connection.wait_for_event(
+                timeout_s=args.tracking_timeout + RTC_HORIZON / effective_knot_hz,
+                event_types=("checkpoint_ready", "trajectory_stopped", "trajectory_command_rejected"),
+            )
+            if first_checkpoint.event_type != "checkpoint_ready":
+                raise RolloutError(f"tracking trajectory failed: {first_checkpoint.detail}")
+            observation = _wait_checkpoint_observation(
+                connection,
+                first_checkpoint,
+                timeout_s=args.tracking_timeout,
+                max_source_age_s=args.max_source_age,
+                max_state_image_skew_s=args.max_state_image_skew,
+            )
+            inference_count += _run_bridge_synchronized(
+                args,
+                connection,
+                policy,
+                command_ids,
+                heartbeat,
+                session_id=session_id,
+                initial_observation=observation,
+                initial_actions=None,
+                episode_deadline=episode_deadline,
+            )
+
+        while time.monotonic() < episode_deadline:
+            if heartbeat.error is not None:
+                raise RolloutError(f"trajectory heartbeat failed: {heartbeat.error}")
+            checkpoint = connection.wait_for_event(
+                timeout_s=args.tracking_timeout + RTC_EXECUTION_HORIZON / effective_knot_hz,
+                event_types=("checkpoint_ready", "trajectory_stopped", "trajectory_command_rejected"),
+            )
+            if checkpoint.event_type != "checkpoint_ready":
+                raise RolloutError(f"RTC checkpoint failed: {checkpoint.detail}")
+            observation = _wait_checkpoint_observation(
+                connection,
+                checkpoint,
+                timeout_s=args.tracking_timeout,
+                max_source_age_s=args.max_source_age,
+                max_state_image_skew_s=args.max_state_image_skew,
+            )
+            try:
+                predicted_delay = estimator.predicted_steps(effective_knot_hz)
+                policy_observation = build_policy_observation(observation, args.prompt)
+                request_id = uuid.uuid4().hex
+                request = build_rtc_request(
+                    request_id=request_id,
+                    plan_id=checkpoint.plan_id,
+                    timeline_version=checkpoint.timeline_version,
+                    checkpoint_id=checkpoint.checkpoint_id or 0,
+                    observation=policy_observation,
+                    old_remaining_actions_absolute=checkpoint.old_remaining_actions_absolute,
+                    predicted_delay_steps=predicted_delay,
+                )
+                result_box: dict[str, object] = {}
+
+                def infer_rtc() -> None:
+                    try:
+                        result_box["result"] = policy.infer(request)
+                    except BaseException as exc:
+                        result_box["error"] = exc
+
+                worker = threading.Thread(target=infer_rtc, name=f"rtc-{request_id[:8]}", daemon=True)
+                worker.start()
+                connection.send(
+                    ResumeTrajectoryCommand(
+                        command_id=command_ids.next(),
+                        session_id=session_id,
+                        plan_id=checkpoint.plan_id,
+                        timeline_version=checkpoint.timeline_version,
+                        checkpoint_id=checkpoint.checkpoint_id or 0,
+                        request_id=request_id,
+                        predicted_delay_steps=predicted_delay,
+                    )
+                )
+                while worker.is_alive():
+                    worker.join(timeout=0.05)
+                    if heartbeat.error is not None:
+                        raise RolloutError(f"trajectory heartbeat failed: {heartbeat.error}")
+                if "error" in result_box:
+                    raise RtcError(f"RTC inference transport failed: {result_box['error']}")
+                rtc_actions, rtc_timing = parse_rtc_response(result_box["result"], request=request)
+                inference_count += 1
+                estimator.record_seconds(rtc_timing["wall_ms"] / 1000.0)
+                LOGGER.info(
+                    "RTC request %s wall_ms=%.1f d_pred=%d",
+                    request_id,
+                    rtc_timing["wall_ms"],
+                    predicted_delay,
+                )
+                if args.rtc_shadow:
+                    shadow_event = connection.wait_for_event(
+                        timeout_s=args.tracking_timeout,
+                        event_types=(
+                            "rtc_waiting_at_deadline",
+                            "rtc_invalid",
+                            "trajectory_stopped",
+                        ),
+                    )
+                    if shadow_event.event_type != "rtc_waiting_at_deadline":
+                        raise RtcError(
+                            f"RTC shadow invalidated before merge boundary: "
+                            f"{shadow_event.detail or shadow_event.event_type}"
+                        )
+                    LOGGER.info(
+                        "RTC shadow request=%s d_actual=%s d_pred=%d result discarded",
+                        request_id,
+                        shadow_event.actual_delay_steps,
+                        predicted_delay,
+                    )
+                    raise RtcError(
+                        f"RTC shadow result discarded at d_actual={shadow_event.actual_delay_steps}"
+                    )
+                replacement_plan_id = f"plan-{uuid.uuid4().hex}"
+                connection.send(
+                    StageRtcChunkCommand(
+                        command_id=command_ids.next(),
+                        session_id=session_id,
+                        base_plan_id=checkpoint.plan_id,
+                        replacement_plan_id=replacement_plan_id,
+                        timeline_version=checkpoint.timeline_version,
+                        checkpoint_id=checkpoint.checkpoint_id or 0,
+                        request_id=request_id,
+                        predicted_delay_steps=predicted_delay,
+                        execution_horizon=RTC_EXECUTION_HORIZON,
+                        actions=_actions_tuple(rtc_actions),
+                    )
+                )
+                merged = connection.wait_for_event(
+                    timeout_s=args.tracking_timeout,
+                    event_types=(
+                        "rtc_merged",
+                        "rtc_invalid",
+                        "trajectory_command_rejected",
+                        "trajectory_stopped",
+                    ),
+                )
+                if merged.event_type != "rtc_merged" or merged.request_id != request_id:
+                    raise RtcError(f"bridge rejected RTC merge: {merged.detail or merged.event_type}")
+                LOGGER.info(
+                    "RTC merged request=%s d_actual=%s version=%d",
+                    request_id,
+                    merged.actual_delay_steps,
+                    merged.timeline_version,
+                )
+                heartbeat.update_version(merged.timeline_version)
+            except Exception as exc:
+                LOGGER.warning("RTC disabled for the rest of this episode: %s", exc)
+                holding = _hold_bridge_position(
+                    connection,
+                    command_ids,
+                    session_id=session_id,
+                    reason=f"RTC fallback: {exc}",
+                    timeout_s=args.tracking_timeout,
+                )
+                heartbeat.update_version(holding.timeline_version)
+                _, stable_source_time = _wait_bridge_tracking(
+                    connection,
+                    tolerance_rad=args.tracking_tolerance_rad,
+                    settle_seconds=args.tracking_settle_seconds,
+                    timeout_s=args.tracking_timeout,
+                )
+                observation = _fresh_observation_after_source_time(
+                    connection,
+                    stable_source_time,
+                    timeout_s=args.tracking_timeout,
+                    max_source_age_s=args.max_source_age,
+                    max_state_image_skew_s=args.max_state_image_skew,
+                )
+                inference_count += _run_bridge_synchronized(
+                    args,
+                    connection,
+                    policy,
+                    command_ids,
+                    heartbeat,
+                    session_id=session_id,
+                    initial_observation=observation,
+                    initial_actions=None,
+                    episode_deadline=episode_deadline,
+                )
+                break
+
+        holding = _hold_bridge_position(
+            connection,
+            command_ids,
+            session_id=session_id,
+            reason="trajectory rollout complete",
+            timeout_s=args.tracking_timeout,
+        )
+        heartbeat.update_version(holding.timeline_version)
+        print("\nROLLOUT COMPLETE\n  Bridge is holding one fixed target. Now change Apex Input Mode to None.")
+        deadline = time.monotonic() + args.exit_mode_timeout
+        while time.monotonic() < deadline:
+            latest_observation = connection.latest()
+            if latest_observation.input_mode != 3:
+                return inference_count
+            time.sleep(0.05)
+        raise RolloutError("Input Mode stayed Custom after trajectory rollout")
+    finally:
+        heartbeat_stop.set()
+        heartbeat.join()
+
+
 def run(args: argparse.Namespace) -> int:
     connection: RobotConnection | None = None
     stop = threading.Event()
@@ -915,22 +1527,69 @@ def run(args: argparse.Namespace) -> int:
             root_logger.setLevel(previous_root_level)
         LOGGER.debug("policy metadata: %s", policy.get_server_metadata())
 
+        warmup_latencies_ms: list[float] = []
         if args.warmup_inferences:
             print("Warming up policy; warmup actions will not be executed...")
         for index in range(args.warmup_inferences):
             observation = connection.latest(args.max_observation_age)
             validate_observation(observation, args.max_source_age)
             _, timing = infer_actions(policy, observation, args.prompt)
+            if args.rollout_schedule != "rtc":
+                warmup_latencies_ms.append(float(timing["wall_ms"]))
             LOGGER.debug("discarded warmup inference %d: %s", index + 1, timing)
             print(
                 f"  Warmup {index + 1}/{args.warmup_inferences} complete ({timing['wall_ms']:.1f}ms); output discarded."
             )
+
+        if args.rollout_schedule == "rtc":
+            metadata = policy.get_server_metadata()
+            rtc_metadata = metadata.get("rtc", {}) if isinstance(metadata, dict) else {}
+            if rtc_metadata.get("protocol") != "rtc_v1":
+                raise RolloutError("policy server does not advertise rtc_v1 support")
+            observation = connection.latest(args.max_observation_age)
+            policy_observation = build_policy_observation(observation, args.prompt)
+            current = build_state16(
+                observation.joints,
+                observation.gripper_raw_left,
+                observation.gripper_raw_right,
+            )
+            print("Warming up RTC sampler; outputs will not be executed...")
+            for rtc_warmup_index in range(2):
+                warmup_request = build_rtc_request(
+                    request_id=f"warmup-{uuid.uuid4().hex}",
+                    plan_id="warmup",
+                    timeline_version=0,
+                    checkpoint_id=0,
+                    observation=policy_observation,
+                    old_remaining_actions_absolute=np.asarray([current] * 6),
+                    predicted_delay_steps=4,
+                    warmup=True,
+                )
+                warmup_result = policy.infer(warmup_request)
+                _, rtc_warmup_timing = parse_rtc_response(warmup_result, request=warmup_request)
+                if rtc_warmup_index == 1:
+                    warmup_latencies_ms.append(float(rtc_warmup_timing["wall_ms"]))
+                print(
+                    f"  RTC warmup {rtc_warmup_index + 1}/2 complete "
+                    f"({rtc_warmup_timing['wall_ms']:.1f}ms); output discarded."
+                )
 
         if args.execute:
             observation = _wait_for_ready(connection, args.ready_timeout)
             _confirm_execution(args, observation)
         else:
             print("\nDRY RUN: policy inference and safety filtering only; no actions will be sent.")
+
+        if args.rollout_schedule in ("tracking", "rtc"):
+            inference_count = _run_trajectory_schedule(
+                args,
+                connection,
+                policy,
+                observation,
+                warmup_latencies_ms,
+            )
+            print(f"\nTrajectory rollout finished: {inference_count} inferences.")
+            return 0
 
         plan = ActionPlan()
         publisher = ActionPublisher(
@@ -1144,7 +1803,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--episode-seconds", type=float, default=60.0)
     parser.add_argument(
         "--rollout-schedule",
-        choices=("prefetch", "synchronized"),
+        choices=("prefetch", "synchronized", "tracking", "rtc"),
         default="prefetch",
         help="prefetch chunks while moving, or infer only after the previous target is tracked and held",
     )
@@ -1210,6 +1869,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="synchronized mode: maximum time for either tracking or stable hold",
     )
     parser.add_argument("--warmup-inferences", type=int, default=1)
+    parser.add_argument("--rtc-shadow", action="store_true", help="run one RTC request, discard it, then use sync fallback")
+    parser.add_argument("--max-state-image-skew", type=float, default=0.05)
     parser.add_argument("--max-joint-step-rad", type=float, default=0.08)
     parser.add_argument("--joint-limit-margin-rad", type=float, default=0.02)
     parser.add_argument("--max-source-age", type=float, default=0.20)
@@ -1259,6 +1920,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             parser.error("--rollout-schedule synchronized requires --playback-mode interpolated")
         if not args.execute:
             parser.error("--rollout-schedule synchronized requires --execute")
+    if args.rollout_schedule in ("tracking", "rtc"):
+        if not args.execute:
+            parser.error(f"--rollout-schedule {args.rollout_schedule} requires --execute")
+        if args.playback_mode != "interpolated":
+            parser.error(f"--rollout-schedule {args.rollout_schedule} requires --playback-mode interpolated")
+        if args.control_hz != 100.0 or args.model_hz != 15.0 or args.playback_time_scale != 2.0:
+            parser.error("tracking/rtc requires --control-hz 100 --model-hz 15 --playback-time-scale 2")
+        if args.execute_steps != RTC_HORIZON:
+            parser.error("tracking/rtc requires --execute-steps 10")
+    if args.rtc_shadow and args.rollout_schedule != "rtc":
+        parser.error("--rtc-shadow requires --rollout-schedule rtc")
+    if args.max_state_image_skew <= 0:
+        parser.error("--max-state-image-skew must be positive")
     if args.warmup_inferences < 0:
         parser.error("--warmup-inferences cannot be negative")
     if args.yes and not args.execute:

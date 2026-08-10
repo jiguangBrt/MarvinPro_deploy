@@ -61,11 +61,117 @@ class RobotObservation:
 
 
 @dataclass(frozen=True)
+class RobotStateUpdate:
+    state_seq: int
+    sampled_monotonic: float
+    joints: tuple[float, ...]
+    gripper_raw_left: float
+    gripper_raw_right: float
+    motion_gate_open: bool
+    gate_reason: str
+    last_command_id: int | None = None
+    last_command_status: str = "no command"
+    trajectory_mode: str = "legacy"
+    session_id: str | None = None
+    plan_id: str | None = None
+    timeline_version: int = 0
+    phase: float | None = None
+    phase_rate: float = 0.0
+    raw_reference: tuple[float, ...] | None = None
+    sent_target: tuple[float, ...] | None = None
+    tracking_error_rad: float | None = None
+    servo_error_rad: float | None = None
+    arm_clipped: bool = False
+    frozen_reason: str | None = None
+    active_request_id: str | None = None
+    version: int = PROTOCOL_VERSION
+
+
+@dataclass(frozen=True)
+class TrajectoryEvent:
+    event_seq: int
+    event_type: str
+    emitted_monotonic: float
+    session_id: str
+    plan_id: str
+    timeline_version: int
+    phase: float
+    checkpoint_id: int | None = None
+    stable_monotonic: float | None = None
+    observation_seq_at_stable: int | None = None
+    old_remaining_actions_absolute: tuple[tuple[float, ...], ...] = ()
+    request_id: str | None = None
+    predicted_delay_steps: int | None = None
+    actual_delay_steps: int | None = None
+    detail: str = ""
+    version: int = PROTOCOL_VERSION
+
+
+@dataclass(frozen=True)
 class ActionCommand:
     command_id: int
     observation_seq: int
     action: tuple[float, ...]
     execute: bool
+    version: int = PROTOCOL_VERSION
+
+
+@dataclass(frozen=True)
+class LoadTrajectoryCommand:
+    command_id: int
+    observation_seq: int
+    session_id: str
+    plan_id: str
+    expected_timeline_version: int
+    knots: tuple[tuple[float, ...], ...]
+    knot_hz: float
+    checkpoint_horizon: int
+    execute: bool
+    version: int = PROTOCOL_VERSION
+
+
+@dataclass(frozen=True)
+class ResumeTrajectoryCommand:
+    command_id: int
+    session_id: str
+    plan_id: str
+    timeline_version: int
+    checkpoint_id: int
+    request_id: str
+    predicted_delay_steps: int
+    version: int = PROTOCOL_VERSION
+
+
+@dataclass(frozen=True)
+class StageRtcChunkCommand:
+    command_id: int
+    session_id: str
+    base_plan_id: str
+    replacement_plan_id: str
+    timeline_version: int
+    checkpoint_id: int
+    request_id: str
+    predicted_delay_steps: int
+    execution_horizon: int
+    actions: tuple[tuple[float, ...], ...]
+    version: int = PROTOCOL_VERSION
+
+
+@dataclass(frozen=True)
+class TrajectoryHeartbeat:
+    session_id: str
+    timeline_version: int
+    version: int = PROTOCOL_VERSION
+
+
+@dataclass(frozen=True)
+class HoldPositionCommand:
+    command_id: int
+    session_id: str
+    expected_timeline_version: int
+    action: tuple[float, ...]
+    execute: bool
+    reason: str = "client requested hold"
     version: int = PROTOCOL_VERSION
 
 

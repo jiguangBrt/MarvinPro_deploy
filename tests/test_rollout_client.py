@@ -1,5 +1,6 @@
 from contextlib import redirect_stderr
 import io
+import socket
 from types import SimpleNamespace
 import threading
 import time
@@ -7,7 +8,14 @@ import unittest
 
 import numpy as np
 
-from marvinpro_deploy.rollout_client import ActionPlan, ActionPublisher, parse_args
+from marvinpro_deploy.protocol import BridgeHello, TrajectoryEvent, send_message
+from marvinpro_deploy.rollout_client import (
+    _TrajectoryHeartbeat,
+    ActionPlan,
+    ActionPublisher,
+    RobotConnection,
+    parse_args,
+)
 
 
 def vector(value: float) -> tuple[float, ...]:
@@ -127,6 +135,64 @@ class ActionPublisherTest(unittest.TestCase):
             publisher.join(timeout=1.0)
 
 
+class RobotConnectionTest(unittest.TestCase):
+    def test_late_event_cannot_reappear_after_newer_event_was_consumed(self):
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        accepted = []
+        ready = threading.Event()
+
+        def accept_client():
+            bridge_socket, _ = listener.accept()
+            accepted.append(bridge_socket)
+            send_message(bridge_socket, BridgeHello())
+            ready.set()
+
+        accept_thread = threading.Thread(target=accept_client, daemon=True)
+        accept_thread.start()
+        connection = RobotConnection("127.0.0.1", listener.getsockname()[1])
+        self.assertTrue(ready.wait(1.0))
+        bridge_socket = accepted[0]
+        try:
+            first = TrajectoryEvent(10, "checkpoint_ready", 1.0, "s", "p", 1, 3.0)
+            send_message(bridge_socket, first)
+            self.assertEqual(connection.wait_for_event(timeout_s=1.0).event_seq, 10)
+
+            send_message(
+                bridge_socket,
+                TrajectoryEvent(9, "checkpoint_ready", 1.1, "s", "p", 1, 3.0),
+            )
+            send_message(
+                bridge_socket,
+                TrajectoryEvent(11, "checkpoint_ready", 1.2, "s", "p", 1, 3.0),
+            )
+            self.assertEqual(connection.wait_for_event(timeout_s=1.0).event_seq, 11)
+        finally:
+            connection.close("test complete")
+            bridge_socket.close()
+            listener.close()
+            accept_thread.join(timeout=1.0)
+
+    def test_heartbeat_does_not_depend_on_outbound_state_telemetry(self):
+        sent = []
+        connection = SimpleNamespace(send=sent.append)
+        stop = threading.Event()
+        heartbeat = _TrajectoryHeartbeat(connection, "session", stop)
+        heartbeat.update_version(7)
+        heartbeat.start()
+        try:
+            deadline = time.monotonic() + 0.5
+            while not sent and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(sent)
+            self.assertEqual(sent[0].session_id, "session")
+            self.assertEqual(sent[0].timeline_version, 7)
+        finally:
+            stop.set()
+            heartbeat.join()
+
+
 class RolloutArgumentTest(unittest.TestCase):
     def test_interpolated_two_times_configuration(self):
         args = parse_args(
@@ -185,6 +251,27 @@ class RolloutArgumentTest(unittest.TestCase):
             with self.subTest(argv=argv), redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit):
                     parse_args(argv)
+
+    def test_rtc_schedule_requires_fixed_first_version_configuration(self):
+        args = parse_args(
+            [
+                "--execute",
+                "--rollout-schedule",
+                "rtc",
+                "--playback-mode",
+                "interpolated",
+                "--control-hz",
+                "100",
+                "--model-hz",
+                "15",
+                "--playback-time-scale",
+                "2",
+                "--execute-steps",
+                "10",
+            ]
+        )
+        self.assertEqual(args.rollout_schedule, "rtc")
+        self.assertFalse(args.rtc_shadow)
 
     def test_rejects_speedup(self):
         with redirect_stderr(io.StringIO()):

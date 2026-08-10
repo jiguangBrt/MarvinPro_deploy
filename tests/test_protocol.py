@@ -1,8 +1,17 @@
 import socket
 import struct
+from types import SimpleNamespace
 import unittest
 
-from marvinpro_deploy.protocol import ActionCommand, ProtocolError, recv_message, send_message
+from marvinpro_deploy.protocol import (
+    ActionCommand,
+    ProtocolError,
+    RobotStateUpdate,
+    TrajectoryEvent,
+    recv_message,
+    require_current_version,
+    send_message,
+)
 
 
 class ProtocolTest(unittest.TestCase):
@@ -25,6 +34,24 @@ class ProtocolTest(unittest.TestCase):
         finally:
             left.close()
             right.close()
+
+    def test_state_and_event_round_trip(self):
+        messages = (
+            RobotStateUpdate(1, 3.5, (0.0,) * 14, 0.0, 0.0, True, "ready"),
+            TrajectoryEvent(2, "checkpoint_ready", 4.0, "session", "plan", 3, 3.0),
+        )
+        left, right = socket.socketpair()
+        try:
+            for expected in messages:
+                send_message(left, expected)
+                self.assertEqual(recv_message(right), expected)
+        finally:
+            left.close()
+            right.close()
+
+    def test_rejects_protocol_version_mismatch(self):
+        with self.assertRaisesRegex(ProtocolError, "version mismatch"):
+            require_current_version(SimpleNamespace(version=1))
 
 
 if __name__ == "__main__":

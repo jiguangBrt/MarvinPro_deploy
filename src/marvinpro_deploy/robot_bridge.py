@@ -7,6 +7,7 @@ standard library. Run it in the Apex environment on 6.6.7.100.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import math
 import socket
 import threading
@@ -16,6 +17,7 @@ import rclpy
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.signals import SignalHandlerOptions
 from sensor_msgs.msg import CompressedImage, JointState
 from std_msgs.msg import Float32, Float32MultiArray, Int16MultiArray, Int32
 
@@ -45,18 +47,27 @@ from .config import (
     TOPIC_USER_CMD_L,
     TOPIC_USER_CMD_R,
 )
-from .joint_mapping import JointMap, JointMapError
+from .joint_mapping import JointMap, JointMapError, build_state16
 from .protocol import (
     ActionCommand,
     BridgeHello,
+    HoldPositionCommand,
+    LoadTrajectoryCommand,
     ProtocolError,
     RobotObservation,
+    RobotStateUpdate,
+    ResumeTrajectoryCommand,
+    StageRtcChunkCommand,
     StopCommand,
+    TrajectoryEvent,
+    TrajectoryHeartbeat,
     recv_message,
     require_current_version,
     send_message,
 )
-from .safety import SafetyError, validate_action
+from .safety import SafetyError, action_arms, filter_action, validate_action
+from .tracking import TrackingGovernor
+from .trajectory_timeline import TrajectoryTimeline
 
 
 def _now() -> float:
@@ -92,6 +103,8 @@ QOS_COMMAND = QoSProfile(
     history=HistoryPolicy.KEEP_LAST,
 )
 
+TRAJECTORY_CLIENT_ENVELOPE_RAD = 0.08
+
 
 class MarvinBridgeNode(Node):
     def __init__(
@@ -105,6 +118,14 @@ class MarvinBridgeNode(Node):
         max_status_age_s: float,
         max_observation_lag: int,
         joint_limit_margin_rad: float,
+        trajectory_state_timeout_s: float,
+        trajectory_timer_timeout_s: float,
+        trajectory_heartbeat_timeout_s: float,
+        tracking_run_error_rad: float,
+        tracking_resume_error_rad: float,
+        tracking_stop_error_rad: float,
+        tracking_tolerance_rad: float,
+        tracking_settle_seconds: float,
     ) -> None:
         super().__init__("marvinpro_rollout_bridge")
         self.allow_motion = allow_motion
@@ -115,9 +136,20 @@ class MarvinBridgeNode(Node):
         self.max_status_age_s = max_status_age_s
         self.max_observation_lag = max_observation_lag
         self.joint_limit_margin_rad = joint_limit_margin_rad
+        self.trajectory_state_timeout_s = trajectory_state_timeout_s
+        self.trajectory_timer_timeout_s = trajectory_timer_timeout_s
+        self.trajectory_heartbeat_timeout_s = trajectory_heartbeat_timeout_s
+        self.tracking_tolerance_rad = tracking_tolerance_rad
+        self.tracking_settle_seconds = tracking_settle_seconds
+        self._governor = TrackingGovernor(
+            run_error_rad=tracking_run_error_rad,
+            resume_error_rad=tracking_resume_error_rad,
+            stop_error_rad=tracking_stop_error_rad,
+        )
 
         self._lock = threading.RLock()
         self._observation_ready = threading.Condition(self._lock)
+        self._outbound_ready = threading.Condition(self._lock)
         self._joint_map: JointMap | None = None
         self._joints: tuple[float, ...] | None = None
         self._joints_t: float | None = None
@@ -133,6 +165,10 @@ class MarvinBridgeNode(Node):
         self._arm_state_t: float | None = None
         self._latest_observation: RobotObservation | None = None
         self._seq = 0
+        self._latest_state: RobotStateUpdate | None = None
+        self._state_seq = 0
+        self._events: deque[TrajectoryEvent] = deque()
+        self._event_seq = 0
 
         self._client_connected = False
         self._target: tuple[float, ...] | None = None
@@ -140,6 +176,35 @@ class MarvinBridgeNode(Node):
         self._target_command_id: int | None = None
         self._last_command_id: int | None = None
         self._last_command_status = "no command"
+
+        self._trajectory_session_id: str | None = None
+        self._trajectory_plan_id: str | None = None
+        self._timeline: TrajectoryTimeline | None = None
+        self._timeline_version = 0
+        self._phase: float | None = None
+        self._phase_rate = 0.0
+        self._handoff_anchor: tuple[float, ...] | None = None
+        self._handoff_phase: float | None = None
+        self._checkpoint_consumed = False
+        self._trajectory_paused = False
+        self._pause_kind: str | None = None
+        self._checkpoint_id = 0
+        self._checkpoint_stable_since: float | None = None
+        self._checkpoint_emitted = False
+        self._heartbeat_t: float | None = None
+        self._last_trajectory_tick: float | None = None
+        self._raw_reference: tuple[float, ...] | None = None
+        self._sent_target: tuple[float, ...] | None = None
+        self._tracking_error_rad: float | None = None
+        self._servo_error_rad: float | None = None
+        self._arm_clipped = False
+        self._frozen_reason: str | None = None
+        self._active_request_id: str | None = None
+        self._active_predicted_delay: int | None = None
+        self._actual_delay_steps = 0
+        self._inference_invalid = False
+        self._pending_rtc: StageRtcChunkCommand | None = None
+        self._trajectory_hold_action: tuple[float, ...] | None = None
 
         self.create_subscription(JointState, TOPIC_JOINT_STATES, self._on_joint_state, QOS_SENSOR)
         self.create_subscription(
@@ -163,6 +228,7 @@ class MarvinBridgeNode(Node):
         self.get_logger().info(f"bridge initialized at {publish_hz:.1f}Hz, {mode}")
 
     def _on_joint_state(self, msg: JointState) -> None:
+        now = _now()
         with self._lock:
             if self._joint_map is None:
                 try:
@@ -173,7 +239,8 @@ class MarvinBridgeNode(Node):
                     return
             try:
                 self._joints = self._joint_map.canonical_positions(list(msg.position))
-                self._joints_t = _now()
+                self._joints_t = now
+                self._refresh_state_locked(now)
             except JointMapError as exc:
                 self.get_logger().error(str(exc))
 
@@ -239,6 +306,153 @@ class MarvinBridgeNode(Node):
             return False, "arm_state is stale"
         return True, "ready"
 
+    def _trajectory_mode_locked(self) -> str:
+        if self._trajectory_session_id is None:
+            return "legacy"
+        if self._trajectory_hold_action is not None:
+            return "hold"
+        return "trajectory"
+
+    def _refresh_state_locked(self, now: float) -> None:
+        if self._joints is None or self._gripper_l is None or self._gripper_r is None:
+            return
+        assert self._joints_t is not None
+        ready, reason = self._readiness_gate_locked(now)
+        self._state_seq += 1
+        self._latest_state = RobotStateUpdate(
+            state_seq=self._state_seq,
+            # Timer-driven phase/status updates must not masquerade as new robot
+            # feedback. This timestamp advances only in the joint callback.
+            sampled_monotonic=self._joints_t,
+            joints=self._joints,
+            gripper_raw_left=self._gripper_l,
+            gripper_raw_right=self._gripper_r,
+            motion_gate_open=ready,
+            gate_reason=reason,
+            last_command_id=self._last_command_id,
+            last_command_status=self._last_command_status,
+            trajectory_mode=self._trajectory_mode_locked(),
+            session_id=self._trajectory_session_id,
+            plan_id=self._trajectory_plan_id,
+            timeline_version=self._timeline_version,
+            phase=self._phase,
+            phase_rate=self._phase_rate,
+            raw_reference=self._raw_reference,
+            sent_target=self._sent_target,
+            tracking_error_rad=self._tracking_error_rad,
+            servo_error_rad=self._servo_error_rad,
+            arm_clipped=self._arm_clipped,
+            frozen_reason=self._frozen_reason,
+            active_request_id=self._active_request_id,
+        )
+        self._outbound_ready.notify_all()
+
+    def _emit_event_locked(
+        self,
+        event_type: str,
+        now: float,
+        *,
+        session_id: str | None = None,
+        plan_id: str | None = None,
+        timeline_version: int | None = None,
+        checkpoint_id: int | None = None,
+        stable_monotonic: float | None = None,
+        observation_seq_at_stable: int | None = None,
+        old_remaining_actions_absolute: tuple[tuple[float, ...], ...] = (),
+        request_id: str | None = None,
+        predicted_delay_steps: int | None = None,
+        actual_delay_steps: int | None = None,
+        detail: str = "",
+    ) -> None:
+        resolved_session_id = session_id or self._trajectory_session_id
+        resolved_plan_id = plan_id or self._trajectory_plan_id
+        if resolved_session_id is None or resolved_plan_id is None:
+            return
+        self._event_seq += 1
+        self._events.append(
+            TrajectoryEvent(
+                event_seq=self._event_seq,
+                event_type=event_type,
+                emitted_monotonic=now,
+                session_id=resolved_session_id,
+                plan_id=resolved_plan_id,
+                timeline_version=(self._timeline_version if timeline_version is None else timeline_version),
+                phase=0.0 if self._phase is None else self._phase,
+                checkpoint_id=checkpoint_id,
+                stable_monotonic=stable_monotonic,
+                observation_seq_at_stable=observation_seq_at_stable,
+                old_remaining_actions_absolute=old_remaining_actions_absolute,
+                request_id=request_id,
+                predicted_delay_steps=predicted_delay_steps,
+                actual_delay_steps=actual_delay_steps,
+                detail=detail,
+            )
+        )
+        if len(self._events) > 128:
+            self._clear_trajectory_locked("trajectory event queue overflow", now, emit_event=False)
+        self._outbound_ready.notify_all()
+
+    def _clear_trajectory_locked(self, status: str, now: float, *, emit_event: bool = True) -> None:
+        if emit_event:
+            self._emit_event_locked("trajectory_stopped", now, detail=status)
+        self._trajectory_session_id = None
+        self._trajectory_plan_id = None
+        self._timeline = None
+        self._phase = None
+        self._phase_rate = 0.0
+        self._handoff_anchor = None
+        self._handoff_phase = None
+        self._checkpoint_consumed = False
+        self._trajectory_paused = False
+        self._pause_kind = None
+        self._checkpoint_stable_since = None
+        self._checkpoint_emitted = False
+        self._heartbeat_t = None
+        self._raw_reference = None
+        self._sent_target = None
+        self._tracking_error_rad = None
+        self._servo_error_rad = None
+        self._arm_clipped = False
+        self._frozen_reason = None
+        self._active_request_id = None
+        self._active_predicted_delay = None
+        self._actual_delay_steps = 0
+        self._inference_invalid = False
+        self._pending_rtc = None
+        self._trajectory_hold_action = None
+        self._governor.reset()
+        self._clear_target_locked(status)
+
+    def next_outbound(
+        self,
+        *,
+        last_state_seq: int,
+        last_observation_seq: int,
+        prefer_observation: bool,
+        stop: threading.Event,
+        timeout_s: float = 1.0,
+    ) -> object | None:
+        deadline = _now() + timeout_s
+        with self._outbound_ready:
+            while not stop.is_set():
+                if self._events:
+                    return self._events.popleft()
+                observation_ready = (
+                    self._latest_observation is not None and self._latest_observation.seq > last_observation_seq
+                )
+                state_ready = self._latest_state is not None and self._latest_state.state_seq > last_state_seq
+                if prefer_observation and observation_ready:
+                    return self._latest_observation
+                if state_ready:
+                    return self._latest_state
+                if observation_ready:
+                    return self._latest_observation
+                remaining = deadline - _now()
+                if remaining <= 0:
+                    return None
+                self._outbound_ready.wait(timeout=remaining)
+        return None
+
     def _on_image(self, msg: CompressedImage) -> None:
         now = _now()
         with self._observation_ready:
@@ -267,24 +481,244 @@ class MarvinBridgeNode(Node):
                 gate_reason=reason,
                 last_command_id=self._last_command_id,
                 last_command_status=self._last_command_status,
+                extra={
+                    "state_seq": self._state_seq,
+                    "state_sampled_monotonic": self._joints_t,
+                },
             )
             self._observation_ready.notify_all()
+            self._outbound_ready.notify_all()
 
     def client_connected(self) -> None:
         with self._lock:
+            self._events.clear()
             self._client_connected = True
             self._clear_target_locked("client connected; waiting for action")
+            self._refresh_state_locked(_now())
 
     def client_disconnected(self) -> None:
         with self._lock:
             self._client_connected = False
-            self._clear_target_locked("client disconnected; command publication stopped")
+            now = _now()
+            if self._trajectory_session_id is not None:
+                self._clear_trajectory_locked(
+                    "client disconnected; command publication stopped", now, emit_event=False
+                )
+            else:
+                self._clear_target_locked("client disconnected; command publication stopped")
+            self._refresh_state_locked(now)
 
     def _clear_target_locked(self, status: str) -> None:
         self._target = None
         self._target_t = None
         self._target_command_id = None
         self._last_command_status = status
+
+    def _check_observation_lag_locked(self, observation_seq: int) -> None:
+        if self._latest_observation is None:
+            raise SafetyError("no camera observation")
+        lag = self._latest_observation.seq - int(observation_seq)
+        if lag < 0 or lag > self.max_observation_lag:
+            raise SafetyError(f"action observation lag is {lag} frames (limit {self.max_observation_lag})")
+
+    def _validate_trajectory_knots_locked(self, timeline: TrajectoryTimeline) -> None:
+        for knot in timeline.knots:
+            validate_action(
+                knot,
+                action_arms(knot),
+                max_joint_step_rad=self.max_joint_step_rad,
+                joint_limit_margin_rad=self.joint_limit_margin_rad,
+            )
+
+    def _accept_load_trajectory_locked(self, message: LoadTrajectoryCommand, now: float) -> None:
+        require_current_version(message)
+        if not message.execute:
+            raise SafetyError("execute flag is false")
+        if abs(self.publish_hz - 100.0) > 1e-6:
+            raise SafetyError("trajectory mode requires bridge --publish-hz 100")
+        ready, reason = self._readiness_gate_locked(now)
+        if not ready:
+            raise SafetyError(reason)
+        self._check_observation_lag_locked(message.observation_seq)
+        if self._trajectory_session_id is not None and message.session_id != self._trajectory_session_id:
+            raise SafetyError("another trajectory session is active")
+        if message.expected_timeline_version != self._timeline_version:
+            raise SafetyError(
+                f"timeline version mismatch: expected {message.expected_timeline_version}, current {self._timeline_version}"
+            )
+        timeline = TrajectoryTimeline(message.knots, message.knot_hz, message.checkpoint_horizon)
+        self._validate_trajectory_knots_locked(timeline)
+        if timeline.horizon != 10:
+            raise SafetyError("trajectory mode currently requires horizon 10")
+        assert self._joints is not None and self._gripper_l is not None and self._gripper_r is not None
+        self._clear_target_locked("trajectory ownership enabled")
+        self._trajectory_session_id = message.session_id
+        self._trajectory_plan_id = message.plan_id
+        self._timeline = timeline
+        self._timeline_version += 1
+        self._phase = 0.0
+        self._phase_rate = 0.0
+        self._handoff_anchor = build_state16(self._joints, self._gripper_l, self._gripper_r)
+        self._handoff_phase = 0.0
+        self._checkpoint_consumed = False
+        self._trajectory_paused = False
+        self._pause_kind = None
+        self._checkpoint_stable_since = None
+        self._checkpoint_emitted = False
+        self._heartbeat_t = now
+        self._last_trajectory_tick = now
+        self._raw_reference = self._handoff_anchor
+        self._sent_target = self._handoff_anchor
+        self._tracking_error_rad = 0.0
+        self._servo_error_rad = 0.0
+        self._arm_clipped = False
+        self._frozen_reason = None
+        self._active_request_id = None
+        self._active_predicted_delay = None
+        self._actual_delay_steps = 0
+        self._inference_invalid = False
+        self._pending_rtc = None
+        self._trajectory_hold_action = None
+        self._governor.reset()
+        self._last_command_id = message.command_id
+        self._last_command_status = f"loaded trajectory {message.plan_id} version {self._timeline_version}"
+        self._emit_event_locked("trajectory_loaded", now, detail=self._last_command_status)
+
+    def _accept_resume_locked(self, message: ResumeTrajectoryCommand, now: float) -> None:
+        require_current_version(message)
+        if (
+            message.session_id != self._trajectory_session_id
+            or message.plan_id != self._trajectory_plan_id
+            or message.timeline_version != self._timeline_version
+            or message.checkpoint_id != self._checkpoint_id
+        ):
+            raise SafetyError("resume command does not match the active checkpoint")
+        if not self._trajectory_paused or self._pause_kind != "checkpoint" or not self._checkpoint_emitted:
+            raise SafetyError("trajectory is not waiting at a completed checkpoint")
+        assert self._timeline is not None
+        max_delay = min(self._timeline.checkpoint_horizon, self._timeline.horizon - self._timeline.checkpoint_horizon)
+        if not 1 <= message.predicted_delay_steps <= max_delay:
+            raise SafetyError(f"predicted delay must be within 1..{max_delay}")
+        self._trajectory_paused = False
+        self._pause_kind = None
+        self._checkpoint_consumed = True
+        self._active_request_id = message.request_id
+        self._active_predicted_delay = message.predicted_delay_steps
+        self._actual_delay_steps = 0
+        self._inference_invalid = False
+        self._pending_rtc = None
+        self._checkpoint_stable_since = None
+        self._last_command_id = message.command_id
+        self._last_command_status = f"resumed trajectory for RTC request {message.request_id}"
+        self._emit_event_locked(
+            "rtc_resumed",
+            now,
+            checkpoint_id=message.checkpoint_id,
+            request_id=message.request_id,
+            predicted_delay_steps=message.predicted_delay_steps,
+        )
+
+    def _apply_rtc_replacement_locked(self, message: StageRtcChunkCommand, now: float) -> None:
+        assert self._timeline is not None and self._raw_reference is not None
+        if self._inference_invalid:
+            raise SafetyError("RTC inference epoch was invalidated by tracking or safety")
+        if self._actual_delay_steps > message.predicted_delay_steps:
+            raise SafetyError(
+                f"actual delay {self._actual_delay_steps} exceeds prediction {message.predicted_delay_steps}"
+            )
+        timeline, phase = self._timeline.replacement(
+            message.actions,
+            actual_delay_steps=self._actual_delay_steps,
+            anchor=self._raw_reference,
+        )
+        self._validate_trajectory_knots_locked(timeline)
+        old_plan_id = self._trajectory_plan_id
+        self._timeline = timeline
+        self._trajectory_plan_id = message.replacement_plan_id
+        self._timeline_version += 1
+        self._phase = phase
+        self._handoff_anchor = None
+        self._handoff_phase = None
+        self._checkpoint_consumed = False
+        self._trajectory_paused = phase >= timeline.checkpoint_phase
+        self._pause_kind = "checkpoint" if self._trajectory_paused else None
+        self._checkpoint_stable_since = None
+        self._checkpoint_emitted = False
+        self._active_request_id = None
+        self._active_predicted_delay = None
+        actual_delay = self._actual_delay_steps
+        self._actual_delay_steps = 0
+        self._pending_rtc = None
+        self._governor.reset()
+        self._last_command_status = f"merged RTC plan {message.replacement_plan_id} after {actual_delay} steps"
+        self._emit_event_locked(
+            "rtc_merged",
+            now,
+            checkpoint_id=message.checkpoint_id,
+            request_id=message.request_id,
+            predicted_delay_steps=message.predicted_delay_steps,
+            actual_delay_steps=actual_delay,
+            detail=f"replaced {old_plan_id} with {message.replacement_plan_id}",
+        )
+
+    def _accept_stage_rtc_locked(self, message: StageRtcChunkCommand, now: float) -> None:
+        require_current_version(message)
+        if (
+            message.session_id != self._trajectory_session_id
+            or message.base_plan_id != self._trajectory_plan_id
+            or message.timeline_version != self._timeline_version
+            or message.checkpoint_id != self._checkpoint_id
+            or message.request_id != self._active_request_id
+        ):
+            raise SafetyError("RTC result IDs do not match the active inference epoch")
+        if message.predicted_delay_steps != self._active_predicted_delay:
+            raise SafetyError("RTC result predicted delay changed in flight")
+        if self._inference_invalid:
+            raise SafetyError("RTC inference epoch was invalidated by tracking or safety")
+        assert self._timeline is not None
+        if message.execution_horizon != self._timeline.checkpoint_horizon:
+            raise SafetyError("RTC execution horizon does not match the timeline checkpoint")
+        candidate = TrajectoryTimeline(message.actions, self._timeline.knot_hz, message.execution_horizon)
+        self._validate_trajectory_knots_locked(candidate)
+        self._last_command_id = message.command_id
+        if self._trajectory_paused and self._pause_kind == "rtc_deadline":
+            self._apply_rtc_replacement_locked(message, now)
+            return
+        if self._pending_rtc is not None:
+            raise SafetyError("an RTC replacement is already staged")
+        self._pending_rtc = message
+        self._last_command_status = f"staged RTC result {message.request_id}"
+
+    def _accept_hold_locked(self, message: HoldPositionCommand, now: float) -> None:
+        require_current_version(message)
+        if not message.execute:
+            raise SafetyError("execute flag is false")
+        if message.session_id != self._trajectory_session_id:
+            raise SafetyError("hold command does not match trajectory session")
+        if message.expected_timeline_version != self._timeline_version:
+            raise SafetyError("hold command timeline version mismatch")
+        assert self._joints is not None
+        target = validate_action(
+            message.action,
+            self._joints,
+            max_joint_step_rad=self.max_joint_step_rad,
+            joint_limit_margin_rad=self.joint_limit_margin_rad,
+        )
+        self._timeline = None
+        self._trajectory_hold_action = target
+        self._timeline_version += 1
+        self._phase = None
+        self._phase_rate = 0.0
+        self._trajectory_paused = True
+        self._pause_kind = "hold"
+        self._heartbeat_t = now
+        self._raw_reference = target
+        self._sent_target = target
+        self._active_request_id = None
+        self._pending_rtc = None
+        self._last_command_id = message.command_id
+        self._last_command_status = f"holding fixed position: {message.reason}"
+        self._emit_event_locked("holding", now, detail=message.reason)
 
     def accept_command(self, message) -> None:
         now = _now()
@@ -295,68 +729,337 @@ class MarvinBridgeNode(Node):
                 except ProtocolError as exc:
                     self._clear_target_locked(f"rejected stop: {exc}")
                     return
-                self._clear_target_locked(f"stopped: {message.reason}")
-                return
-            if not isinstance(message, ActionCommand):
-                self._clear_target_locked(f"rejected unexpected message {type(message).__name__}")
+                if self._trajectory_session_id is not None:
+                    self._clear_trajectory_locked(f"stopped: {message.reason}", now)
+                else:
+                    self._clear_target_locked(f"stopped: {message.reason}")
                 return
 
-            self._last_command_id = message.command_id
+            if isinstance(message, TrajectoryHeartbeat):
+                try:
+                    require_current_version(message)
+                    if message.session_id != self._trajectory_session_id:
+                        raise SafetyError("heartbeat session mismatch")
+                    if message.timeline_version != self._timeline_version:
+                        raise SafetyError("heartbeat timeline version mismatch")
+                    self._heartbeat_t = now
+                except (ProtocolError, SafetyError) as exc:
+                    self._last_command_status = f"rejected trajectory heartbeat: {exc}"
+                return
+
             try:
-                require_current_version(message)
-                if not message.execute:
-                    raise SafetyError("execute flag is false")
-                ready, reason = self._readiness_gate_locked(now)
-                if not ready:
-                    raise SafetyError(reason)
-                if self._latest_observation is None:
-                    raise SafetyError("no camera observation")
-                lag = self._latest_observation.seq - int(message.observation_seq)
-                if lag < 0 or lag > self.max_observation_lag:
-                    raise SafetyError(
-                        f"action observation lag is {lag} frames (limit {self.max_observation_lag})"
-                    )
-                assert self._joints is not None
-                target = validate_action(
-                    message.action,
-                    self._joints,
-                    max_joint_step_rad=self.max_joint_step_rad,
-                    joint_limit_margin_rad=self.joint_limit_margin_rad,
-                )
+                if isinstance(message, LoadTrajectoryCommand):
+                    self._accept_load_trajectory_locked(message, now)
+                elif isinstance(message, ResumeTrajectoryCommand):
+                    self._accept_resume_locked(message, now)
+                elif isinstance(message, StageRtcChunkCommand):
+                    self._accept_stage_rtc_locked(message, now)
+                elif isinstance(message, HoldPositionCommand):
+                    self._accept_hold_locked(message, now)
+                elif isinstance(message, ActionCommand):
+                    if self._trajectory_session_id is not None:
+                        raise SafetyError("legacy action rejected while trajectory session owns the bridge")
+                    self._accept_legacy_action_locked(message, now)
+                else:
+                    raise ProtocolError(f"unexpected message {type(message).__name__}")
             except (ProtocolError, SafetyError, TypeError, ValueError) as exc:
-                self._clear_target_locked(f"rejected command {message.command_id}: {exc}")
+                command_id = getattr(message, "command_id", "unknown")
+                self._last_command_status = f"rejected command {command_id}: {exc}"
+                if isinstance(message, ActionCommand) and self._trajectory_session_id is None:
+                    self._clear_target_locked(self._last_command_status)
+                if isinstance(
+                    message,
+                    (LoadTrajectoryCommand, ResumeTrajectoryCommand, StageRtcChunkCommand, HoldPositionCommand),
+                ):
+                    rejected_plan_id = getattr(
+                        message,
+                        "plan_id",
+                        getattr(message, "base_plan_id", self._trajectory_plan_id),
+                    )
+                    self._emit_event_locked(
+                        "trajectory_command_rejected",
+                        now,
+                        session_id=getattr(message, "session_id", self._trajectory_session_id),
+                        plan_id=rejected_plan_id,
+                        timeline_version=getattr(
+                            message,
+                            "timeline_version",
+                            getattr(message, "expected_timeline_version", self._timeline_version),
+                        ),
+                        checkpoint_id=getattr(message, "checkpoint_id", None),
+                        request_id=getattr(message, "request_id", None),
+                        detail=str(exc),
+                    )
+            self._refresh_state_locked(now)
+
+    def _accept_legacy_action_locked(self, message: ActionCommand, now: float) -> None:
+        self._last_command_id = message.command_id
+        require_current_version(message)
+        if not message.execute:
+            raise SafetyError("execute flag is false")
+        ready, reason = self._readiness_gate_locked(now)
+        if not ready:
+            raise SafetyError(reason)
+        self._check_observation_lag_locked(message.observation_seq)
+        assert self._joints is not None
+        target = validate_action(
+            message.action,
+            self._joints,
+            max_joint_step_rad=self.max_joint_step_rad,
+            joint_limit_margin_rad=self.joint_limit_margin_rad,
+        )
+        self._target = target
+        self._target_t = now
+        self._target_command_id = message.command_id
+        self._last_command_status = f"accepted command {message.command_id}"
+
+    @staticmethod
+    def _arm_error(action: tuple[float, ...], joints: tuple[float, ...]) -> float:
+        return max(abs(target - measured) for target, measured in zip(action_arms(action), joints))
+
+    def _trajectory_reference_locked(self) -> tuple[float, ...] | None:
+        if self._trajectory_hold_action is not None:
+            return self._trajectory_hold_action
+        if self._timeline is None or self._phase is None:
+            return None
+        if self._handoff_phase is not None and self._handoff_anchor is not None:
+            destination = self._timeline.knots[0]
+            blend = max(0.0, min(1.0, self._handoff_phase))
+            return tuple(a + (b - a) * blend for a, b in zip(self._handoff_anchor, destination))
+        return self._timeline.value(self._phase)
+
+    def _invalidate_active_rtc_locked(self, now: float, reason: str) -> None:
+        if self._active_request_id is None or self._inference_invalid:
+            return
+        self._inference_invalid = True
+        self._trajectory_paused = True
+        self._pause_kind = "rtc_invalid"
+        self._pending_rtc = None
+        self._checkpoint_stable_since = None
+        self._checkpoint_emitted = False
+        self._emit_event_locked(
+            "rtc_invalid",
+            now,
+            checkpoint_id=self._checkpoint_id,
+            request_id=self._active_request_id,
+            predicted_delay_steps=self._active_predicted_delay,
+            actual_delay_steps=self._actual_delay_steps,
+            detail=reason,
+        )
+
+    def _update_pause_settle_locked(
+        self,
+        now: float,
+        *,
+        state_stale: bool,
+        timer_overrun: bool,
+    ) -> None:
+        if (
+            not self._trajectory_paused
+            or self._raw_reference is None
+            or self._joints is None
+            or self._joints_t is None
+            or state_stale
+            or timer_overrun
+        ):
+            self._checkpoint_stable_since = None
+            return
+        error = self._arm_error(self._raw_reference, self._joints)
+        if error > self.tracking_tolerance_rad:
+            self._checkpoint_stable_since = None
+            return
+        if self._checkpoint_stable_since is None:
+            self._checkpoint_stable_since = self._joints_t
+            return
+        if (
+            self._joints_t < self._checkpoint_stable_since
+            or self._joints_t - self._checkpoint_stable_since < self.tracking_settle_seconds
+        ):
+            if self._joints_t < self._checkpoint_stable_since:
+                self._checkpoint_stable_since = None
+            return
+        if self._checkpoint_emitted:
+            return
+        self._checkpoint_emitted = True
+        stable_monotonic = self._joints_t
+        if self._pause_kind == "checkpoint":
+            assert self._timeline is not None
+            self._emit_event_locked(
+                "checkpoint_ready",
+                now,
+                checkpoint_id=self._checkpoint_id,
+                stable_monotonic=stable_monotonic,
+                observation_seq_at_stable=self._seq,
+                old_remaining_actions_absolute=self._timeline.remaining_after_checkpoint(),
+            )
+        elif self._pause_kind == "rtc_invalid":
+            self._emit_event_locked(
+                "fallback_ready",
+                now,
+                checkpoint_id=self._checkpoint_id,
+                stable_monotonic=stable_monotonic,
+                observation_seq_at_stable=self._seq,
+                request_id=self._active_request_id,
+                predicted_delay_steps=self._active_predicted_delay,
+                actual_delay_steps=self._actual_delay_steps,
+                detail="RTC inference invalid; synchronized fallback may observe",
+            )
+
+    def _advance_trajectory_locked(self, now: float, dt: float, phase_rate: float) -> None:
+        if self._timeline is None or self._phase is None or self._trajectory_paused:
+            return
+        if self._handoff_phase is not None:
+            self._handoff_phase = min(1.0, self._handoff_phase + self._timeline.knot_hz * phase_rate * dt)
+            if self._handoff_phase >= 1.0:
+                self._handoff_phase = None
+                self._handoff_anchor = None
+                self._phase = 0.0
+            return
+
+        old_phase = self._phase
+        phase_limit = self._timeline.final_phase if self._checkpoint_consumed else self._timeline.checkpoint_phase
+        new_phase = min(phase_limit, old_phase + self._timeline.knot_hz * phase_rate * dt)
+        old_index = int(math.floor(old_phase + 1e-9))
+        new_index = int(math.floor(new_phase + 1e-9))
+        crossed = max(0, new_index - old_index)
+        if crossed and self._active_request_id is not None:
+            reaches_deadline = (
+                self._active_predicted_delay is not None
+                and self._actual_delay_steps + crossed >= self._active_predicted_delay
+            )
+            if self._pending_rtc is not None or reaches_deadline:
+                new_phase = float(old_index + 1)
+                crossed = 1
+        self._phase = new_phase
+
+        if crossed and self._active_request_id is not None:
+            self._actual_delay_steps += crossed
+            self._raw_reference = self._timeline.value(new_phase)
+            if self._pending_rtc is not None:
+                pending = self._pending_rtc
+                try:
+                    self._apply_rtc_replacement_locked(pending, now)
+                except (SafetyError, ValueError) as exc:
+                    self._invalidate_active_rtc_locked(now, str(exc))
+                return
+            if (
+                self._active_predicted_delay is not None
+                and self._actual_delay_steps >= self._active_predicted_delay
+            ):
+                self._trajectory_paused = True
+                self._pause_kind = "rtc_deadline"
+                self._phase_rate = 0.0
+                self._frozen_reason = "waiting for RTC result at predicted delay boundary"
+                self._emit_event_locked(
+                    "rtc_waiting_at_deadline",
+                    now,
+                    checkpoint_id=self._checkpoint_id,
+                    request_id=self._active_request_id,
+                    predicted_delay_steps=self._active_predicted_delay,
+                    actual_delay_steps=self._actual_delay_steps,
+                )
                 return
 
-            self._target = target
-            self._target_t = now
-            self._target_command_id = message.command_id
-            self._last_command_status = f"accepted command {message.command_id}"
+        if not self._checkpoint_consumed and new_phase >= self._timeline.checkpoint_phase:
+            self._phase = self._timeline.checkpoint_phase
+            self._trajectory_paused = True
+            self._pause_kind = "checkpoint"
+            self._phase_rate = 0.0
+            self._checkpoint_id += 1
+            self._checkpoint_stable_since = None
+            self._checkpoint_emitted = False
+
+    def _trajectory_target_locked(self, now: float) -> tuple[tuple[float, ...], int | None] | None:
+        if self._heartbeat_t is None or now - self._heartbeat_t > self.trajectory_heartbeat_timeout_s:
+            self._clear_trajectory_locked("trajectory heartbeat timed out; publication stopped", now)
+            return None
+        assert self._joints is not None
+        raw = self._trajectory_reference_locked()
+        if raw is None:
+            return None
+        state_age = _age(now, self._joints_t)
+        dt = 0.0 if self._last_trajectory_tick is None else now - self._last_trajectory_tick
+        self._last_trajectory_tick = now
+        state_stale = state_age is None or state_age > self.trajectory_state_timeout_s
+        timer_overrun = dt > self.trajectory_timer_timeout_s
+        try:
+            filtered = filter_action(
+                raw,
+                self._joints,
+                max_joint_step_rad=TRAJECTORY_CLIENT_ENVELOPE_RAD,
+                joint_limit_margin_rad=self.joint_limit_margin_rad,
+            )
+            arm_clipped = any(index not in (7, 15) for index in filtered.clipped_indices)
+            target = validate_action(
+                filtered.action,
+                self._joints,
+                max_joint_step_rad=self.max_joint_step_rad,
+                joint_limit_margin_rad=self.joint_limit_margin_rad,
+            )
+        except SafetyError as exc:
+            self._clear_trajectory_locked(f"trajectory safety check failed: {exc}", now)
+            return None
+
+        tracking_error = self._arm_error(raw, self._joints)
+        servo_error = self._arm_error(target, self._joints)
+        decision = self._governor.update(
+            tracking_error,
+            state_stale=state_stale,
+            timer_overrun=timer_overrun,
+            arm_clipped=arm_clipped,
+        )
+        self._raw_reference = raw
+        self._sent_target = target
+        self._tracking_error_rad = tracking_error
+        self._servo_error_rad = servo_error
+        self._arm_clipped = arm_clipped
+        self._phase_rate = 0.0 if self._trajectory_paused else decision.phase_rate
+        self._frozen_reason = self._pause_kind if self._trajectory_paused else decision.frozen_reason
+        if decision.hard_frozen:
+            self._invalidate_active_rtc_locked(now, decision.frozen_reason or "tracking governor froze")
+        self._advance_trajectory_locked(now, dt, self._phase_rate)
+        self._update_pause_settle_locked(
+            now,
+            state_stale=state_stale,
+            timer_overrun=timer_overrun,
+        )
+        return target, self._last_command_id
 
     def _publish_target(self) -> None:
         now = _now()
         with self._lock:
             ready, reason = self._readiness_gate_locked(now)
             if not ready:
-                if self._target is not None:
+                if self._trajectory_session_id is not None:
+                    self._clear_trajectory_locked(f"publication blocked: {reason}", now)
+                elif self._target is not None:
                     self._clear_target_locked(f"publication blocked: {reason}")
+                self._refresh_state_locked(now)
                 return
-            if self._target is None or self._target_t is None:
-                return
-            if now - self._target_t > self.command_timeout_s:
-                self._clear_target_locked("command timed out; publication stopped")
-                return
-            assert self._joints is not None
-            try:
-                target = validate_action(
-                    self._target,
-                    self._joints,
-                    max_joint_step_rad=self.max_joint_step_rad,
-                    joint_limit_margin_rad=self.joint_limit_margin_rad,
-                )
-            except SafetyError as exc:
-                self._clear_target_locked(f"publication safety check failed: {exc}")
-                return
-            command_id = self._target_command_id
+            if self._trajectory_session_id is not None:
+                trajectory_target = self._trajectory_target_locked(now)
+                self._refresh_state_locked(now)
+                if trajectory_target is None:
+                    return
+                target, command_id = trajectory_target
+            else:
+                if self._target is None or self._target_t is None:
+                    return
+                if now - self._target_t > self.command_timeout_s:
+                    self._clear_target_locked("command timed out; publication stopped")
+                    return
+                assert self._joints is not None
+                try:
+                    target = validate_action(
+                        self._target,
+                        self._joints,
+                        max_joint_step_rad=self.max_joint_step_rad,
+                        joint_limit_margin_rad=self.joint_limit_margin_rad,
+                    )
+                except SafetyError as exc:
+                    self._clear_target_locked(f"publication safety check failed: {exc}")
+                    return
+                command_id = self._target_command_id
 
         left = JointcmdArm()
         left.header.stamp = self.get_clock().now().to_msg()
@@ -418,7 +1121,7 @@ class DoctorNode(Node):
 
 
 def doctor(duration_s: float) -> int:
-    rclpy.init()
+    rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
     node = DoctorNode()
     started = _now()
     try:
@@ -444,7 +1147,7 @@ def doctor(duration_s: float) -> int:
             print(f"  joint mapping: FAILED: {exc}")
     print("  expected before execution: input_mode=3, robot_state=(3, 3), arm_state=(3, 3)")
     node.destroy_node()
-    rclpy.shutdown()
+    rclpy.try_shutdown()
     return 1 if failed else 0
 
 
@@ -454,7 +1157,9 @@ def _serve_client(conn: socket.socket, address, node: MarvinBridgeNode) -> None:
     # Skip the cached frame captured before client_connected() opened that part
     # of the readiness gate. The first frame sent to a client reflects the
     # current connection state.
-    last_seq = node.latest_observation_seq()
+    last_observation_seq = node.latest_observation_seq()
+    last_state_seq = 0
+    prefer_observation = False
     print(f"[bridge] rollout client connected from {address[0]}:{address[1]}", flush=True)
     try:
         send_message(
@@ -483,11 +1188,21 @@ def _serve_client(conn: socket.socket, address, node: MarvinBridgeNode) -> None:
         receiver = threading.Thread(target=receive_commands, daemon=True)
         receiver.start()
         while not stop.is_set():
-            observation = node.wait_for_observation(last_seq, stop)
-            if observation is None:
+            message = node.next_outbound(
+                last_state_seq=last_state_seq,
+                last_observation_seq=last_observation_seq,
+                prefer_observation=prefer_observation,
+                stop=stop,
+            )
+            if message is None:
                 continue
-            send_message(conn, observation)
-            last_seq = observation.seq
+            send_message(conn, message)
+            if isinstance(message, RobotStateUpdate):
+                last_state_seq = message.state_seq
+                prefer_observation = True
+            elif isinstance(message, RobotObservation):
+                last_observation_seq = message.seq
+                prefer_observation = False
     except (BrokenPipeError, ConnectionResetError, OSError, ProtocolError) as exc:
         print(f"[bridge] observation sender stopped: {exc}", flush=True)
     finally:
@@ -499,6 +1214,13 @@ def _serve_client(conn: socket.socket, address, node: MarvinBridgeNode) -> None:
             pass
         conn.close()
         print("[bridge] rollout client disconnected; publishing is stopped", flush=True)
+
+
+def _shutdown_ros_runtime(executor, spin_thread: threading.Thread, node: MarvinBridgeNode) -> None:
+    executor.shutdown()
+    spin_thread.join(timeout=2.0)
+    node.destroy_node()
+    rclpy.try_shutdown()
 
 
 def serve(args: argparse.Namespace) -> int:
@@ -513,7 +1235,10 @@ def serve(args: argparse.Namespace) -> int:
         print(f"[bridge] cannot listen on {args.bind_host}:{args.port}: {exc}", flush=True)
         return 2
 
-    rclpy.init()
+    # The default rclpy SIGINT handler shuts the context down underneath the
+    # spin thread. Keep signal handling in this function so teardown has one
+    # owner and Ctrl+C cannot race a second rclpy.shutdown().
+    rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
     node = MarvinBridgeNode(
         allow_motion=args.allow_motion,
         publish_hz=args.publish_hz,
@@ -523,6 +1248,14 @@ def serve(args: argparse.Namespace) -> int:
         max_status_age_s=args.max_status_age,
         max_observation_lag=args.max_observation_lag,
         joint_limit_margin_rad=args.joint_limit_margin_rad,
+        trajectory_state_timeout_s=args.trajectory_state_timeout,
+        trajectory_timer_timeout_s=args.trajectory_timer_timeout,
+        trajectory_heartbeat_timeout_s=args.trajectory_heartbeat_timeout,
+        tracking_run_error_rad=args.tracking_run_error_rad,
+        tracking_resume_error_rad=args.tracking_resume_error_rad,
+        tracking_stop_error_rad=args.tracking_stop_error_rad,
+        tracking_tolerance_rad=args.tracking_tolerance_rad,
+        tracking_settle_seconds=args.tracking_settle_seconds,
     )
     executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
@@ -546,9 +1279,7 @@ def serve(args: argparse.Namespace) -> int:
     finally:
         node.client_disconnected()
         server.close()
-        executor.shutdown()
-        node.destroy_node()
-        rclpy.shutdown()
+        _shutdown_ros_runtime(executor, spin_thread, node)
     return 0
 
 
@@ -566,9 +1297,32 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-state-age", type=float, default=0.20)
     parser.add_argument("--max-status-age", type=float, default=0.50)
     parser.add_argument("--max-observation-lag", type=int, default=8)
+    parser.add_argument("--trajectory-state-timeout", type=float, default=0.05)
+    parser.add_argument("--trajectory-timer-timeout", type=float, default=0.05)
+    parser.add_argument("--trajectory-heartbeat-timeout", type=float, default=0.25)
+    parser.add_argument("--tracking-run-error-rad", type=float, default=0.01)
+    parser.add_argument("--tracking-resume-error-rad", type=float, default=0.03)
+    parser.add_argument("--tracking-stop-error-rad", type=float, default=0.04)
+    parser.add_argument("--tracking-tolerance-rad", type=float, default=0.01)
+    parser.add_argument("--tracking-settle-seconds", type=float, default=0.20)
     args = parser.parse_args(argv)
     if args.publish_hz <= 0 or args.command_timeout <= 0 or args.duration <= 0:
         parser.error("rates, timeouts, and duration must be positive")
+    if not (
+        0 < args.tracking_run_error_rad
+        < args.tracking_resume_error_rad
+        < args.tracking_stop_error_rad
+        < TRAJECTORY_CLIENT_ENVELOPE_RAD
+    ):
+        parser.error("tracking thresholds must satisfy 0 < run < resume < stop < 0.08")
+    if min(
+        args.trajectory_state_timeout,
+        args.trajectory_timer_timeout,
+        args.trajectory_heartbeat_timeout,
+        args.tracking_tolerance_rad,
+        args.tracking_settle_seconds,
+    ) <= 0:
+        parser.error("trajectory timeouts and tracking parameters must be positive")
     return args
 
 

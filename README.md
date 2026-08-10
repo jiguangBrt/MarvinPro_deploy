@@ -157,6 +157,70 @@ hold，不会重复执行过时的预测动作。
 
 bridge 使用 pickle 传输 JPEG 和数据结构，只能暴露在可信的机器人私有网络，不应映射到公网。
 
+## 跟踪感知时间轴与 RTC（protocol v2）
+
+`tracking` 和 `rtc` 使用 bridge 本地 100 Hz trajectory owner。控制 timer 只对连续 phase 求值，不会按
+100 Hz 自动消费模型动作；机器人跟踪误差增大时，phase 会减速或冻结。A3 checkpoint 只有在全部14个
+臂关节误差不超过 `0.01 rad`，并且由持续更新的 joint source timestamp 证明连续稳定 `0.20 s` 后才成立。
+因此“客户端已经发出 A3，但反馈仍在 A2”不会触发新观测。
+
+protocol v2 必须同时更新控制器上的 `MarvinPro_deploy` 和本机客户端。trajectory session 每 `100 ms`
+发送 heartbeat；bridge 超过 `250 ms` 未收到会清空 trajectory 并停止发布。旧的 discrete、prefetch、
+synchronized 和诊断客户端仍使用 legacy `ActionCommand` 路径。
+
+先只验证 bridge governor，不启用 RTC merge：
+
+```bash
+# 控制器 bridge，Apex Input Mode 先保持 None
+./scripts/run_bridge_on_controller.sh --allow-motion --publish-hz 100
+
+# 本机客户端，按提示完成确认后再切 Custom
+cd /home/jh/OpenPI_UR/openpi
+PYTHONPATH=/home/jh/TianJi_data_collector/MarvinPro_deploy/src \
+uv run python -m marvinpro_deploy.rollout_client \
+  --robot-host 6.6.7.100 \
+  --policy-host 192.168.50.73 \
+  --execute \
+  --episode-seconds 5 \
+  --rollout-schedule tracking \
+  --playback-mode interpolated \
+  --control-hz 100 \
+  --model-hz 15 \
+  --playback-time-scale 2 \
+  --execute-steps 10 \
+  --log-level DEBUG
+```
+
+远程 OpenPI 必须先完成
+`/home/jh/OpenPI_UR/openpi/REMOTE_RTC_TESTS.md`。之后第一轮只运行 shadow：新观测在
+物理 A3 checkpoint 后采集，推理期间 bridge 继续执行 A4/A5 等旧节点，客户端等待实际 `d_pred` 边界并
+记录 `d_actual`，但不合并 RTC 输出；随后本 episode 固定降级 synchronized。
+
+```bash
+PYTHONPATH=/home/jh/TianJi_data_collector/MarvinPro_deploy/src \
+uv run python -m marvinpro_deploy.rollout_client \
+  --robot-host 6.6.7.100 \
+  --policy-host 192.168.50.73 \
+  --execute \
+  --episode-seconds 5 \
+  --rollout-schedule rtc \
+  --rtc-shadow \
+  --playback-mode interpolated \
+  --control-hz 100 \
+  --model-hz 15 \
+  --playback-time-scale 2 \
+  --execute-steps 10 \
+  --log-level DEBUG
+```
+
+shadow、单 chunk governor 和 synchronized 回归全部通过后，删除 `--rtc-shadow` 才允许实际 merge。RTC
+只在下一个整数 knot 边界替换 future，并由 bridge 重新计算 `d_actual`。clipping、hard freeze、反馈过期、
+heartbeat 超时、ID/version 不匹配或 `d_actual > d_pred` 都会拒绝结果；任一次失败后，本 episode 不再重试
+RTC，而是固定 hold、重新确认跟踪和新图像，然后使用 bridge-owned synchronized 执行。
+
+若本机受代理或路由影响，禁止把连接失败误判成 RTC 算法失败，也不要自动尝试真机。按
+[`ROBOT_RTC_TESTS.md`](ROBOT_RTC_TESTS.md) 完成网络预检和现场分阶段验收。
+
 ## 持续 rollout 的慢速插值诊断
 
 > **失败实验，禁止继续真机复现。** 2026-08-07 真机结果出现约1.33秒周期的明显回弹和77个手臂
