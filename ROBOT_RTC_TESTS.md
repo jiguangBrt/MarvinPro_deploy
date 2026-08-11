@@ -6,11 +6,11 @@ Impedance Mode、Home 或清故障；这些步骤必须由现场人员确认。�
 
 ## 已离线验证
 
-- protocol v2 序列化、版本拒绝、高频 state/image/event 分流、乱序 event 丢弃和发送公平性；
+- protocol v4 序列化、版本拒绝、高频 state/image/event 分流、乱序 event 丢弃和发送公平性；
 - feedback source timestamp 不会被 100 Hz timer 伪装成新反馈；
 - 慢速一阶机器人会令 phase 减速/冻结，不按控制 tick 消费动作；
-- A3 feedback 仍在 A2 时不产生 checkpoint，stale feedback 不能累计 `0.20 s` settle；
-- fake bridge 完整执行 `Load -> A3 checkpoint -> Resume -> Stage -> phase 4.0 merge`；
+- A5 feedback 仍在 A4 时不产生 checkpoint，stale feedback 不能累计 `0.20 s` settle；
+- fake bridge 完整执行 `Load -> A5 checkpoint -> Resume -> Stage -> phase 6.0 merge`；
 - merge 使用真实 `d_actual`，并将当前旧 reference 放到 `C[k-1]` 作为 anchor；
 - RTC 失败后客户端进入固定 hold，再使用 bridge-owned synchronized。
 
@@ -52,7 +52,7 @@ cd /home/jh/TianJi_data_collector/MarvinPro_deploy
 记录所有 topic 频率和最新值。`/joint_states` 应足以支持 50 ms stale 门限；相机、左右夹爪、input mode、
 robot state 和 arm state 均必须有消息。doctor 不通过时停止，不得通过放宽 timeout 继续。
 
-## 3. protocol v2 dry-run
+## 3. protocol v4 dry-run
 
 控制器启动不允许动作的 bridge：
 
@@ -148,7 +148,7 @@ uv run python -m marvinpro_deploy.rollout_client \
 
 ## 5. synchronized 回归
 
-使用 README 中已验证的 synchronized 参数运行至少两个 chunk。protocol v2 更新后，边界误差、跟踪时间、
+使用 README 中已验证的 synchronized 参数运行至少两个 chunk。protocol v4 更新后，边界误差、跟踪时间、
 clipping 和固定 hold 行为不得劣于旧基线。回归失败时不进入 RTC shadow。
 
 Terminal A 在 Apex Input Mode 为 None 时启动 bridge，并记录本轮目录：
@@ -214,7 +214,7 @@ uv run python -m marvinpro_deploy.rollout_client \
   --log-file "$RUN_DIR/rtc-shadow.log"
 ```
 
-RTC 输出不会 merge。确认日志证明：物理 A3 checkpoint 后才采图；推理期间继续旧 A4/A5；bridge 在整数
+RTC 输出不会 merge。确认日志证明：物理 A5 checkpoint 后才采图；推理期间继续旧 A6/A7；bridge 在整数
 knot 边界记录 `d_actual`；shadow 丢弃后，本 episode 只运行 synchronized，不重试 RTC。
 
 ## 7. 两 chunk RTC
@@ -234,7 +234,7 @@ latched；不得现场放宽 `0.08/0.12 rad` 包络、URDF margin 或 tracking/s
 
 ## 8. 连续 RTC checkpoint
 
-settled RTC 通过后，才允许用 `--rtc-continuous` 验证无停车观测。该模式在 A3 边界发出 checkpoint 后继续
+settled RTC 通过后，才允许用 `--rtc-continuous` 验证无停车观测。该模式在 A5 边界发出 checkpoint 后继续
 执行旧轨迹，不等待误差进入 `0.01 rad` 并稳定 `0.20 s`；client 等待边界后的新图像，bridge 会把拿图期间
 已经跨过的整数 knot 计入 `d_actual`。tracking governor、clipping、stale、heartbeat、ID/version、
 `d_actual <= d_pred` 和整数边界 merge 保护保持不变。
@@ -265,7 +265,7 @@ fallback 原因和操作员结论。
 - 8 秒 doctor：`/joint_states` 63.4 Hz，左右夹爪各 472.4 Hz，相机 11.6 Hz，robot/arm state
   各 126.7 Hz，joint mapping 正常；当时 Apex 为 None，状态为 `input_mode=0`、`robot_state=(0,0)`、
   `arm_state=(0,0)`；
-- protocol v2 dry-run bridge：hello 为 `version=2`、`motion_allowed=False`、`publish_hz=100`，关节限位
+- protocol v3 dry-run bridge（历史记录）：hello 为 `version=3`、`motion_allowed=False`、`publish_hz=100`，关节限位
   14/14；6 秒内收到 1091 个递增 state 和 88 张 JPEG，state 最大接收间隔 34.35 ms，joint source
   最大间隔 28.77 ms，image 最大间隔 89.95 ms，最后一帧反馈 age 为 2.9/1.6/0.5 ms；
 - 未连接正在使用的 policy 服务器，未启动 `--allow-motion`，未改变 Apex 模式，未发送任何 action；
@@ -357,3 +357,15 @@ fallback 原因和操作员结论。
   checkpoint 停顿。
 - 本轮没有 clipping、stale、hard freeze 或 command rejection；bridge 平均 `98.94 Hz`、最大 gap `27.540 ms`。
 - continuous shadow 通过，允许下一轮单次实际 continuous RTC merge；仍需操作员重新确认真机安全环境。
+
+### 2026-08-11 execution horizon 6 远程验证
+
+- 当前协议改为 `H=10`、`s=6`、旧轨迹 prefix `(4,16)`、`d_pred<=4`；模型 checkpoint 和权重未修改。
+- 本地部署端 53 项测试全部通过；本地和远程 OpenPI 定向 CPU 套件均为 `21 passed, 2 deselected`，远程
+  Ruff 通过。
+- GPU 5 直接 checkpoint 测试首次缓存/JIT 为 `3954.34 ms`；稳定 `d_pred=1..4` 为
+  `109.30-116.16 ms`，输出均为有限 `(10,16)`，无形状相关重编译。
+- WebSocket metadata 正确公布 execution horizon 6；旧 `s=4/(6,16)` 请求被结构化拒绝，随后同一连接的
+  有效请求成功。第一组 20 次 wall latency 出现 `p95=808.58 ms/max=1230.51 ms` 的链路尖峰，不通过
+  delay 门槛；立即重复的稳定序列为 `225.34-413.38 ms`，server 为 `105.34-125.27 ms`，带 50 ms guard
+  的预测上限为 4。真机必须重新从 continuous shadow 开始，不得直接执行 replacement。

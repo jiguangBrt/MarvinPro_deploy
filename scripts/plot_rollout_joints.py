@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot measured arm joints, interpolated commands, phase, and tracking error."""
+"""Plot measured arm joints, gripper feedback, commands, phase, and tracking error."""
 
 from __future__ import annotations
 
@@ -59,6 +59,8 @@ def _empty_data() -> dict[str, list]:
         "measured": [],
         "command": [],
         "reference": [],
+        "gripper_measured": [],
+        "gripper_torque": [],
         "phase": [],
         "events": [],
     }
@@ -88,6 +90,18 @@ def _load_csv(path: Path, event_log: Path | None) -> dict[str, list]:
             if record_type == "bridge_state":
                 if measured is not None:
                     data["measured"].append((recorded, measured))
+                gripper_measured = (
+                    _float(row.get("measured_gripper_position_L")),
+                    _float(row.get("measured_gripper_position_R")),
+                )
+                if all(value is not None for value in gripper_measured):
+                    data["gripper_measured"].append((recorded, gripper_measured))
+                gripper_torque = (
+                    _float(row.get("measured_gripper_torque_L")),
+                    _float(row.get("measured_gripper_torque_R")),
+                )
+                if all(value is not None for value in gripper_torque):
+                    data["gripper_torque"].append((recorded, gripper_torque))
                 sampled = _float(row.get("sampled_monotonic"))
                 if sampled is not None:
                     clock_offsets.append(recorded - sampled)
@@ -196,6 +210,44 @@ def plot(input_path: Path, output_path: Path, event_log: Path | None = None) -> 
         if index == 0:
             axis.legend(fontsize=7, loc="best")
 
+    for side_index, (name, action_index) in enumerate((("Gripper_L", 7), ("Gripper_R", 15))):
+        axis = figure.add_subplot(grid[3, side_index + 2])
+        if data["gripper_measured"]:
+            measured_time = [time_s - origin for time_s, _ in data["gripper_measured"]]
+            measured = [values[side_index] for _, values in data["gripper_measured"]]
+            axis.plot(measured_time, measured, color="#1769aa", linewidth=1.1, label="measured position")
+        command_time = [time_s - origin for time_s, _ in data["command"]]
+        command = [values[action_index] for _, values in data["command"]]
+        axis.plot(command_time, command, color="#d95f02", linewidth=1.0, linestyle="--", label="sent command")
+        if data["reference"]:
+            reference_time = [time_s - origin for time_s, _ in data["reference"]]
+            reference = [values[action_index] for _, values in data["reference"]]
+            axis.plot(
+                reference_time,
+                reference,
+                color="#636363",
+                linewidth=0.7,
+                linestyle=":",
+                alpha=0.7,
+                label="raw reference",
+            )
+        axis.set_title(f"{name} (0=open, 1=closed)", fontsize=9)
+        axis.set_ylim(-0.05, 1.05)
+        axis.grid(alpha=0.25)
+        axis.tick_params(labelsize=7)
+        handles, labels = axis.get_legend_handles_labels()
+        if data["gripper_torque"]:
+            torque_axis = axis.twinx()
+            torque_time = [time_s - origin for time_s, _ in data["gripper_torque"]]
+            torque = [values[side_index] for _, values in data["gripper_torque"]]
+            torque_axis.plot(torque_time, torque, color="#238b45", linewidth=0.8, alpha=0.75, label="measured torque")
+            torque_axis.set_ylabel("torque", color="#238b45", fontsize=7)
+            torque_axis.tick_params(axis="y", colors="#238b45", labelsize=7)
+            torque_handles, torque_labels = torque_axis.get_legend_handles_labels()
+            handles.extend(torque_handles)
+            labels.extend(torque_labels)
+        axis.legend(handles, labels, fontsize=7, loc="best")
+
     phase_axis = figure.add_subplot(grid[4, :2])
     phase_time = [time_s - origin for time_s, _, _, _ in data["phase"]]
     phases = [math.nan if phase is None else phase for _, phase, _, _ in data["phase"]]
@@ -235,8 +287,9 @@ def plot(input_path: Path, output_path: Path, event_log: Path | None = None) -> 
         phase_axis.text(x, 0.98, event, rotation=90, transform=phase_axis.get_xaxis_transform(), fontsize=6)
 
     figure.suptitle(
-        f"MarvinPro joint telemetry: {input_path.name}\n"
-        "Blue=measured feedback, orange dashed=interpolated command sent to the controller, "
+        f"MarvinPro joint and gripper telemetry: {input_path.name}\n"
+        "Blue=measured arm/gripper position, green=measured gripper torque, "
+        "orange dashed=interpolated command sent to the controller, "
         "gray dotted=pre-safety reference",
         fontsize=13,
     )

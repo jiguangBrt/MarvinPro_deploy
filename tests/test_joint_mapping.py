@@ -1,6 +1,11 @@
 import unittest
 
-from marvinpro_deploy.joint_mapping import JointMap, JointMapError, build_state16, normalize_gripper
+from marvinpro_deploy.joint_mapping import (
+    JointMap,
+    JointMapError,
+    build_state16,
+    normalize_gripper,
+)
 
 
 class JointMappingTest(unittest.TestCase):
@@ -15,7 +20,7 @@ class JointMappingTest(unittest.TestCase):
         with self.assertRaises(JointMapError):
             JointMap.from_names([f"Joint{i}_L" for i in range(1, 8)])
 
-    def test_gripper_matches_training_calibration(self):
+    def test_gripper_feedback_matches_training_calibration(self):
         self.assertEqual(normalize_gripper(-0.1), 0.0)
         self.assertAlmostEqual(normalize_gripper(0.625), 0.5)
         self.assertEqual(normalize_gripper(1.4), 1.0)

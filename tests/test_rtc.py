@@ -2,7 +2,14 @@ import unittest
 
 import numpy as np
 
-from marvinpro_deploy.rtc import DelayEstimator, RtcError, build_rtc_request, parse_rtc_response
+from marvinpro_deploy.rtc import (
+    DelayEstimator,
+    RTC_EXECUTION_HORIZON,
+    RTC_HORIZON,
+    RtcError,
+    build_rtc_request,
+    parse_rtc_response,
+)
 
 
 class RtcClientTest(unittest.TestCase):
@@ -21,11 +28,11 @@ class RtcClientTest(unittest.TestCase):
             timeline_version=3,
             checkpoint_id=4,
             observation={"state": np.zeros(16)},
-            old_remaining_actions_absolute=np.zeros((6, 16)),
+            old_remaining_actions_absolute=np.zeros((RTC_HORIZON - RTC_EXECUTION_HORIZON, 16)),
             predicted_delay_steps=2,
         )
         self.assertEqual(request["d_pred"], 2)
-        self.assertEqual(request["s"], 4)
+        self.assertEqual(request["s"], 6)
         self.assertEqual(request["schedule"], "exp")
         self.assertEqual(request["beta"], 5.0)
         self.assertNotIn("predicted_delay_steps", request)

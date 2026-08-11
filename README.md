@@ -14,8 +14,10 @@ rollout 客户端应运行在当前电脑，不运行在机器人控制器。机
 
 - 观测/动作顺序：`[左臂7, 左夹爪, 右臂7, 右夹爪]`。
 - 关节单位：rad；policy server 输出已经过 `AbsoluteActions`，是绝对关节目标。
-- 夹爪：模型使用 `0=open, 1=closed`；状态由 `/info/gripper_feedback_L/R.data[0] / 1.25`
-  归一化，命令直接向 `/control/gripperValueL/R` 发布 `0..1`。
+- 夹爪：模型使用 `0=open, 1=closed`；命令直接向 `/control/gripperValueL/R` 发布 `0..1`。
+  `/info/gripper_feedback_L/R` 的五维反馈依次为
+  `[q_position_rad, dq_velocity_rad_s, tau_torque, temp_mos, temp_motor]`。bridge 使用真实 `q` 构造
+  policy state，并独立记录 `dq/tau`；`q` 按训练标定 `0..1.25 rad` 归一化到 `0..1`。
 - 相机：四宫格左上=`cam_high`，左下=`cam_left_wrist`，右下=`cam_right_wrist`，右上忽略；底部
   时间戳区域不进入模型。
 - 双臂目标：`/control/user/joint_cmd_A/B`，消息类型
@@ -46,8 +48,9 @@ cd /home/jh/TianJi_data_collector/MarvinPro_deploy
 ```
 
 脚本将 `0` 或 `1` 短时连续发布到 `/control/gripperValueL/R`，不会调用 Home、切换 Apex Input Mode
-或发送机械臂关节命令。命令值 `1` 不要改成 `1.25`：`1.25` 只用于闭合状态的反馈标定。若检测到
-rollout bridge 仍在运行，脚本会拒绝发布，避免两个外部命令源互相覆盖。
+或发送机械臂关节命令。`/info/gripper_feedback_L/R` 的 `data[0]` 是实际位置 `q`，`data[2]` 是实际
+力矩 `tau`；脚本会打印完整反馈值。
+若检测到 rollout bridge 仍在运行，脚本会拒绝发布，避免两个外部命令源互相覆盖。
 
 ## 1. GPU 服务器启动 policy
 
@@ -81,11 +84,12 @@ cd /home/jh/TianJi_data_collector/MarvinPro_deploy
 预检不会创建动作 publisher，也不会发指令。以下输入必须都有消息：
 
 - `/joint_states`
-- `/info/gripper_feedback_L`、`/info/gripper_feedback_R`
 - `/quad_tile/compressed`
 - `/control/input_mode`
 - `/info/robot_state`、`/info/arm_state`
 
+doctor 会打印 `/info/gripper_feedback_L/R` 的 `q/dq/tau/温度`；两侧反馈都必须存在且新鲜，才会打开
+rollout 运动门。
 相机没有消息时，先在 Apex 启动 Camera。执行前还必须看到 `input_mode=3`、两个状态数组均为
 `(3, 3)`；这台控制器用状态 `3` 表示关节阻抗模式。dry-run 阶段可以仍为 None/`0`。
 
@@ -181,14 +185,22 @@ hold，不会重复执行过时的预测动作。
 
 bridge 使用 pickle 传输 JPEG 和数据结构，只能暴露在可信的机器人私有网络，不应映射到公网。
 
-## 跟踪感知时间轴与 RTC（protocol v2）
+## 跟踪感知时间轴与 RTC（protocol v4）
 
 `tracking` 和 `rtc` 使用 bridge 本地 100 Hz trajectory owner。控制 timer 只对连续 phase 求值，不会按
-100 Hz 自动消费模型动作；机器人跟踪误差增大时，phase 会减速或冻结。A3 checkpoint 只有在全部14个
+100 Hz 自动消费模型动作；机器人跟踪误差增大时，phase 会减速或冻结。RTC A5 checkpoint 只有在全部14个
 臂关节误差不超过 `0.01 rad`，并且由持续更新的 joint source timestamp 证明连续稳定 `0.20 s` 后才成立。
-因此“客户端已经发出 A3，但反馈仍在 A2”不会触发新观测。
+因此“客户端已经发出 A5，但反馈仍在 A4”不会触发新观测。
 
-protocol v2 必须同时更新控制器上的 `MarvinPro_deploy` 和本机客户端。trajectory session 每 `100 ms`
+RTC 默认使用 `--playback-time-scale 2`（有效 knot rate `7.5 Hz`）。仅为区分 merge 边界与机器人跟踪
+降速造成的停顿，可使用已限制的诊断配置 `--playback-time-scale 3`（有效 knot rate `5 Hz`）；其他倍率
+仍会被客户端拒绝。
+
+protocol v4 必须同时更新控制器上的 `MarvinPro_deploy` 和本机客户端；v4 恢复夹爪真实位置状态，并传输
+`dq/tau/温度` 诊断。RTC 的 tracking governor 只使用 14 个机械臂关节误差：夹爪接触物体后可能无法到达
+位置目标，若把夹爪误差放进推进门会造成错误冻结。夹爪位置误差和力矩仍写入 telemetry，用于判断闭合、
+接触和打滑，而不控制 RTC phase。
+trajectory session 每 `100 ms`
 发送 heartbeat；bridge 超过 `250 ms` 未收到会清空 trajectory 并停止发布。旧的 discrete、prefetch、
 synchronized 和诊断客户端仍使用 legacy `ActionCommand` 路径。
 
@@ -230,11 +242,12 @@ uv run python -m marvinpro_deploy.rollout_client \
 None，再安全退出。
 
 指定 `--log-file "$RUN_DIR/rollout.log"` 还会自动生成
-`$RUN_DIR/rollout.telemetry.csv`。它逐条保存 bridge 实测 14 个关节、bridge 插帧后的最终命令，以及
+`$RUN_DIR/rollout.telemetry.csv`。它逐条保存 bridge 实测 14 个关节、夹爪 `q/dq/tau/温度`、夹爪
+位置目标误差、bridge 插帧后的最终命令，以及
 prefetch/legacy 客户端插帧生成的请求目标和实际发送命令；`client_reference_*` 是插帧值，
 `client_command_*` 是 safety-filter 后的发送值，`record_type` 字段区分 `bridge_state` 和
 `client_command`。
-测试后可生成关节角对照图：
+测试后可生成关节角与夹爪位置/力矩对照图：
 
 ```bash
 PYTHONPATH=/home/jh/TianJi_data_collector/MarvinPro_deploy/src \
@@ -246,7 +259,7 @@ scripts/plot_rollout_joints.py \
 
 远程 OpenPI 必须先完成
 `/home/jh/OpenPI_UR/openpi/REMOTE_RTC_TESTS.md`。之后第一轮只运行 shadow：新观测在
-物理 A3 checkpoint 后采集，推理期间 bridge 继续执行 A4/A5 等旧节点，客户端等待实际 `d_pred` 边界并
+物理 A5 checkpoint 后采集，推理期间 bridge 继续执行 A6/A7 等旧节点，客户端等待实际 `d_pred` 边界并
 记录 `d_actual`，但不合并 RTC 输出；随后本 episode 固定降级 synchronized。
 
 ```bash
@@ -258,6 +271,7 @@ uv run python -m marvinpro_deploy.rollout_client \
   --execute \
   --episode-seconds 5 \
   --rollout-schedule rtc \
+  --rtc-continuous \
   --rtc-shadow \
   --playback-mode interpolated \
   --control-hz 100 \
@@ -270,13 +284,13 @@ uv run python -m marvinpro_deploy.rollout_client \
 ```
 
 shadow、单 chunk governor 和 synchronized 回归全部通过后，删除 `--rtc-shadow` 才允许实际 merge；首轮实际
-测试必须加 `--max-rtc-merges 2`，达到两次成功 replacement merge 后，客户端会等待当前 RTC 段到达下一个稳定 checkpoint，再锁存 hold。RTC
+测试必须加 `--max-rtc-merges 1`，达到一次成功 replacement merge 后，客户端会等待当前 RTC 段到达下一个 checkpoint，再锁存 hold。RTC
 只在下一个整数 knot 边界替换 future，并由 bridge 重新计算 `d_actual`。clipping、hard freeze、反馈过期、
 heartbeat 超时、ID/version 不匹配或 `d_actual > d_pred` 都会拒绝结果；任一次失败后，本 episode 不再重试
 RTC，而是固定 hold、重新确认跟踪和新图像，然后使用 bridge-owned synchronized 执行。
 
-默认 RTC 使用 settled checkpoint，适合验证观测和 merge 证据，但会在每个 A3 等待跟踪到位并稳定
-`0.20 s`。settled 多 chunk 验收通过后，可显式增加 `--rtc-continuous`：bridge 在 A3 记录观测边界后继续
+默认 RTC 使用 settled checkpoint，适合验证观测和 merge 证据，但会在每个 A5 等待跟踪到位并稳定
+`0.20 s`。settled 多 chunk 验收通过后，可显式增加 `--rtc-continuous`：bridge 在 A5 记录观测边界后继续
 旧轨迹，client 拿图期间跨过的 knot 会计入 `d_actual`，其余安全门不变。连续模式必须重新从
 `--rtc-continuous --rtc-shadow` 开始验收，shadow 通过后才允许单次实际 merge；详细顺序见
 [`ROBOT_RTC_TESTS.md`](ROBOT_RTC_TESTS.md)。

@@ -31,7 +31,7 @@ from .config import (
     JOINT_NAMES,
 )
 from .image_processing import ImageError, decode_and_split
-from .joint_mapping import build_state16
+from .joint_mapping import build_state16, normalize_gripper
 from .motion_profile import FrozenLinearPlan
 from .rtc import (
     DelayEstimator,
@@ -65,10 +65,11 @@ LOGGER = logging.getLogger("marvinpro_rollout")
 _ACTIVE_STATE_LOG_INTERVAL_S = 0.10
 _HOLD_STATE_LOG_INTERVAL_S = 1.0
 _ACTION_NAMES = JOINT_NAMES[:7] + ("Gripper_L",) + JOINT_NAMES[7:] + ("Gripper_R",)
+_RTC_PLAYBACK_TIME_SCALES = (2.0, 3.0)
 
 
 class JointTelemetryRecorder:
-    """Write measured feedback and the actual outgoing command without console noise."""
+    """Write arm feedback, gripper q/dq/tau, and outgoing commands."""
 
     def __init__(self, path: Path) -> None:
         path = path.expanduser().resolve()
@@ -103,7 +104,24 @@ class JointTelemetryRecorder:
             "active_request_id",
         ]
         columns.extend(f"measured_{name}" for name in JOINT_NAMES)
-        columns.extend(("feedback_gripper_raw_L", "feedback_gripper_raw_R"))
+        columns.extend(
+            (
+                "measured_gripper_position_raw_L",
+                "measured_gripper_position_raw_R",
+                "measured_gripper_position_L",
+                "measured_gripper_position_R",
+                "measured_gripper_velocity_L",
+                "measured_gripper_velocity_R",
+                "measured_gripper_torque_L",
+                "measured_gripper_torque_R",
+                "gripper_position_error_L",
+                "gripper_position_error_R",
+                "measured_gripper_mos_temperature_L",
+                "measured_gripper_mos_temperature_R",
+                "measured_gripper_motor_temperature_L",
+                "measured_gripper_motor_temperature_R",
+            )
+        )
         columns.extend(f"raw_reference_{name}" for name in _ACTION_NAMES)
         columns.extend(f"bridge_command_{name}" for name in _ACTION_NAMES)
         columns.extend(f"client_reference_{name}" for name in _ACTION_NAMES)
@@ -117,6 +135,33 @@ class JointTelemetryRecorder:
         if len(values) != size:
             raise ValueError(f"telemetry vector has length {len(values)}, expected {size}")
         return list(values)
+
+    @staticmethod
+    def _gripper_values(message, target: tuple[float, ...] | None) -> list[float | str]:
+        def optional(name: str) -> float | str:
+            value = getattr(message, name, None)
+            return "" if value is None else float(value)
+
+        left = normalize_gripper(message.gripper_raw_left)
+        right = normalize_gripper(message.gripper_raw_right)
+        errors: tuple[float | str, float | str] = ("", "")
+        if target is not None and len(target) == 16:
+            errors = (abs(float(target[7]) - left), abs(float(target[15]) - right))
+        return [
+            message.gripper_raw_left,
+            message.gripper_raw_right,
+            left,
+            right,
+            optional("gripper_velocity_left"),
+            optional("gripper_velocity_right"),
+            optional("gripper_torque_left"),
+            optional("gripper_torque_right"),
+            *errors,
+            optional("gripper_mos_temperature_left"),
+            optional("gripper_mos_temperature_right"),
+            optional("gripper_motor_temperature_left"),
+            optional("gripper_motor_temperature_right"),
+        ]
 
     def record_state(self, message: RobotStateUpdate, received_monotonic: float) -> None:
         row = [
@@ -137,7 +182,7 @@ class JointTelemetryRecorder:
             message.active_request_id or "",
         ]
         row.extend(message.joints)
-        row.extend((message.gripper_raw_left, message.gripper_raw_right))
+        row.extend(self._gripper_values(message, message.sent_target))
         row.extend(self._values(message.raw_reference, 16))
         row.extend(self._values(message.sent_target, 16))
         row.extend([""] * 16)
@@ -171,7 +216,7 @@ class JointTelemetryRecorder:
             "",
         ]
         row.extend(observation.joints)
-        row.extend((observation.gripper_raw_left, observation.gripper_raw_right))
+        row.extend(self._gripper_values(observation, sent_action))
         row.extend([""] * 16)
         row.extend([""] * 16)
         row.extend(self._values(requested_action, 16))
@@ -830,8 +875,8 @@ def validate_observation(observation: RobotObservation, max_source_age_s: float)
         raise RolloutError("robot observation has no camera image")
     ages = {
         "joint state": observation.age_state_s,
-        "left gripper": observation.age_gripper_left_s,
-        "right gripper": observation.age_gripper_right_s,
+        "left gripper feedback": observation.age_gripper_left_s,
+        "right gripper feedback": observation.age_gripper_right_s,
     }
     for label, age in ages.items():
         if age is None or age > max_source_age_s:
@@ -949,10 +994,10 @@ def _confirm_execution(args: argparse.Namespace, observation: RobotObservation) 
         else:
             print(f"  rollout schedule: bridge-owned {args.rollout_schedule}")
             if args.rollout_schedule == "rtc" and args.rtc_continuous:
-                print("  RTC checkpoint: continuous at action 4 (no settle hold)")
+                print(f"  RTC checkpoint: continuous at action {RTC_EXECUTION_HORIZON} (no settle hold)")
             else:
                 print(
-                    "  physical checkpoint: 4 actions"
+                    f"  physical checkpoint: {RTC_EXECUTION_HORIZON} actions"
                     if args.rollout_schedule == "rtc"
                     else "  full-chunk checkpoint"
                 )
@@ -983,13 +1028,18 @@ def _confirm_and_refresh_execution_observation(
     validate_observation(fresh, args.max_source_age)
     LOGGER.warning(
         "post_confirmation_observation baseline_seq=%d fresh_seq=%d captured=%.6f "
-        "joint_age_ms=%.3f left_gripper_age_ms=%.3f right_gripper_age_ms=%.3f",
+        "joint_age_ms=%.3f gripper_age_ms=(%.3f,%.3f) gripper_q_rad=(%.3f,%.3f) "
+        "gripper_tau=(%s,%s)",
         latest_after_confirmation.seq,
         fresh.seq,
         fresh.captured_monotonic,
         float(fresh.age_state_s) * 1000.0,
         float(fresh.age_gripper_left_s) * 1000.0,
         float(fresh.age_gripper_right_s) * 1000.0,
+        fresh.gripper_raw_left,
+        fresh.gripper_raw_right,
+        fresh.gripper_torque_left,
+        fresh.gripper_torque_right,
     )
     return fresh
 
@@ -1454,8 +1504,7 @@ def _wait_checkpoint_observation(
         LOGGER.info(
             "checkpoint_observation event_seq=%d checkpoint=%s image_seq=%d "
             "stable=%.6f captured=%.6f after_stable_ms=%.3f state_sampled=%.6f "
-            "state_image_skew_ms=%.3f joint_age_ms=%.3f left_gripper_age_ms=%.3f "
-            "right_gripper_age_ms=%.3f",
+            "state_image_skew_ms=%.3f joint_age_ms=%.3f gripper_q_rad=(%.3f,%.3f)",
             event.event_seq,
             event.checkpoint_id,
             observation.seq,
@@ -1465,8 +1514,8 @@ def _wait_checkpoint_observation(
             float(sampled),
             abs(observation.captured_monotonic - float(sampled)) * 1000.0,
             float(observation.age_state_s) * 1000.0,
-            float(observation.age_gripper_left_s) * 1000.0,
-            float(observation.age_gripper_right_s) * 1000.0,
+            observation.gripper_raw_left,
+            observation.gripper_raw_right,
         )
         return observation
 
@@ -1956,7 +2005,8 @@ def run(args: argparse.Namespace) -> int:
         validate_observation(observation, args.max_source_age)
         LOGGER.info(
             "robot_observation_ready seq=%d captured=%.6f input_mode=%s robot_state=%s arm_state=%s "
-            "gate=%s reason=%r joint_age_ms=%.3f left_gripper_age_ms=%.3f right_gripper_age_ms=%.3f",
+            "gate=%s reason=%r joint_age_ms=%.3f gripper_age_ms=(%.3f,%.3f) "
+            "gripper_q_rad=(%.3f,%.3f) gripper_tau=(%s,%s) source=%s",
             observation.seq,
             observation.captured_monotonic,
             observation.input_mode,
@@ -1967,6 +2017,11 @@ def run(args: argparse.Namespace) -> int:
             float(observation.age_state_s) * 1000.0,
             float(observation.age_gripper_left_s) * 1000.0,
             float(observation.age_gripper_right_s) * 1000.0,
+            observation.gripper_raw_left,
+            observation.gripper_raw_right,
+            observation.gripper_torque_left,
+            observation.gripper_torque_right,
+            observation.extra.get("gripper_state_source", "unknown"),
         )
 
         if args.execute and not connection.hello.motion_allowed:
@@ -2012,6 +2067,11 @@ def run(args: argparse.Namespace) -> int:
             rtc_metadata = metadata.get("rtc", {}) if isinstance(metadata, dict) else {}
             if rtc_metadata.get("protocol") != "rtc_v1":
                 raise RolloutError("policy server does not advertise rtc_v1 support")
+            if rtc_metadata.get("execution_horizon") != RTC_EXECUTION_HORIZON:
+                raise RolloutError(
+                    "policy server RTC execution horizon mismatch: "
+                    f"expected {RTC_EXECUTION_HORIZON}, got {rtc_metadata.get('execution_horizon')!r}"
+                )
             observation = connection.latest(args.max_observation_age)
             policy_observation = build_policy_observation(observation, args.prompt)
             current = build_state16(
@@ -2027,7 +2087,9 @@ def run(args: argparse.Namespace) -> int:
                     timeline_version=0,
                     checkpoint_id=0,
                     observation=policy_observation,
-                    old_remaining_actions_absolute=np.asarray([current] * 6),
+                    old_remaining_actions_absolute=np.asarray(
+                        [current] * (RTC_HORIZON - RTC_EXECUTION_HORIZON)
+                    ),
                     predicted_delay_steps=4,
                     warmup=True,
                 )
@@ -2351,7 +2413,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--rtc-continuous",
         action="store_true",
-        help="rtc mode: observe at action 4 without pausing for checkpoint settle",
+        help=f"rtc mode: observe at action {RTC_EXECUTION_HORIZON} without pausing for checkpoint settle",
     )
     parser.add_argument(
         "--max-rtc-merges",
@@ -2434,8 +2496,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             parser.error(f"--rollout-schedule {args.rollout_schedule} requires --execute")
         if args.playback_mode != "interpolated":
             parser.error(f"--rollout-schedule {args.rollout_schedule} requires --playback-mode interpolated")
-        if args.control_hz != 100.0 or args.model_hz != 15.0 or args.playback_time_scale != 2.0:
-            parser.error("tracking/rtc requires --control-hz 100 --model-hz 15 --playback-time-scale 2")
+        if (
+            args.control_hz != 100.0
+            or args.model_hz != 15.0
+            or args.playback_time_scale not in _RTC_PLAYBACK_TIME_SCALES
+        ):
+            parser.error(
+                "tracking/rtc requires --control-hz 100 --model-hz 15 "
+                "--playback-time-scale 2 or 3"
+            )
         if args.execute_steps != RTC_HORIZON:
             parser.error("tracking/rtc requires --execute-steps 10")
     if args.rtc_shadow and args.rollout_schedule != "rtc":

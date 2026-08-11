@@ -6,7 +6,7 @@ M6-S-{L,R}-CCS-696-V4 URDF on 6.6.7.100 (checked 2026-08-05).
 
 from __future__ import annotations
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 4
 DEFAULT_BRIDGE_HOST = "6.6.7.100"
 DEFAULT_BRIDGE_PORT = 7332
 DEFAULT_POLICY_HOST = "192.168.50.73"
@@ -60,11 +60,11 @@ JOINT_UPPER = (
     1.5708,
 )
 
-# Training converter calibration: feedback raw 0=open, 1.25=closed.
+TOPIC_JOINT_STATES = "/joint_states"
+# DM driver layout verified from the installed controller source on 2026-08-11:
+# [position_rad, velocity_rad_s, torque, mos_temperature, motor_temperature].
 GRIPPER_OPEN_RAW = 0.0
 GRIPPER_CLOSED_RAW = 1.25
-
-TOPIC_JOINT_STATES = "/joint_states"
 TOPIC_GRIPPER_FEEDBACK_L = "/info/gripper_feedback_L"
 TOPIC_GRIPPER_FEEDBACK_R = "/info/gripper_feedback_R"
 TOPIC_QUAD_IMAGE = "/quad_tile/compressed"

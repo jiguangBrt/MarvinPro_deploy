@@ -157,6 +157,14 @@ class MarvinBridgeNode(Node):
         self._gripper_l_t: float | None = None
         self._gripper_r: float | None = None
         self._gripper_r_t: float | None = None
+        self._gripper_l_velocity: float | None = None
+        self._gripper_r_velocity: float | None = None
+        self._gripper_l_torque: float | None = None
+        self._gripper_r_torque: float | None = None
+        self._gripper_l_mos_temperature: float | None = None
+        self._gripper_r_mos_temperature: float | None = None
+        self._gripper_l_motor_temperature: float | None = None
+        self._gripper_r_motor_temperature: float | None = None
         self._input_mode: int | None = None
         self._input_mode_t: float | None = None
         self._robot_state: tuple[int, ...] | None = None
@@ -250,24 +258,33 @@ class MarvinBridgeNode(Node):
             except JointMapError as exc:
                 self.get_logger().error(str(exc))
 
+    @staticmethod
+    def _gripper_feedback_values(msg: Float32MultiArray) -> tuple[float, ...] | None:
+        if len(msg.data) < 3:
+            return None
+        values = tuple(float(value) for value in msg.data[:5])
+        if not all(math.isfinite(value) for value in values):
+            return None
+        return values
+
     def _on_gripper_l(self, msg: Float32MultiArray) -> None:
-        if not msg.data:
-            return
-        value = float(msg.data[0])
-        if not math.isfinite(value):
+        values = self._gripper_feedback_values(msg)
+        if values is None:
             return
         with self._lock:
-            self._gripper_l = value
+            self._gripper_l, self._gripper_l_velocity, self._gripper_l_torque = values[:3]
+            self._gripper_l_mos_temperature = values[3] if len(values) > 3 else None
+            self._gripper_l_motor_temperature = values[4] if len(values) > 4 else None
             self._gripper_l_t = _now()
 
     def _on_gripper_r(self, msg: Float32MultiArray) -> None:
-        if not msg.data:
-            return
-        value = float(msg.data[0])
-        if not math.isfinite(value):
+        values = self._gripper_feedback_values(msg)
+        if values is None:
             return
         with self._lock:
-            self._gripper_r = value
+            self._gripper_r, self._gripper_r_velocity, self._gripper_r_torque = values[:3]
+            self._gripper_r_mos_temperature = values[3] if len(values) > 3 else None
+            self._gripper_r_motor_temperature = values[4] if len(values) > 4 else None
             self._gripper_r_t = _now()
 
     def _on_input_mode(self, msg: Int32) -> None:
@@ -296,9 +313,9 @@ class MarvinBridgeNode(Node):
             return False, "joint state is stale"
         if self._gripper_l is None or self._gripper_r is None:
             return False, "no gripper feedback"
-        if _age(now, self._gripper_l_t) > self.max_state_age_s:
+        if _age(now, self._gripper_l_t) is None or _age(now, self._gripper_l_t) > self.max_state_age_s:
             return False, "left gripper feedback is stale"
-        if _age(now, self._gripper_r_t) > self.max_state_age_s:
+        if _age(now, self._gripper_r_t) is None or _age(now, self._gripper_r_t) > self.max_state_age_s:
             return False, "right gripper feedback is stale"
         if self._input_mode != CUSTOM_INPUT_MODE:
             return False, f"input_mode={self._input_mode}, expected {CUSTOM_INPUT_MODE} (Custom)"
@@ -350,6 +367,14 @@ class MarvinBridgeNode(Node):
             arm_clipped=self._arm_clipped,
             frozen_reason=self._frozen_reason,
             active_request_id=self._active_request_id,
+            gripper_velocity_left=self._gripper_l_velocity,
+            gripper_velocity_right=self._gripper_r_velocity,
+            gripper_torque_left=self._gripper_l_torque,
+            gripper_torque_right=self._gripper_r_torque,
+            gripper_mos_temperature_left=self._gripper_l_mos_temperature,
+            gripper_mos_temperature_right=self._gripper_r_mos_temperature,
+            gripper_motor_temperature_left=self._gripper_l_motor_temperature,
+            gripper_motor_temperature_right=self._gripper_r_motor_temperature,
         )
         self._outbound_ready.notify_all()
 
@@ -526,7 +551,16 @@ class MarvinBridgeNode(Node):
                 extra={
                     "state_seq": self._state_seq,
                     "state_sampled_monotonic": self._joints_t,
+                    "gripper_state_source": "dm_position_feedback",
                 },
+                gripper_velocity_left=self._gripper_l_velocity,
+                gripper_velocity_right=self._gripper_r_velocity,
+                gripper_torque_left=self._gripper_l_torque,
+                gripper_torque_right=self._gripper_r_torque,
+                gripper_mos_temperature_left=self._gripper_l_mos_temperature,
+                gripper_mos_temperature_right=self._gripper_r_mos_temperature,
+                gripper_motor_temperature_left=self._gripper_l_motor_temperature,
+                gripper_motor_temperature_right=self._gripper_r_motor_temperature,
             )
             self._observation_ready.notify_all()
             self._outbound_ready.notify_all()
@@ -593,8 +627,8 @@ class MarvinBridgeNode(Node):
         if timeline.horizon != 10:
             raise SafetyError("trajectory mode currently requires horizon 10")
         continuous_checkpoint = bool(getattr(message, "continuous_checkpoint", False))
-        if continuous_checkpoint and timeline.checkpoint_horizon != 4:
-            raise SafetyError("continuous checkpoints require execution horizon 4")
+        if continuous_checkpoint and timeline.checkpoint_horizon != 6:
+            raise SafetyError("continuous checkpoints require execution horizon 6")
         assert self._joints is not None and self._gripper_l is not None and self._gripper_r is not None
         self._clear_target_locked("trajectory ownership enabled")
         self._trajectory_session_id = message.session_id
@@ -1298,7 +1332,9 @@ def doctor(duration_s: float) -> int:
     failed = False
     for topic, count in node.counts.items():
         value = node.latest.get(topic)
-        print(f"  {topic}: {count} msgs, {count / elapsed:.1f}Hz, latest={value}")
+        diagnostic = topic in (TOPIC_GRIPPER_FEEDBACK_L, TOPIC_GRIPPER_FEEDBACK_R)
+        label = " ([q, dq, tau, T_mos, T_motor])" if diagnostic else ""
+        print(f"  {topic}{label}: {count} msgs, {count / elapsed:.1f}Hz, latest={value}")
         if count == 0:
             failed = True
     joint_value = node.latest.get(TOPIC_JOINT_STATES)

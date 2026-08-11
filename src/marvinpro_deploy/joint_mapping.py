@@ -1,4 +1,4 @@
-"""Pure-Python Marvin Pro state layout and gripper calibration."""
+"""Pure-Python Marvin Pro state layout and gripper feedback calibration."""
 
 from __future__ import annotations
 

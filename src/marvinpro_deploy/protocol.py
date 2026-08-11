@@ -41,6 +41,8 @@ class RobotObservation:
     image: bytes
     image_format: str
     joints: tuple[float, ...]
+    # Raw DM motor position feedback in radians. The client applies the
+    # training calibration before constructing the 16-dimensional state.
     gripper_raw_left: float
     gripper_raw_right: float
     input_mode: int | None
@@ -58,6 +60,14 @@ class RobotObservation:
     last_command_status: str = "no command"
     version: int = PROTOCOL_VERSION
     extra: dict[str, Any] = field(default_factory=dict)
+    gripper_velocity_left: float | None = None
+    gripper_velocity_right: float | None = None
+    gripper_torque_left: float | None = None
+    gripper_torque_right: float | None = None
+    gripper_mos_temperature_left: float | None = None
+    gripper_mos_temperature_right: float | None = None
+    gripper_motor_temperature_left: float | None = None
+    gripper_motor_temperature_right: float | None = None
 
 
 @dataclass(frozen=True)
@@ -65,6 +75,7 @@ class RobotStateUpdate:
     state_seq: int
     sampled_monotonic: float
     joints: tuple[float, ...]
+    # Raw DM motor position feedback in radians.
     gripper_raw_left: float
     gripper_raw_right: float
     motion_gate_open: bool
@@ -84,6 +95,14 @@ class RobotStateUpdate:
     arm_clipped: bool = False
     frozen_reason: str | None = None
     active_request_id: str | None = None
+    gripper_velocity_left: float | None = None
+    gripper_velocity_right: float | None = None
+    gripper_torque_left: float | None = None
+    gripper_torque_right: float | None = None
+    gripper_mos_temperature_left: float | None = None
+    gripper_mos_temperature_right: float | None = None
+    gripper_motor_temperature_left: float | None = None
+    gripper_motor_temperature_right: float | None = None
     version: int = PROTOCOL_VERSION
 
 

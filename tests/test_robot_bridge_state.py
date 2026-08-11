@@ -90,6 +90,20 @@ _install_ros_stubs()
 robot_bridge = importlib.import_module("marvinpro_deploy.robot_bridge")
 
 
+def test_gripper_feedback_parser_preserves_q_velocity_torque_and_temperatures():
+    values = robot_bridge.MarvinBridgeNode._gripper_feedback_values(
+        _Message(data=[0.4, -0.02, 0.31, 32.0, 30.0, 999.0])
+    )
+
+    assert values == (0.4, -0.02, 0.31, 32.0, 30.0)
+    assert robot_bridge.MarvinBridgeNode._gripper_feedback_values(
+        _Message(data=[0.4, -0.02])
+    ) is None
+    assert robot_bridge.MarvinBridgeNode._gripper_feedback_values(
+        _Message(data=[0.4, float("nan"), 0.31])
+    ) is None
+
+
 def _bare_node():
     node = object.__new__(robot_bridge.MarvinBridgeNode)
     node._outbound_ready = _Notify()
@@ -107,6 +121,14 @@ def _bare_node():
     node._servo_error_rad = None
     node._arm_clipped = False
     node._frozen_reason = None
+    node._gripper_l_velocity = None
+    node._gripper_r_velocity = None
+    node._gripper_l_torque = None
+    node._gripper_r_torque = None
+    node._gripper_l_mos_temperature = None
+    node._gripper_r_mos_temperature = None
+    node._gripper_l_motor_temperature = None
+    node._gripper_r_motor_temperature = None
     return node
 
 
@@ -146,6 +168,27 @@ def test_timer_state_update_preserves_joint_source_timestamp():
 
     assert node._latest_state.sampled_monotonic == 12.5
     assert node._latest_state.state_seq == 1
+
+
+def test_motion_gate_requires_fresh_measured_gripper_feedback():
+    node = _bare_node()
+    node.allow_motion = True
+    node._client_connected = True
+    node._joints = (0.0,) * 14
+    node._joints_t = 10.0
+    node.max_state_age_s = 0.20
+    node._gripper_l = 0.4
+    node._gripper_r = 0.7
+    node._gripper_l_t = node._gripper_r_t = 9.0
+    node._input_mode = 3
+    node._robot_state = node._arm_state = (3, 3)
+    node._robot_state_t = node._arm_state_t = 10.0
+    node.max_status_age_s = 0.50
+
+    ready, reason = node._readiness_gate_locked(10.1)
+
+    assert not ready
+    assert reason == "left gripper feedback is stale"
 
 
 def test_rejection_event_can_precede_trajectory_session():
@@ -234,9 +277,9 @@ def test_continuous_checkpoint_does_not_pause_and_accounts_for_elapsed_knots():
     node._timeline = robot_bridge.TrajectoryTimeline(
         tuple(_action(index * 0.01) for index in range(10)),
         7.5,
-        4,
+        6,
     )
-    node._phase = 3.0
+    node._phase = 5.0
     node._phase_rate = 1.0
     node._handoff_phase = None
     node._handoff_anchor = None
@@ -247,11 +290,11 @@ def test_continuous_checkpoint_does_not_pause_and_accounts_for_elapsed_knots():
     node._checkpoint_emitted = False
     node._checkpoint_id = 0
     node._continuous_checkpoint = True
-    node._joints = (0.03,) * 14
+    node._joints = (0.05,) * 14
     node._joints_t = 5.0
     node._seq = 12
-    node._raw_reference = _action(0.03)
-    node._sent_target = _action(0.03)
+    node._raw_reference = _action(0.05)
+    node._sent_target = _action(0.05)
     node._tracking_error_rad = 0.0
     node._servo_error_rad = 0.0
     node._active_request_id = None
@@ -269,12 +312,12 @@ def test_continuous_checkpoint_does_not_pause_and_accounts_for_elapsed_knots():
     assert checkpoint.continuous_checkpoint
     assert checkpoint.settle_duration_s is None
     assert checkpoint.stable_monotonic == 5.0
-    assert checkpoint.old_remaining_actions_absolute == node._timeline.knots[4:]
-    assert node._phase > 3.0
+    assert checkpoint.old_remaining_actions_absolute == node._timeline.knots[6:]
+    assert node._phase > 5.0
     assert node._checkpoint_consumed
     assert not node._trajectory_paused
 
-    node._phase = 4.25
+    node._phase = 6.25
     node._accept_resume_locked(
         robot_bridge.ResumeTrajectoryCommand(
             command_id=2,
@@ -306,7 +349,7 @@ def test_continuous_checkpoint_does_not_pause_and_accounts_for_elapsed_knots():
             checkpoint_id=1,
             request_id="request",
             predicted_delay_steps=3,
-            execution_horizon=4,
+            execution_horizon=6,
             actions=rtc_knots,
         ),
         5.21,
@@ -437,7 +480,7 @@ def test_fake_bridge_checkpoint_resume_and_atomic_rtc_merge(monkeypatch):
             expected_timeline_version=0,
             knots=old_knots,
             knot_hz=7.5,
-            checkpoint_horizon=4,
+            checkpoint_horizon=6,
             execute=True,
         )
     )
@@ -456,9 +499,9 @@ def test_fake_bridge_checkpoint_resume_and_atomic_rtc_merge(monkeypatch):
         clock[0] += 0.01
 
     checkpoint = next(event for event in node._events if event.event_type == "checkpoint_ready")
-    assert checkpoint.phase == 3.0
+    assert checkpoint.phase == 5.0
     assert checkpoint.checkpoint_id == 1
-    assert checkpoint.old_remaining_actions_absolute == old_knots[4:]
+    assert checkpoint.old_remaining_actions_absolute == old_knots[6:]
     assert clock[0] - 100.0 > 0.20
 
     node.accept_command(
@@ -472,7 +515,7 @@ def test_fake_bridge_checkpoint_resume_and_atomic_rtc_merge(monkeypatch):
             predicted_delay_steps=2,
         )
     )
-    rtc_knots = tuple(_arm_action(0.020 + index * 0.004) for index in range(10))
+    rtc_knots = tuple(_arm_action(0.030 + index * 0.004) for index in range(10))
     node.accept_command(
         robot_bridge.StageRtcChunkCommand(
             command_id=3,
@@ -483,7 +526,7 @@ def test_fake_bridge_checkpoint_resume_and_atomic_rtc_merge(monkeypatch):
             checkpoint_id=1,
             request_id="request",
             predicted_delay_steps=2,
-            execution_horizon=4,
+            execution_horizon=6,
             actions=rtc_knots,
         )
     )
@@ -507,7 +550,7 @@ def test_fake_bridge_checkpoint_resume_and_atomic_rtc_merge(monkeypatch):
     assert node._trajectory_plan_id == "new-plan"
     assert node._timeline_version == 2
     assert node._phase == 0.0
-    assert node._timeline.knots[0] == old_knots[4]
+    assert node._timeline.knots[0] == old_knots[6]
     assert all(abs(value - 0.005) < 1e-12 for value in merged.boundary_old_velocity)
     assert all(abs(value - 0.004) < 1e-12 for value in merged.boundary_new_velocity)
     assert abs(merged.boundary_velocity_jump_rad - 0.001) < 1e-12

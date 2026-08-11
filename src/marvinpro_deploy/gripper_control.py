@@ -7,8 +7,6 @@ import sys
 import time
 
 from .config import (
-    GRIPPER_CLOSED_RAW,
-    GRIPPER_OPEN_RAW,
     TOPIC_GRIPPER_CMD_L,
     TOPIC_GRIPPER_CMD_R,
     TOPIC_GRIPPER_FEEDBACK_L,
@@ -91,13 +89,13 @@ def _run(command: str, side: str, duration_s: float) -> int:
 
     rclpy.init(args=None)
     node = rclpy.create_node("marvinpro_direct_gripper_control")
-    feedback: dict[str, float] = {}
+    diagnostics: dict[str, tuple[float, ...]] = {}
     subscriptions = []
 
-    def save_feedback(name: str):
+    def save_diagnostics(name: str):
         def callback(message) -> None:
             if message.data:
-                feedback[name] = float(message.data[0])
+                diagnostics[name] = tuple(float(value) for value in message.data)
 
         return callback
 
@@ -112,7 +110,7 @@ def _run(command: str, side: str, duration_s: float) -> int:
             node.create_subscription(
                 Float32MultiArray,
                 feedback_topics[name],
-                save_feedback(name),
+                save_diagnostics(name),
                 feedback_qos,
             )
         )
@@ -161,14 +159,21 @@ def _run(command: str, side: str, duration_s: float) -> int:
         print(
             f"Command sent: {names} -> {command} ({COMMAND_NAME[command]}), {publish_count} times at {PUBLISH_HZ:g} Hz."
         )
-        if feedback:
-            readings = ", ".join(f"{name}={feedback[name]:.3f}" for name, _topic in selected_topics if name in feedback)
-            print(
-                f"Latest raw feedback: {readings} "
-                f"(calibration: open={GRIPPER_OPEN_RAW:g}, closed~={GRIPPER_CLOSED_RAW:g})."
-            )
+        if diagnostics:
+            readings = []
+            for name, _topic in selected_topics:
+                values = diagnostics.get(name)
+                if values is None:
+                    continue
+                labels = ("q_rad", "dq_rad_s", "tau", "T_mos", "T_motor")
+                readings.append(
+                    name + "={" + ", ".join(
+                        f"{label}={value:.4f}" for label, value in zip(labels, values)
+                    ) + "}"
+                )
+            print("Latest measured gripper feedback: " + ", ".join(readings) + ".")
         else:
-            print("No gripper feedback was received during the command.", file=sys.stderr)
+            print("No measured gripper feedback was received during the command.", file=sys.stderr)
         return 0
     finally:
         node.destroy_node()

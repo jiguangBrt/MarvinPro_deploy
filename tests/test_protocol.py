@@ -61,7 +61,7 @@ class ProtocolTest(unittest.TestCase):
                 expected_timeline_version=1,
                 knots=((0.0,) * 16,) * 10,
                 knot_hz=7.5,
-                checkpoint_horizon=4,
+                checkpoint_horizon=6,
                 execute=True,
                 continuous_checkpoint=True,
             ),

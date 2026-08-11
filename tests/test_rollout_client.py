@@ -216,6 +216,10 @@ class RobotConnectionTest(unittest.TestCase):
             age_state_s=0.001,
             age_gripper_left_s=0.002,
             age_gripper_right_s=0.003,
+            gripper_raw_left=0.4,
+            gripper_raw_right=0.6,
+            gripper_torque_left=0.1,
+            gripper_torque_right=0.2,
         )
 
         class FakeConnection:
@@ -267,7 +271,7 @@ class RobotConnectionTest(unittest.TestCase):
 
 
 class JointTelemetryRecorderTest(unittest.TestCase):
-    def test_records_feedback_and_post_filter_command_in_one_csv(self):
+    def test_records_arm_and_gripper_feedback_and_post_filter_command(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "rollout.telemetry.csv"
             recorder = JointTelemetryRecorder(path)
@@ -285,6 +289,10 @@ class JointTelemetryRecorderTest(unittest.TestCase):
                 phase_rate=1.0,
                 raw_reference=vector(1.0),
                 sent_target=vector(2.0),
+                gripper_velocity_left=0.01,
+                gripper_velocity_right=0.02,
+                gripper_torque_left=0.11,
+                gripper_torque_right=0.12,
             )
             recorder.record_state(state, 20.0)
             observation = SimpleNamespace(
@@ -308,6 +316,9 @@ class JointTelemetryRecorderTest(unittest.TestCase):
                 rows = list(csv.DictReader(stream))
             self.assertEqual([row["record_type"] for row in rows], ["bridge_state", "client_command"])
             self.assertEqual(float(rows[0]["measured_Joint1_L"]), 0.1)
+            self.assertEqual(float(rows[0]["measured_gripper_position_raw_L"]), 0.2)
+            self.assertAlmostEqual(float(rows[0]["measured_gripper_position_L"]), 0.16)
+            self.assertEqual(float(rows[0]["measured_gripper_torque_L"]), 0.11)
             self.assertEqual(float(rows[0]["bridge_command_Joint1_L"]), 2.0)
             self.assertEqual(float(rows[1]["client_reference_Joint1_L"]), 3.0)
             self.assertEqual(float(rows[1]["client_command_Joint1_L"]), 2.9)
@@ -464,6 +475,47 @@ class RolloutArgumentTest(unittest.TestCase):
         self.assertFalse(args.rtc_shadow)
         self.assertTrue(args.rtc_continuous)
         self.assertEqual(args.max_rtc_merges, 2)
+
+    def test_rtc_schedule_allows_validated_slow_playback(self):
+        args = parse_args(
+            [
+                "--execute",
+                "--rollout-schedule",
+                "rtc",
+                "--playback-mode",
+                "interpolated",
+                "--control-hz",
+                "100",
+                "--model-hz",
+                "15",
+                "--playback-time-scale",
+                "3",
+                "--execute-steps",
+                "10",
+            ]
+        )
+
+        self.assertEqual(args.playback_time_scale, 3.0)
+
+    def test_rtc_schedule_rejects_unvalidated_playback_scale(self):
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parse_args(
+                [
+                    "--execute",
+                    "--rollout-schedule",
+                    "rtc",
+                    "--playback-mode",
+                    "interpolated",
+                    "--control-hz",
+                    "100",
+                    "--model-hz",
+                    "15",
+                    "--playback-time-scale",
+                    "4",
+                    "--execute-steps",
+                    "10",
+                ]
+            )
 
     def test_continuous_checkpoint_requires_rtc_schedule(self):
         with redirect_stderr(io.StringIO()):
