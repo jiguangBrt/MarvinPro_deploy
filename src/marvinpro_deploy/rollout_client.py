@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from collections import deque
 from dataclasses import dataclass
 import logging
 import math
+from pathlib import Path
+import queue
+import shlex
 import socket
+import sys
 import threading
 import time
 import uuid
@@ -57,13 +62,168 @@ from .safety import SafetyError, action_arms, filter_action
 
 LOGGER = logging.getLogger("marvinpro_rollout")
 
+_ACTIVE_STATE_LOG_INTERVAL_S = 0.10
+_HOLD_STATE_LOG_INTERVAL_S = 1.0
+_ACTION_NAMES = JOINT_NAMES[:7] + ("Gripper_L",) + JOINT_NAMES[7:] + ("Gripper_R",)
+
+
+class JointTelemetryRecorder:
+    """Write measured feedback and the actual outgoing command without console noise."""
+
+    def __init__(self, path: Path) -> None:
+        path = path.expanduser().resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
+        self._file = path.open("w", encoding="utf-8", newline="", buffering=1)
+        self._writer = csv.writer(self._file)
+        self._lock = threading.Lock()
+        self._rows: queue.Queue[list[object] | None] = queue.Queue()
+        self._closed = False
+        self._writer.writerow(self._columns())
+        self._writer_thread = threading.Thread(target=self._write_loop, name="joint-telemetry", daemon=True)
+        self._writer_thread.start()
+
+    @staticmethod
+    def _columns() -> list[str]:
+        columns = [
+            "record_type",
+            "recorded_monotonic",
+            "sampled_monotonic",
+            "state_seq",
+            "observation_seq",
+            "command_id",
+            "trajectory_mode",
+            "timeline_version",
+            "phase",
+            "phase_rate",
+            "tracking_error_rad",
+            "servo_error_rad",
+            "arm_clipped",
+            "frozen_reason",
+            "active_request_id",
+        ]
+        columns.extend(f"measured_{name}" for name in JOINT_NAMES)
+        columns.extend(("feedback_gripper_raw_L", "feedback_gripper_raw_R"))
+        columns.extend(f"raw_reference_{name}" for name in _ACTION_NAMES)
+        columns.extend(f"bridge_command_{name}" for name in _ACTION_NAMES)
+        columns.extend(f"client_reference_{name}" for name in _ACTION_NAMES)
+        columns.extend(f"client_command_{name}" for name in _ACTION_NAMES)
+        return columns
+
+    @staticmethod
+    def _values(values: tuple[float, ...] | None, size: int) -> list[float | str]:
+        if values is None:
+            return [""] * size
+        if len(values) != size:
+            raise ValueError(f"telemetry vector has length {len(values)}, expected {size}")
+        return list(values)
+
+    def record_state(self, message: RobotStateUpdate, received_monotonic: float) -> None:
+        row = [
+            "bridge_state",
+            received_monotonic,
+            message.sampled_monotonic,
+            message.state_seq,
+            "",
+            message.last_command_id if message.last_command_id is not None else "",
+            message.trajectory_mode,
+            message.timeline_version,
+            "" if message.phase is None else message.phase,
+            message.phase_rate,
+            "" if message.tracking_error_rad is None else message.tracking_error_rad,
+            "" if message.servo_error_rad is None else message.servo_error_rad,
+            int(message.arm_clipped),
+            message.frozen_reason or "",
+            message.active_request_id or "",
+        ]
+        row.extend(message.joints)
+        row.extend((message.gripper_raw_left, message.gripper_raw_right))
+        row.extend(self._values(message.raw_reference, 16))
+        row.extend(self._values(message.sent_target, 16))
+        row.extend([""] * 16)
+        self._write(row)
+
+    def record_client_command(
+        self,
+        *,
+        recorded_monotonic: float,
+        observation: RobotObservation,
+        command_id: int,
+        requested_action: tuple[float, ...],
+        sent_action: tuple[float, ...],
+        was_hold: bool,
+    ) -> None:
+        row = [
+            "client_hold" if was_hold else "client_command",
+            recorded_monotonic,
+            observation.captured_monotonic,
+            "",
+            observation.seq,
+            command_id,
+            "legacy_client",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ]
+        row.extend(observation.joints)
+        row.extend((observation.gripper_raw_left, observation.gripper_raw_right))
+        row.extend([""] * 16)
+        row.extend([""] * 16)
+        row.extend(self._values(requested_action, 16))
+        row.extend(self._values(sent_action, 16))
+        self._write(row)
+
+    def _write(self, row: list[object]) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._rows.put_nowait(row)
+
+    def _write_loop(self) -> None:
+        while True:
+            row = self._rows.get()
+            try:
+                if row is None:
+                    return
+                self._writer.writerow(row)
+                self._file.flush()
+            finally:
+                self._rows.task_done()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._rows.put_nowait(None)
+        self._rows.join()
+        self._writer_thread.join(timeout=1.0)
+        self._file.close()
+
 
 class RolloutError(RuntimeError):
     pass
 
 
+def _state_log_interval_s(trajectory_mode: str) -> float:
+    if trajectory_mode == "hold":
+        return _HOLD_STATE_LOG_INTERVAL_S
+    return _ACTIVE_STATE_LOG_INTERVAL_S
+
+
 class RobotConnection:
-    def __init__(self, host: str, port: int, connect_timeout_s: float = 5.0) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        connect_timeout_s: float = 5.0,
+        telemetry: JointTelemetryRecorder | None = None,
+    ) -> None:
         self._socket = socket.create_connection((host, port), timeout=connect_timeout_s)
         self._socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         hello = recv_message(self._socket)
@@ -80,8 +240,11 @@ class RobotConnection:
         self._latest_observation_received = 0.0
         self._latest_state: RobotStateUpdate | None = None
         self._latest_state_received = 0.0
+        self._telemetry = telemetry
         self._events: deque[TrajectoryEvent] = deque()
         self._last_event_seq = 0
+        self._last_state_log_monotonic = 0.0
+        self._last_state_log_signature: tuple[object, ...] | None = None
         self._error: BaseException | None = None
         self._closed = False
         self._receiver = threading.Thread(target=self._receive_loop, name="robot-observations", daemon=True)
@@ -104,10 +267,90 @@ class RobotConnection:
                         if self._latest_state is None or message.state_seq > self._latest_state.state_seq:
                             self._latest_state = message
                             self._latest_state_received = received
+                            if self._telemetry is not None:
+                                self._telemetry.record_state(message, received)
+                            signature = (
+                                message.motion_gate_open,
+                                message.trajectory_mode,
+                                message.session_id,
+                                message.plan_id,
+                                message.timeline_version,
+                                message.arm_clipped,
+                                message.frozen_reason,
+                                message.active_request_id,
+                            )
+                            periodic = (
+                                message.trajectory_mode != "legacy"
+                                and received - self._last_state_log_monotonic
+                                >= _state_log_interval_s(message.trajectory_mode)
+                            )
+                            if signature != self._last_state_log_signature or periodic:
+                                reference_delta = _reference_delta(message.raw_reference, message.sent_target)
+                                LOGGER.debug(
+                                    "bridge_state seq=%d source=%.6f gate=%s mode=%s session=%s plan=%s "
+                                    "version=%d phase=%s phase_rate=%.6f tracking_error=%s servo_error=%s "
+                                    "reference_delta=%s arm_clipped=%s frozen=%s request=%s "
+                                    "joints=%s raw_reference=%s sent_target=%s status=%r",
+                                    message.state_seq,
+                                    message.sampled_monotonic,
+                                    message.motion_gate_open,
+                                    message.trajectory_mode,
+                                    message.session_id,
+                                    message.plan_id,
+                                    message.timeline_version,
+                                    message.phase,
+                                    message.phase_rate,
+                                    message.tracking_error_rad,
+                                    message.servo_error_rad,
+                                    reference_delta,
+                                    message.arm_clipped,
+                                    message.frozen_reason,
+                                    message.active_request_id,
+                                    message.joints,
+                                    message.raw_reference,
+                                    message.sent_target,
+                                    message.last_command_status,
+                                )
+                                self._last_state_log_monotonic = received
+                                self._last_state_log_signature = signature
                     elif isinstance(message, TrajectoryEvent):
                         if message.event_seq > self._last_event_seq:
                             self._events.append(message)
                             self._last_event_seq = message.event_seq
+                            LOGGER.info(
+                                "bridge_event type=%s event_seq=%d session=%s plan=%s version=%d "
+                                "phase=%.6f checkpoint=%s request=%s d_pred=%s d_actual=%s "
+                                "tracking_error=%s servo_error=%s settle_s=%s joint_source=%s "
+                                "reference_delta=%s arm_clipped=%s frozen=%s continuous_checkpoint=%s "
+                                "raw_reference=%s "
+                                "sent_target=%s boundary_old_velocity=%s boundary_new_velocity=%s "
+                                "boundary_velocity_jump_rad=%s boundary_acceleration_jump_rad=%s detail=%r",
+                                message.event_type,
+                                message.event_seq,
+                                message.session_id,
+                                message.plan_id,
+                                message.timeline_version,
+                                message.phase,
+                                message.checkpoint_id,
+                                message.request_id,
+                                message.predicted_delay_steps,
+                                message.actual_delay_steps,
+                                message.tracking_error_rad,
+                                message.servo_error_rad,
+                                message.settle_duration_s,
+                                message.joint_source_monotonic,
+                                _reference_delta(message.raw_reference, message.sent_target),
+                                message.arm_clipped,
+                                message.frozen_reason,
+                                getattr(message, "continuous_checkpoint", False),
+                                message.raw_reference,
+                                message.sent_target,
+                                getattr(message, "boundary_old_velocity", ()),
+                                getattr(message, "boundary_new_velocity", ()),
+                                getattr(message, "boundary_velocity_jump_rad", None),
+                                getattr(message, "boundary_acceleration_jump_rad", None),
+                                message.detail,
+                            )
                     else:
                         raise ProtocolError(f"unexpected bridge message {type(message).__name__}")
                     self._condition.notify_all()
@@ -236,6 +479,8 @@ class RobotConnection:
             pass
         self._socket.close()
         self._receiver.join(timeout=1.0)
+        if self._telemetry is not None:
+            self._telemetry.close()
 
 
 @dataclass(frozen=True)
@@ -278,6 +523,14 @@ class TrackingResult:
     max_error_rad: float
     final_error_rad: float
     worst_joint: str
+
+
+def _reference_delta(reference, target) -> float | None:
+    if reference is None or target is None:
+        return None
+    reference_arms = np.asarray(action_arms(tuple(float(value) for value in reference)))
+    target_arms = np.asarray(action_arms(tuple(float(value) for value in target)))
+    return float(np.max(np.abs(reference_arms - target_arms)))
 
 
 class ActionPlan:
@@ -371,6 +624,7 @@ class ActionPublisher:
         warn_on_plan_empty: bool,
         refresh_observation_seq: bool,
         hold_last_plan_action: bool,
+        telemetry: JointTelemetryRecorder | None = None,
     ) -> None:
         self.connection = connection
         self.plan = plan
@@ -382,6 +636,7 @@ class ActionPublisher:
         self.joint_limit_margin_rad = joint_limit_margin_rad
         self.refresh_observation_seq = refresh_observation_seq
         self.hold_last_plan_action = hold_last_plan_action
+        self.telemetry = telemetry
         self.error: BaseException | None = None
         self.sent = 0
         self.plan_steps_sent = 0
@@ -396,6 +651,10 @@ class ActionPublisher:
         self._allow_plan_latching = True
         self._warn_on_plan_empty = warn_on_plan_empty
         self._has_published_plan_action = False
+        self._tick_count = 0
+        self._late_tick_count = 0
+        self._skipped_tick_count = 0
+        self._max_tick_gap_s = 0.0
         self._thread = threading.Thread(target=self._run, name="action-publisher", daemon=True)
 
     def start(self) -> None:
@@ -433,9 +692,19 @@ class ActionPublisher:
             # A plan step already popped by the publisher must not overwrite the shutdown latch.
             self._allow_plan_latching = False
 
+    def timing_snapshot(self) -> tuple[int, int, int, float]:
+        with self._state_lock:
+            return (
+                self._tick_count,
+                self._late_tick_count,
+                self._skipped_tick_count,
+                self._max_tick_gap_s,
+            )
+
     def _run(self) -> None:
         command_id = 0
         next_tick = time.monotonic()
+        previous_tick = None
         last_underrun_log = 0.0
         last_arm_clip_log = 0.0
         last_gripper_clip_log = 0.0
@@ -445,6 +714,15 @@ class ActionPublisher:
                 if now < next_tick:
                     self.stop.wait(next_tick - now)
                     continue
+                if previous_tick is not None:
+                    tick_gap = now - previous_tick
+                    with self._state_lock:
+                        self._max_tick_gap_s = max(self._max_tick_gap_s, tick_gap)
+                        self._late_tick_count += tick_gap > 1.5 * self.period_s
+                        self._skipped_tick_count += max(0, int(tick_gap / self.period_s) - 1)
+                previous_tick = now
+                with self._state_lock:
+                    self._tick_count += 1
                 while next_tick <= now:
                     next_tick += self.period_s
 
@@ -487,12 +765,27 @@ class ActionPublisher:
                 arm_was_clipped = any(index not in (7, 15) for index in filtered.clipped_indices)
                 gripper_was_clipped = any(index in (7, 15) for index in filtered.clipped_indices)
                 if arm_was_clipped and now - last_arm_clip_log >= 1.0:
-                    LOGGER.warning("safety filter clipped action dimensions %s", filtered.clipped_indices)
+                    clip_details = tuple(
+                        f"{index}:{step.action[index]:.5f}->{filtered.action[index]:.5f}"
+                        for index in filtered.clipped_indices
+                        if index not in (7, 15)
+                    )
+                    LOGGER.warning(
+                        "safety filter clipped arm dimensions %s raw_to_sent=%s",
+                        tuple(index for index in filtered.clipped_indices if index not in (7, 15)),
+                        clip_details,
+                    )
                     last_arm_clip_log = now
                 elif gripper_was_clipped and now - last_gripper_clip_log >= 2.0:
+                    clip_details = tuple(
+                        f"{index}:{step.action[index]:.5f}->{filtered.action[index]:.5f}"
+                        for index in filtered.clipped_indices
+                        if index in (7, 15)
+                    )
                     LOGGER.debug(
-                        "safety filter is repeatedly clamping gripper dimensions %s",
-                        filtered.clipped_indices,
+                        "safety filter is repeatedly clamping gripper dimensions %s raw_to_sent=%s",
+                        tuple(index for index in filtered.clipped_indices if index in (7, 15)),
+                        clip_details,
                     )
                     last_gripper_clip_log = now
                 command_id += 1
@@ -505,6 +798,15 @@ class ActionPublisher:
                             execute=True,
                         )
                     )
+                    if self.telemetry is not None:
+                        self.telemetry.record_client_command(
+                            recorded_monotonic=now,
+                            observation=observation,
+                            command_id=command_id,
+                            requested_action=step.action,
+                            sent_action=filtered.action,
+                            was_hold=was_hold,
+                        )
                 with self._state_lock:
                     self.sent += 1
                     self.plan_steps_sent += not was_hold
@@ -600,10 +902,27 @@ def _wait_for_ready(connection: RobotConnection, timeout_s: float) -> RobotObser
     print("  Waiting for input_mode=3, robot_state=(3, 3), arm_state=(3, 3)...", flush=True)
     observation = connection.wait_for_observation(timeout_s=timeout_s, require_motion_gate=True)
     print("  Motion gate is ready.")
+    LOGGER.warning(
+        "motion_gate_ready observation_seq=%d input_mode=%s robot_state=%s arm_state=%s",
+        observation.seq,
+        observation.input_mode,
+        observation.robot_state,
+        observation.arm_state,
+    )
     return observation
 
 
 def _confirm_execution(args: argparse.Namespace, observation: RobotObservation) -> None:
+    LOGGER.warning(
+        "real_robot_execution_requested observation_seq=%d input_mode=%s robot_state=%s "
+        "arm_state=%s duration_s=%.3f schedule=%s",
+        observation.seq,
+        observation.input_mode,
+        observation.robot_state,
+        observation.arm_state,
+        args.episode_seconds,
+        args.rollout_schedule,
+    )
     print("\nREAL ROBOT EXECUTION REQUESTED")
     print(f"  prompt: {args.prompt}")
     print(f"  input_mode: {observation.input_mode}")
@@ -629,13 +948,50 @@ def _confirm_execution(args: argparse.Namespace, observation: RobotObservation) 
             print(f"  next-chunk inference lead: {args.chunk_prefetch_seconds:.2f}s")
         else:
             print(f"  rollout schedule: bridge-owned {args.rollout_schedule}")
-            print("  physical checkpoint: 4 actions" if args.rollout_schedule == "rtc" else "  full-chunk checkpoint")
+            if args.rollout_schedule == "rtc" and args.rtc_continuous:
+                print("  RTC checkpoint: continuous at action 4 (no settle hold)")
+            else:
+                print(
+                    "  physical checkpoint: 4 actions"
+                    if args.rollout_schedule == "rtc"
+                    else "  full-chunk checkpoint"
+                )
+            if args.rollout_schedule == "rtc" and args.max_rtc_merges is not None:
+                print(f"  maximum RTC merges: {args.max_rtc_merges}")
     print("Keep the emergency stop reachable. Switch Input Mode to None before stopping the bridge.")
     if args.yes:
+        LOGGER.warning("real_robot_execution_confirmed method=--yes")
         return
-    answer = input('Type exactly "EXECUTE" to start motion: ')
-    if answer != "EXECUTE":
+    answer = input('Type exactly "E" to start motion: ')
+    if answer != "E":
         raise RolloutError("execution confirmation was not given")
+    LOGGER.warning("real_robot_execution_confirmed method=typed_E")
+
+
+def _confirm_and_refresh_execution_observation(
+    args: argparse.Namespace,
+    connection: RobotConnection,
+    observation: RobotObservation,
+) -> RobotObservation:
+    _confirm_execution(args, observation)
+    latest_after_confirmation = connection.latest(args.max_observation_age)
+    fresh = connection.wait_for_observation(
+        timeout_s=args.observation_timeout,
+        newer_than=latest_after_confirmation.seq,
+        require_motion_gate=True,
+    )
+    validate_observation(fresh, args.max_source_age)
+    LOGGER.warning(
+        "post_confirmation_observation baseline_seq=%d fresh_seq=%d captured=%.6f "
+        "joint_age_ms=%.3f left_gripper_age_ms=%.3f right_gripper_age_ms=%.3f",
+        latest_after_confirmation.seq,
+        fresh.seq,
+        fresh.captured_monotonic,
+        float(fresh.age_state_s) * 1000.0,
+        float(fresh.age_gripper_left_s) * 1000.0,
+        float(fresh.age_gripper_right_s) * 1000.0,
+    )
+    return fresh
 
 
 def _wait_for_none_after_rollout(
@@ -663,6 +1019,7 @@ def _wait_for_none_after_rollout(
         observation = connection.latest()
         if observation.input_mode != 3:
             print(f"  Input Mode is {observation.input_mode}; rollout client can disconnect safely.")
+            LOGGER.warning("rollout_exit_mode_confirmed input_mode=%s", observation.input_mode)
             return
         if publisher.error is not None:
             raise RolloutError(f"action publisher failed while waiting for Input Mode None: {publisher.error}")
@@ -1008,6 +1365,24 @@ def _actions_tuple(actions: np.ndarray) -> tuple[tuple[float, ...], ...]:
     values = np.asarray(actions, dtype=np.float64)
     if values.shape != (RTC_HORIZON, 16) or not np.isfinite(values).all():
         raise RolloutError(f"trajectory actions must have shape ({RTC_HORIZON}, 16), got {values.shape}")
+    values = values.copy()
+    raw_left = values[:, 7].copy()
+    raw_right = values[:, 15].copy()
+    values[:, 7] = np.clip(raw_left, 0.0, 1.0)
+    values[:, 15] = np.clip(raw_right, 0.0, 1.0)
+    left_clipped = int(np.count_nonzero(values[:, 7] != raw_left))
+    right_clipped = int(np.count_nonzero(values[:, 15] != raw_right))
+    if left_clipped or right_clipped:
+        LOGGER.info(
+            "trajectory_gripper_projection left_clipped=%d right_clipped=%d "
+            "raw_left_range=[%.6f,%.6f] raw_right_range=[%.6f,%.6f]",
+            left_clipped,
+            right_clipped,
+            float(np.min(raw_left)),
+            float(np.max(raw_left)),
+            float(np.min(raw_right)),
+            float(np.max(raw_right)),
+        )
     return tuple(tuple(float(value) for value in row) for row in values)
 
 
@@ -1023,6 +1398,7 @@ def _load_bridge_trajectory(
     knot_hz: float,
     checkpoint_horizon: int,
     timeout_s: float,
+    continuous_checkpoint: bool = False,
 ) -> TrajectoryEvent:
     connection.send(
         LoadTrajectoryCommand(
@@ -1035,6 +1411,7 @@ def _load_bridge_trajectory(
             knot_hz=knot_hz,
             checkpoint_horizon=checkpoint_horizon,
             execute=True,
+            continuous_checkpoint=continuous_checkpoint,
         )
     )
     event = connection.wait_for_event(
@@ -1074,6 +1451,23 @@ def _wait_checkpoint_observation(
         if sampled is None or abs(observation.captured_monotonic - float(sampled)) > max_state_image_skew_s:
             continue
         validate_observation(observation, max_source_age_s)
+        LOGGER.info(
+            "checkpoint_observation event_seq=%d checkpoint=%s image_seq=%d "
+            "stable=%.6f captured=%.6f after_stable_ms=%.3f state_sampled=%.6f "
+            "state_image_skew_ms=%.3f joint_age_ms=%.3f left_gripper_age_ms=%.3f "
+            "right_gripper_age_ms=%.3f",
+            event.event_seq,
+            event.checkpoint_id,
+            observation.seq,
+            event.stable_monotonic,
+            observation.captured_monotonic,
+            (observation.captured_monotonic - event.stable_monotonic) * 1000.0,
+            float(sampled),
+            abs(observation.captured_monotonic - float(sampled)) * 1000.0,
+            float(observation.age_state_s) * 1000.0,
+            float(observation.age_gripper_left_s) * 1000.0,
+            float(observation.age_gripper_right_s) * 1000.0,
+        )
         return observation
 
 
@@ -1255,6 +1649,13 @@ def _run_trajectory_schedule(
     actions, timing = infer_actions(policy, observation, args.prompt)
     inference_count += 1
     estimator.record_seconds(timing["wall_ms"] / 1000.0)
+    LOGGER.info(
+        "trajectory_initial_inference observation_seq=%d wall_ms=%.1f policy_timing=%s server_timing=%s",
+        observation.seq,
+        timing["wall_ms"],
+        timing["policy_timing"],
+        timing["server_timing"],
+    )
     first_plan_id = f"plan-{uuid.uuid4().hex}"
     loaded = _load_bridge_trajectory(
         connection,
@@ -1267,11 +1668,20 @@ def _run_trajectory_schedule(
         knot_hz=effective_knot_hz,
         checkpoint_horizon=RTC_HORIZON if fallback else RTC_EXECUTION_HORIZON,
         timeout_s=args.tracking_timeout,
+        continuous_checkpoint=args.rtc_continuous,
     )
-    LOGGER.info("bridge trajectory session %s loaded at version %d", session_id, loaded.timeline_version)
+    LOGGER.info(
+        "bridge trajectory session=%s plan=%s loaded_version=%d event_seq=%d phase=%.6f",
+        session_id,
+        first_plan_id,
+        loaded.timeline_version,
+        loaded.event_seq,
+        loaded.phase,
+    )
     heartbeat.update_version(loaded.timeline_version)
     heartbeat.start()
     episode_deadline = time.monotonic() + args.episode_seconds
+    rtc_merge_count = 0
 
     try:
         if fallback:
@@ -1300,7 +1710,10 @@ def _run_trajectory_schedule(
                 episode_deadline=episode_deadline,
             )
 
-        while time.monotonic() < episode_deadline:
+        while (
+            time.monotonic() < episode_deadline
+            or (args.max_rtc_merges is not None and rtc_merge_count >= args.max_rtc_merges)
+        ):
             if heartbeat.error is not None:
                 raise RolloutError(f"trajectory heartbeat failed: {heartbeat.error}")
             checkpoint = connection.wait_for_event(
@@ -1309,6 +1722,30 @@ def _run_trajectory_schedule(
             )
             if checkpoint.event_type != "checkpoint_ready":
                 raise RolloutError(f"RTC checkpoint failed: {checkpoint.detail}")
+            if args.max_rtc_merges is not None and rtc_merge_count >= args.max_rtc_merges:
+                if args.rtc_continuous:
+                    LOGGER.info(
+                        "RTC merge limit reached count=%d limit=%d; continuous checkpoint received, holding now",
+                        rtc_merge_count,
+                        args.max_rtc_merges,
+                    )
+                    print(
+                        f"\nRTC merge limit reached ({rtc_merge_count}); "
+                        "current RTC segment reached a continuous checkpoint; holding the target.",
+                        flush=True,
+                    )
+                else:
+                    LOGGER.info(
+                        "RTC merge limit reached count=%d limit=%d; stable checkpoint received, holding now",
+                        rtc_merge_count,
+                        args.max_rtc_merges,
+                    )
+                    print(
+                        f"\nRTC merge limit reached ({rtc_merge_count}); "
+                        "current RTC segment reached a stable checkpoint; holding the target.",
+                        flush=True,
+                    )
+                break
             observation = _wait_checkpoint_observation(
                 connection,
                 checkpoint,
@@ -1421,6 +1858,8 @@ def _run_trajectory_schedule(
                     merged.timeline_version,
                 )
                 heartbeat.update_version(merged.timeline_version)
+                rtc_merge_count += 1
+                LOGGER.info("RTC merge count=%d limit=%s", rtc_merge_count, args.max_rtc_merges)
             except Exception as exc:
                 LOGGER.warning("RTC disabled for the rest of this episode: %s", exc)
                 holding = _hold_bridge_position(
@@ -1465,11 +1904,15 @@ def _run_trajectory_schedule(
             timeout_s=args.tracking_timeout,
         )
         heartbeat.update_version(holding.timeline_version)
-        print("\nROLLOUT COMPLETE\n  Bridge is holding one fixed target. Now change Apex Input Mode to None.")
+        print("\nROLLOUT COMPLETE")
+        print("  Motion is complete; the bridge is holding one fixed target.")
+        print("  The client is waiting for the required manual safety handoff.")
+        print("  Change Apex Input Mode to None now; the client will then exit.", flush=True)
         deadline = time.monotonic() + args.exit_mode_timeout
         while time.monotonic() < deadline:
             latest_observation = connection.latest()
             if latest_observation.input_mode != 3:
+                LOGGER.warning("trajectory_exit_mode_confirmed input_mode=%s", latest_observation.input_mode)
                 return inference_count
             time.sleep(0.05)
         raise RolloutError("Input Mode stayed Custom after trajectory rollout")
@@ -1480,27 +1923,50 @@ def _run_trajectory_schedule(
 
 def run(args: argparse.Namespace) -> int:
     connection: RobotConnection | None = None
+    telemetry: JointTelemetryRecorder | None = None
     stop = threading.Event()
     publisher: ActionPublisher | None = None
     reason = "rollout completed"
     try:
+        telemetry_path = getattr(args, "telemetry_file", None)
+        if telemetry_path:
+            telemetry = JointTelemetryRecorder(Path(telemetry_path))
         print(f"Connecting to robot bridge at {args.robot_host}:{args.robot_port}...")
-        connection = RobotConnection(args.robot_host, args.robot_port, args.connect_timeout)
+        connection = RobotConnection(
+            args.robot_host,
+            args.robot_port,
+            args.connect_timeout,
+            telemetry=telemetry,
+        )
         print(
             "  Bridge connected: "
             f"motion_allowed={connection.hello.motion_allowed}, "
             f"publish_hz={connection.hello.publish_hz:.1f}"
         )
+        LOGGER.info(
+            "bridge_hello version=%d motion_allowed=%s publish_hz=%.1f max_joint_step_rad=%.5f limits=%d/%d",
+            connection.hello.version,
+            connection.hello.motion_allowed,
+            connection.hello.publish_hz,
+            connection.hello.max_joint_step_rad,
+            len(connection.hello.joint_lower),
+            len(connection.hello.joint_upper),
+        )
         observation = connection.wait_for_observation(timeout_s=args.observation_timeout)
         validate_observation(observation, args.max_source_age)
-        LOGGER.debug(
-            "robot observation ready: seq=%d input_mode=%s robot_state=%s arm_state=%s gate=%s (%s)",
+        LOGGER.info(
+            "robot_observation_ready seq=%d captured=%.6f input_mode=%s robot_state=%s arm_state=%s "
+            "gate=%s reason=%r joint_age_ms=%.3f left_gripper_age_ms=%.3f right_gripper_age_ms=%.3f",
             observation.seq,
+            observation.captured_monotonic,
             observation.input_mode,
             observation.robot_state,
             observation.arm_state,
             observation.motion_gate_open,
             observation.gate_reason,
+            float(observation.age_state_s) * 1000.0,
+            float(observation.age_gripper_left_s) * 1000.0,
+            float(observation.age_gripper_right_s) * 1000.0,
         )
 
         if args.execute and not connection.hello.motion_allowed:
@@ -1525,7 +1991,7 @@ def run(args: argparse.Namespace) -> int:
             policy = websocket_client_policy.WebsocketClientPolicy(args.policy_host, args.policy_port)
         finally:
             root_logger.setLevel(previous_root_level)
-        LOGGER.debug("policy metadata: %s", policy.get_server_metadata())
+        LOGGER.info("policy_metadata=%s", policy.get_server_metadata())
 
         warmup_latencies_ms: list[float] = []
         if args.warmup_inferences:
@@ -1576,7 +2042,7 @@ def run(args: argparse.Namespace) -> int:
 
         if args.execute:
             observation = _wait_for_ready(connection, args.ready_timeout)
-            _confirm_execution(args, observation)
+            observation = _confirm_and_refresh_execution_observation(args, connection, observation)
         else:
             print("\nDRY RUN: policy inference and safety filtering only; no actions will be sent.")
 
@@ -1589,6 +2055,7 @@ def run(args: argparse.Namespace) -> int:
                 warmup_latencies_ms,
             )
             print(f"\nTrajectory rollout finished: {inference_count} inferences.")
+            LOGGER.info("trajectory_rollout_finished inferences=%d", inference_count)
             return 0
 
         plan = ActionPlan()
@@ -1607,6 +2074,7 @@ def run(args: argparse.Namespace) -> int:
             ),
             refresh_observation_seq=args.playback_mode == "interpolated",
             hold_last_plan_action=args.rollout_schedule == "synchronized",
+            telemetry=telemetry,
         )
         publisher.start()
         episode_started = time.monotonic()
@@ -1751,6 +2219,14 @@ def run(args: argparse.Namespace) -> int:
                 args.exit_mode_timeout,
             )
         final_snapshot = publisher.snapshot()
+        tick_count, late_tick_count, skipped_tick_count, max_tick_gap_s = publisher.timing_snapshot()
+        LOGGER.debug(
+            "publisher_timing ticks=%d late_ticks=%d skipped_ticks=%d max_gap_ms=%.3f",
+            tick_count,
+            late_tick_count,
+            skipped_tick_count,
+            max_tick_gap_s * 1000.0,
+        )
         LOGGER.debug(
             "rollout done: inferences=%d episode_action_ticks=%d episode_underruns=%d "
             "episode_clipped_ticks=%d episode_arm_clipped_ticks=%d "
@@ -1789,6 +2265,8 @@ def run(args: argparse.Namespace) -> int:
             publisher.join(timeout=1.0)
         if connection is not None:
             connection.close(reason)
+        if telemetry is not None:
+            telemetry.close()
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1799,7 +2277,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--policy-port", type=int, default=DEFAULT_POLICY_PORT)
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--execute", action="store_true", help="send actions to the bridge; default is dry-run")
-    parser.add_argument("--yes", action="store_true", help="skip the typed EXECUTE confirmation")
+    parser.add_argument("--yes", action="store_true", help="skip the typed E confirmation")
     parser.add_argument("--episode-seconds", type=float, default=60.0)
     parser.add_argument(
         "--rollout-schedule",
@@ -1870,6 +2348,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--warmup-inferences", type=int, default=1)
     parser.add_argument("--rtc-shadow", action="store_true", help="run one RTC request, discard it, then use sync fallback")
+    parser.add_argument(
+        "--rtc-continuous",
+        action="store_true",
+        help="rtc mode: observe at action 4 without pausing for checkpoint settle",
+    )
+    parser.add_argument(
+        "--max-rtc-merges",
+        type=int,
+        help=(
+            "rtc mode: after this many successful replacement merges, stop at the "
+            "next checkpoint and hold the current target"
+        ),
+    )
     parser.add_argument("--max-state-image-skew", type=float, default=0.05)
     parser.add_argument("--max-joint-step-rad", type=float, default=0.08)
     parser.add_argument("--joint-limit-margin-rad", type=float, default=0.02)
@@ -1884,7 +2375,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="seconds to hold after the episode while waiting for Input Mode None",
     )
     parser.add_argument("--connect-timeout", type=float, default=5.0)
-    parser.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO")
+    parser.add_argument(
+        "--log-level",
+        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+        default="INFO",
+        help="structured log-file detail level; also used for the console when no log file is set",
+    )
+    parser.add_argument(
+        "--console-log-level",
+        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+        help="terminal log level; defaults to WARNING with --log-file, otherwise --log-level",
+    )
+    parser.add_argument("--log-file", help="write structured rollout diagnostics to this local file")
+    parser.add_argument(
+        "--telemetry-file",
+        help=(
+            "write full-rate measured joints and interpolated commands as CSV; "
+            "defaults to <log-file stem>.telemetry.csv"
+        ),
+    )
     args = parser.parse_args(argv)
     if (
         args.episode_seconds <= 0
@@ -1931,6 +2440,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             parser.error("tracking/rtc requires --execute-steps 10")
     if args.rtc_shadow and args.rollout_schedule != "rtc":
         parser.error("--rtc-shadow requires --rollout-schedule rtc")
+    if args.rtc_continuous and args.rollout_schedule != "rtc":
+        parser.error("--rtc-continuous requires --rollout-schedule rtc")
+    if args.max_rtc_merges is not None:
+        if args.max_rtc_merges < 1:
+            parser.error("--max-rtc-merges must be positive")
+        if args.rollout_schedule != "rtc":
+            parser.error("--max-rtc-merges requires --rollout-schedule rtc")
     if args.max_state_image_skew <= 0:
         parser.error("--max-state-image-skew must be positive")
     if args.warmup_inferences < 0:
@@ -1940,13 +2456,49 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
+def _configure_logging(args: argparse.Namespace, argv: list[str] | None) -> None:
+    if args.telemetry_file:
+        args.telemetry_file = str(Path(args.telemetry_file).expanduser().resolve())
+    elif args.log_file:
+        log_path = Path(args.log_file).expanduser().resolve()
+        args.telemetry_file = str(log_path.with_name(f"{log_path.stem}.telemetry.csv"))
+    console_level_name = args.console_log_level or ("WARNING" if args.log_file else args.log_level)
+    console_level = getattr(logging, console_level_name)
+    file_level = getattr(logging, args.log_level)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(console_level)
+    handlers: list[logging.Handler] = [console_handler]
+    if args.log_file:
+        log_path = Path(args.log_file).expanduser().resolve()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        file_handler.setLevel(file_level)
+        handlers.append(file_handler)
     logging.basicConfig(
         level=logging.WARNING,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        format="%(asctime)s %(levelname)s %(name)s [%(threadName)s]: %(message)s",
+        handlers=handlers,
+        force=True,
     )
-    LOGGER.setLevel(getattr(logging, args.log_level))
+    LOGGER.setLevel(min(console_level, file_level if args.log_file else console_level))
+    effective_argv = sys.argv[1:] if argv is None else argv
+    LOGGER.info(
+        "rollout_start argv=%s source=%s console_log_level=%s file_log_level=%s config=%s",
+        shlex.join(["python", "-m", "marvinpro_deploy.rollout_client", *effective_argv]),
+        Path(__file__).resolve(),
+        console_level_name,
+        args.log_level if args.log_file else None,
+        vars(args),
+    )
+    if args.log_file:
+        print(f"Structured rollout log: {Path(args.log_file).expanduser().resolve()}")
+    if args.telemetry_file:
+        print(f"Joint telemetry log: {args.telemetry_file}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    _configure_logging(args, argv)
     return run(args)
 
 

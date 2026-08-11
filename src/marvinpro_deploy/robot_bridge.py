@@ -191,6 +191,7 @@ class MarvinBridgeNode(Node):
         self._checkpoint_id = 0
         self._checkpoint_stable_since: float | None = None
         self._checkpoint_emitted = False
+        self._continuous_checkpoint = False
         self._heartbeat_t: float | None = None
         self._last_trajectory_tick: float | None = None
         self._raw_reference: tuple[float, ...] | None = None
@@ -222,6 +223,11 @@ class MarvinBridgeNode(Node):
         self._pub_right = self.create_publisher(JointcmdArm, TOPIC_USER_CMD_R, QOS_COMMAND)
         self._pub_gripper_l = self.create_publisher(Float32, TOPIC_GRIPPER_CMD_L, QOS_RELIABLE)
         self._pub_gripper_r = self.create_publisher(Float32, TOPIC_GRIPPER_CMD_R, QOS_RELIABLE)
+        self._publish_tick_count = 0
+        self._publish_late_tick_count = 0
+        self._publish_max_gap_s = 0.0
+        self._publish_first_tick_s: float | None = None
+        self._publish_last_tick_s: float | None = None
         self.create_timer(1.0 / publish_hz, self._publish_target)
 
         mode = "MOTION ENABLED" if allow_motion else "dry-run (motion disabled)"
@@ -362,31 +368,66 @@ class MarvinBridgeNode(Node):
         request_id: str | None = None,
         predicted_delay_steps: int | None = None,
         actual_delay_steps: int | None = None,
+        boundary_old_velocity: tuple[float, ...] = (),
+        boundary_new_velocity: tuple[float, ...] = (),
+        boundary_velocity_jump_rad: float | None = None,
+        boundary_acceleration_jump_rad: float | None = None,
         detail: str = "",
     ) -> None:
         resolved_session_id = session_id or self._trajectory_session_id
         resolved_plan_id = plan_id or self._trajectory_plan_id
         if resolved_session_id is None or resolved_plan_id is None:
             return
+        resolved_timeline_version = self._timeline_version if timeline_version is None else timeline_version
+        settle_duration_s = None
+        if stable_monotonic is not None and self._checkpoint_stable_since is not None:
+            settle_duration_s = max(0.0, stable_monotonic - self._checkpoint_stable_since)
         self._event_seq += 1
-        self._events.append(
-            TrajectoryEvent(
-                event_seq=self._event_seq,
-                event_type=event_type,
-                emitted_monotonic=now,
-                session_id=resolved_session_id,
-                plan_id=resolved_plan_id,
-                timeline_version=(self._timeline_version if timeline_version is None else timeline_version),
-                phase=0.0 if self._phase is None else self._phase,
-                checkpoint_id=checkpoint_id,
-                stable_monotonic=stable_monotonic,
-                observation_seq_at_stable=observation_seq_at_stable,
-                old_remaining_actions_absolute=old_remaining_actions_absolute,
-                request_id=request_id,
-                predicted_delay_steps=predicted_delay_steps,
-                actual_delay_steps=actual_delay_steps,
-                detail=detail,
-            )
+        event = TrajectoryEvent(
+            event_seq=self._event_seq,
+            event_type=event_type,
+            emitted_monotonic=now,
+            session_id=resolved_session_id,
+            plan_id=resolved_plan_id,
+            timeline_version=resolved_timeline_version,
+            phase=0.0 if self._phase is None else self._phase,
+            checkpoint_id=checkpoint_id,
+            stable_monotonic=stable_monotonic,
+            observation_seq_at_stable=observation_seq_at_stable,
+            old_remaining_actions_absolute=old_remaining_actions_absolute,
+            request_id=request_id,
+            predicted_delay_steps=predicted_delay_steps,
+            actual_delay_steps=actual_delay_steps,
+            detail=detail,
+            tracking_error_rad=self._tracking_error_rad,
+            servo_error_rad=self._servo_error_rad,
+            joint_source_monotonic=self._joints_t,
+            settle_duration_s=settle_duration_s,
+            raw_reference=self._raw_reference,
+            sent_target=self._sent_target,
+            arm_clipped=self._arm_clipped,
+            frozen_reason=self._frozen_reason,
+            boundary_old_velocity=boundary_old_velocity,
+            boundary_new_velocity=boundary_new_velocity,
+            boundary_velocity_jump_rad=boundary_velocity_jump_rad,
+            boundary_acceleration_jump_rad=boundary_acceleration_jump_rad,
+            continuous_checkpoint=getattr(self, "_continuous_checkpoint", False),
+        )
+        self._events.append(event)
+        self.get_logger().info(
+            f"trajectory_event type={event.event_type} event_seq={event.event_seq} "
+            f"session={event.session_id} plan={event.plan_id} version={event.timeline_version} "
+            f"phase={event.phase:.6f} checkpoint={event.checkpoint_id} request={event.request_id} "
+            f"d_pred={event.predicted_delay_steps} d_actual={event.actual_delay_steps} "
+            f"tracking_error={event.tracking_error_rad} servo_error={event.servo_error_rad} "
+            f"settle_s={event.settle_duration_s} joint_source={event.joint_source_monotonic} "
+            f"arm_clipped={event.arm_clipped} frozen={event.frozen_reason} "
+            f"continuous_checkpoint={event.continuous_checkpoint} "
+            f"boundary_old_velocity={event.boundary_old_velocity} "
+            f"boundary_new_velocity={event.boundary_new_velocity} "
+            f"boundary_velocity_jump_rad={event.boundary_velocity_jump_rad} "
+            f"boundary_acceleration_jump_rad={event.boundary_acceleration_jump_rad} "
+            f"raw_reference={event.raw_reference} sent_target={event.sent_target} detail={event.detail!r}"
         )
         if len(self._events) > 128:
             self._clear_trajectory_locked("trajectory event queue overflow", now, emit_event=False)
@@ -407,6 +448,7 @@ class MarvinBridgeNode(Node):
         self._pause_kind = None
         self._checkpoint_stable_since = None
         self._checkpoint_emitted = False
+        self._continuous_checkpoint = False
         self._heartbeat_t = None
         self._raw_reference = None
         self._sent_target = None
@@ -550,6 +592,9 @@ class MarvinBridgeNode(Node):
         self._validate_trajectory_knots_locked(timeline)
         if timeline.horizon != 10:
             raise SafetyError("trajectory mode currently requires horizon 10")
+        continuous_checkpoint = bool(getattr(message, "continuous_checkpoint", False))
+        if continuous_checkpoint and timeline.checkpoint_horizon != 4:
+            raise SafetyError("continuous checkpoints require execution horizon 4")
         assert self._joints is not None and self._gripper_l is not None and self._gripper_r is not None
         self._clear_target_locked("trajectory ownership enabled")
         self._trajectory_session_id = message.session_id
@@ -565,6 +610,7 @@ class MarvinBridgeNode(Node):
         self._pause_kind = None
         self._checkpoint_stable_since = None
         self._checkpoint_emitted = False
+        self._continuous_checkpoint = continuous_checkpoint
         self._heartbeat_t = now
         self._last_trajectory_tick = now
         self._raw_reference = self._handoff_anchor
@@ -593,18 +639,46 @@ class MarvinBridgeNode(Node):
             or message.checkpoint_id != self._checkpoint_id
         ):
             raise SafetyError("resume command does not match the active checkpoint")
-        if not self._trajectory_paused or self._pause_kind != "checkpoint" or not self._checkpoint_emitted:
-            raise SafetyError("trajectory is not waiting at a completed checkpoint")
+        settled_checkpoint = (
+            not self._continuous_checkpoint
+            and self._trajectory_paused
+            and self._pause_kind == "checkpoint"
+            and self._checkpoint_emitted
+        )
+        continuous_checkpoint = (
+            self._continuous_checkpoint
+            and not self._trajectory_paused
+            and self._checkpoint_consumed
+            and self._checkpoint_emitted
+            and self._active_request_id is None
+        )
+        if not settled_checkpoint and not continuous_checkpoint:
+            raise SafetyError("trajectory is not at an available checkpoint")
+        if continuous_checkpoint and (self._frozen_reason is not None or self._arm_clipped):
+            raise SafetyError("continuous checkpoint became unsafe before RTC inference started")
         assert self._timeline is not None
         max_delay = min(self._timeline.checkpoint_horizon, self._timeline.horizon - self._timeline.checkpoint_horizon)
         if not 1 <= message.predicted_delay_steps <= max_delay:
             raise SafetyError(f"predicted delay must be within 1..{max_delay}")
-        self._trajectory_paused = False
-        self._pause_kind = None
-        self._checkpoint_consumed = True
+        elapsed_steps = 0
+        if continuous_checkpoint:
+            assert self._phase is not None
+            elapsed_steps = max(
+                0,
+                int(math.floor(self._phase + 1e-9)) - int(self._timeline.checkpoint_phase),
+            )
+            if elapsed_steps >= message.predicted_delay_steps:
+                raise SafetyError(
+                    "continuous checkpoint resume reached the predicted delay boundary "
+                    f"({elapsed_steps} >= {message.predicted_delay_steps})"
+                )
+        else:
+            self._trajectory_paused = False
+            self._pause_kind = None
+            self._checkpoint_consumed = True
         self._active_request_id = message.request_id
         self._active_predicted_delay = message.predicted_delay_steps
-        self._actual_delay_steps = 0
+        self._actual_delay_steps = elapsed_steps
         self._inference_invalid = False
         self._pending_rtc = None
         self._checkpoint_stable_since = None
@@ -616,6 +690,7 @@ class MarvinBridgeNode(Node):
             checkpoint_id=message.checkpoint_id,
             request_id=message.request_id,
             predicted_delay_steps=message.predicted_delay_steps,
+            actual_delay_steps=elapsed_steps,
         )
 
     def _apply_rtc_replacement_locked(self, message: StageRtcChunkCommand, now: float) -> None:
@@ -626,12 +701,47 @@ class MarvinBridgeNode(Node):
             raise SafetyError(
                 f"actual delay {self._actual_delay_steps} exceeds prediction {message.predicted_delay_steps}"
             )
-        timeline, phase = self._timeline.replacement(
+        old_timeline = self._timeline
+        old_phase = self._phase
+        anchor = self._raw_reference
+        timeline, phase = old_timeline.replacement(
             message.actions,
             actual_delay_steps=self._actual_delay_steps,
-            anchor=self._raw_reference,
+            anchor=anchor,
         )
         self._validate_trajectory_knots_locked(timeline)
+        boundary_old_velocity: tuple[float, ...] = ()
+        boundary_new_velocity: tuple[float, ...] = ()
+        boundary_velocity_jump_rad = None
+        boundary_acceleration_jump_rad = None
+        if old_phase is not None and abs(old_phase - round(old_phase)) <= 1e-6:
+            old_index = round(old_phase)
+            if old_index >= 2 and phase + 2.0 <= timeline.final_phase:
+                old_anchor = action_arms(anchor)
+                old_previous = action_arms(old_timeline.value(old_index - 1))
+                old_before_previous = action_arms(old_timeline.value(old_index - 2))
+                new_next = action_arms(timeline.value(phase + 1.0))
+                new_after_next = action_arms(timeline.value(phase + 2.0))
+                boundary_old_velocity = tuple(
+                    current - previous for current, previous in zip(old_anchor, old_previous)
+                )
+                boundary_new_velocity = tuple(
+                    current - previous for current, previous in zip(new_next, old_anchor)
+                )
+                old_acceleration = tuple(
+                    current - 2.0 * previous + before
+                    for current, previous, before in zip(old_anchor, old_previous, old_before_previous)
+                )
+                new_acceleration = tuple(
+                    after - 2.0 * current + previous
+                    for after, current, previous in zip(new_after_next, new_next, old_anchor)
+                )
+                boundary_velocity_jump_rad = max(
+                    abs(new - old) for old, new in zip(boundary_old_velocity, boundary_new_velocity)
+                )
+                boundary_acceleration_jump_rad = max(
+                    abs(new - old) for old, new in zip(old_acceleration, new_acceleration)
+                )
         old_plan_id = self._trajectory_plan_id
         self._timeline = timeline
         self._trajectory_plan_id = message.replacement_plan_id
@@ -640,7 +750,7 @@ class MarvinBridgeNode(Node):
         self._handoff_anchor = None
         self._handoff_phase = None
         self._checkpoint_consumed = False
-        self._trajectory_paused = phase >= timeline.checkpoint_phase
+        self._trajectory_paused = not self._continuous_checkpoint and phase >= timeline.checkpoint_phase
         self._pause_kind = "checkpoint" if self._trajectory_paused else None
         self._checkpoint_stable_since = None
         self._checkpoint_emitted = False
@@ -658,6 +768,10 @@ class MarvinBridgeNode(Node):
             request_id=message.request_id,
             predicted_delay_steps=message.predicted_delay_steps,
             actual_delay_steps=actual_delay,
+            boundary_old_velocity=boundary_old_velocity,
+            boundary_new_velocity=boundary_new_velocity,
+            boundary_velocity_jump_rad=boundary_velocity_jump_rad,
+            boundary_acceleration_jump_rad=boundary_acceleration_jump_rad,
             detail=f"replaced {old_plan_id} with {message.replacement_plan_id}",
         )
 
@@ -916,8 +1030,31 @@ class MarvinBridgeNode(Node):
                 self._phase = 0.0
             return
 
+        if (
+            self._continuous_checkpoint
+            and not self._checkpoint_consumed
+            and self._phase >= self._timeline.checkpoint_phase
+        ):
+            self._checkpoint_id += 1
+            self._checkpoint_consumed = True
+            self._checkpoint_emitted = True
+            self._checkpoint_stable_since = None
+            self._emit_event_locked(
+                "checkpoint_ready",
+                now,
+                checkpoint_id=self._checkpoint_id,
+                stable_monotonic=self._joints_t,
+                observation_seq_at_stable=self._seq,
+                old_remaining_actions_absolute=self._timeline.remaining_after_checkpoint(),
+                detail="continuous RTC checkpoint; trajectory remained active",
+            )
+
         old_phase = self._phase
-        phase_limit = self._timeline.final_phase if self._checkpoint_consumed else self._timeline.checkpoint_phase
+        phase_limit = (
+            self._timeline.final_phase
+            if self._checkpoint_consumed or self._continuous_checkpoint
+            else self._timeline.checkpoint_phase
+        )
         new_phase = min(phase_limit, old_phase + self._timeline.knot_hz * phase_rate * dt)
         old_index = int(math.floor(old_phase + 1e-9))
         new_index = int(math.floor(new_phase + 1e-9))
@@ -962,12 +1099,13 @@ class MarvinBridgeNode(Node):
 
         if not self._checkpoint_consumed and new_phase >= self._timeline.checkpoint_phase:
             self._phase = self._timeline.checkpoint_phase
-            self._trajectory_paused = True
-            self._pause_kind = "checkpoint"
-            self._phase_rate = 0.0
-            self._checkpoint_id += 1
             self._checkpoint_stable_since = None
             self._checkpoint_emitted = False
+            if not self._continuous_checkpoint:
+                self._trajectory_paused = True
+                self._pause_kind = "checkpoint"
+                self._phase_rate = 0.0
+                self._checkpoint_id += 1
 
     def _trajectory_target_locked(self, now: float) -> tuple[tuple[float, ...], int | None] | None:
         if self._heartbeat_t is None or now - self._heartbeat_t > self.trajectory_heartbeat_timeout_s:
@@ -1028,6 +1166,14 @@ class MarvinBridgeNode(Node):
     def _publish_target(self) -> None:
         now = _now()
         with self._lock:
+            if self._publish_last_tick_s is not None:
+                gap_s = now - self._publish_last_tick_s
+                self._publish_max_gap_s = max(self._publish_max_gap_s, gap_s)
+                self._publish_late_tick_count += gap_s > 1.5 / self.publish_hz
+            else:
+                self._publish_first_tick_s = now
+            self._publish_last_tick_s = now
+            self._publish_tick_count += 1
             ready, reason = self._readiness_gate_locked(now)
             if not ready:
                 if self._trajectory_session_id is not None:
@@ -1075,6 +1221,24 @@ class MarvinBridgeNode(Node):
         self._pub_gripper_r.publish(gripper_r)
         with self._lock:
             self._last_command_status = f"published command {command_id}"
+
+    def publish_timing_summary(self) -> None:
+        with self._lock:
+            elapsed_s = (
+                0.0
+                if self._publish_first_tick_s is None or self._publish_last_tick_s is None
+                else self._publish_last_tick_s - self._publish_first_tick_s
+            )
+            average_hz = (
+                0.0
+                if elapsed_s <= 0.0 or self._publish_tick_count < 2
+                else (self._publish_tick_count - 1) / elapsed_s
+            )
+            self.get_logger().info(
+                f"publish_timing ticks={self._publish_tick_count} average_hz={average_hz:.2f} "
+                f"late_ticks={self._publish_late_tick_count} "
+                f"max_gap_ms={self._publish_max_gap_s * 1000.0:.3f}"
+            )
 
     def wait_for_observation(
         self, last_seq: int, stop: threading.Event, timeout_s: float = 1.0
@@ -1219,6 +1383,9 @@ def _serve_client(conn: socket.socket, address, node: MarvinBridgeNode) -> None:
 def _shutdown_ros_runtime(executor, spin_thread: threading.Thread, node: MarvinBridgeNode) -> None:
     executor.shutdown()
     spin_thread.join(timeout=2.0)
+    publish_timing_summary = getattr(node, "publish_timing_summary", None)
+    if publish_timing_summary is not None:
+        publish_timing_summary()
     node.destroy_node()
     rclpy.try_shutdown()
 

@@ -5,6 +5,46 @@ DEPLOY_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REMOTE_HOST="${MARVINPRO_REMOTE_HOST:-nvidia@6.6.7.100}"
 REMOTE_DIR="${MARVINPRO_REMOTE_DIR:-/tmp/MarvinPro_deploy}"
 
+LOCAL_LOG=""
+bridge_args=()
+while (($#)); do
+  case "$1" in
+    --local-log)
+      if (($# < 2)); then
+        echo "--local-log requires a path" >&2
+        exit 2
+      fi
+      LOCAL_LOG="$2"
+      shift 2
+      ;;
+    --local-log=*)
+      LOCAL_LOG="${1#*=}"
+      shift
+      ;;
+    *)
+      bridge_args+=("$1")
+      shift
+      ;;
+  esac
+done
+set -- "${bridge_args[@]}"
+
+if [[ -n "${LOCAL_LOG}" ]]; then
+  mkdir -p "$(dirname "${LOCAL_LOG}")"
+  exec > >(tee -a "${LOCAL_LOG}") 2>&1
+fi
+
+printf '[log] started_at=%s deploy_commit=%s remote=%s remote_dir=%s bridge_args=' \
+  "$(date --iso-8601=seconds)" \
+  "$(git -C "${DEPLOY_ROOT}" rev-parse --short HEAD 2>/dev/null || echo unknown)" \
+  "${REMOTE_HOST}" \
+  "${REMOTE_DIR}"
+printf '%q ' "$@"
+printf '\n'
+if [[ -n "${LOCAL_LOG}" ]]; then
+  echo "[log] local_log=$(realpath -m "${LOCAL_LOG}")"
+fi
+
 echo "[1/2] Syncing bridge code to ${REMOTE_HOST}:${REMOTE_DIR}"
 rsync -az --delete -e ssh \
   --include='/src/***' \

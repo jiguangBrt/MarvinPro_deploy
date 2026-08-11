@@ -1,19 +1,32 @@
 from contextlib import redirect_stderr
+from contextlib import redirect_stdout
 import io
+import csv
+import logging
+from pathlib import Path
 import socket
+import tempfile
 from types import SimpleNamespace
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
-from marvinpro_deploy.protocol import BridgeHello, TrajectoryEvent, send_message
+from marvinpro_deploy.protocol import BridgeHello, RobotStateUpdate, TrajectoryEvent, send_message
 from marvinpro_deploy.rollout_client import (
     _TrajectoryHeartbeat,
+    _actions_tuple,
+    _confirm_execution,
+    _confirm_and_refresh_execution_observation,
+    _configure_logging,
+    _state_log_interval_s,
     ActionPlan,
     ActionPublisher,
+    JointTelemetryRecorder,
     RobotConnection,
+    RolloutError,
     parse_args,
 )
 
@@ -43,6 +56,23 @@ class InterpolatedActionPlanTest(unittest.TestCase):
         self.assertEqual([step.action[0] for step in steps], [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0])
         self.assertEqual({step.observation_seq for step in steps}, {12})
         self.assertIsNone(plan.pop())
+
+    def test_trajectory_actions_project_only_grippers_to_policy_domain(self):
+        actions = np.arange(160, dtype=np.float64).reshape(10, 16) / 100.0
+        actions[:, 7] = np.linspace(-0.01, 1.01, 10)
+        actions[:, 15] = np.linspace(1.02, -0.02, 10)
+        original_arms = np.concatenate((actions[:, :7], actions[:, 8:15]), axis=1).copy()
+
+        prepared = np.asarray(_actions_tuple(actions))
+
+        np.testing.assert_array_equal(
+            np.concatenate((prepared[:, :7], prepared[:, 8:15]), axis=1),
+            original_arms,
+        )
+        self.assertTrue(np.all((0.0 <= prepared[:, 7]) & (prepared[:, 7] <= 1.0)))
+        self.assertTrue(np.all((0.0 <= prepared[:, 15]) & (prepared[:, 15] <= 1.0)))
+        self.assertEqual(prepared[0, 7], 0.0)
+        self.assertEqual(prepared[0, 15], 1.0)
 
     def test_appends_after_existing_tail_without_replacement(self):
         plan = ActionPlan()
@@ -174,6 +204,49 @@ class RobotConnectionTest(unittest.TestCase):
             listener.close()
             accept_thread.join(timeout=1.0)
 
+
+    def test_execution_confirmation_forces_a_new_observation(self):
+        ready_observation = SimpleNamespace(seq=10)
+        latest_after_confirmation = SimpleNamespace(seq=72)
+        fresh_observation = SimpleNamespace(
+            seq=73,
+            captured_monotonic=100.0,
+            joints=(0.0,) * 14,
+            image=b"jpeg",
+            age_state_s=0.001,
+            age_gripper_left_s=0.002,
+            age_gripper_right_s=0.003,
+        )
+
+        class FakeConnection:
+            def __init__(self):
+                self.wait_kwargs = None
+
+            def latest(self, max_local_age_s=None):
+                self.latest_max_age = max_local_age_s
+                return latest_after_confirmation
+
+            def wait_for_observation(self, **kwargs):
+                self.wait_kwargs = kwargs
+                return fresh_observation
+
+        connection = FakeConnection()
+        args = SimpleNamespace(
+            max_observation_age=0.35,
+            observation_timeout=10.0,
+            max_source_age=0.20,
+        )
+        with patch("marvinpro_deploy.rollout_client._confirm_execution") as confirm:
+            result = _confirm_and_refresh_execution_observation(args, connection, ready_observation)
+
+        confirm.assert_called_once_with(args, ready_observation)
+        self.assertIs(result, fresh_observation)
+        self.assertEqual(connection.latest_max_age, 0.35)
+        self.assertEqual(
+            connection.wait_kwargs,
+            {"timeout_s": 10.0, "newer_than": 72, "require_motion_gate": True},
+        )
+
     def test_heartbeat_does_not_depend_on_outbound_state_telemetry(self):
         sent = []
         connection = SimpleNamespace(send=sent.append)
@@ -193,7 +266,71 @@ class RobotConnectionTest(unittest.TestCase):
             heartbeat.join()
 
 
+class JointTelemetryRecorderTest(unittest.TestCase):
+    def test_records_feedback_and_post_filter_command_in_one_csv(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "rollout.telemetry.csv"
+            recorder = JointTelemetryRecorder(path)
+            state = RobotStateUpdate(
+                5,
+                12.5,
+                (0.1,) * 14,
+                0.2,
+                0.3,
+                True,
+                "ready",
+                trajectory_mode="trajectory",
+                timeline_version=3,
+                phase=2.5,
+                phase_rate=1.0,
+                raw_reference=vector(1.0),
+                sent_target=vector(2.0),
+            )
+            recorder.record_state(state, 20.0)
+            observation = SimpleNamespace(
+                seq=8,
+                captured_monotonic=13.0,
+                joints=(0.4,) * 14,
+                gripper_raw_left=0.5,
+                gripper_raw_right=0.6,
+            )
+            recorder.record_client_command(
+                recorded_monotonic=21.0,
+                observation=observation,
+                command_id=9,
+                requested_action=vector(3.0),
+                sent_action=vector(2.9),
+                was_hold=False,
+            )
+            recorder.close()
+
+            with path.open(encoding="utf-8", newline="") as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertEqual([row["record_type"] for row in rows], ["bridge_state", "client_command"])
+            self.assertEqual(float(rows[0]["measured_Joint1_L"]), 0.1)
+            self.assertEqual(float(rows[0]["bridge_command_Joint1_L"]), 2.0)
+            self.assertEqual(float(rows[1]["client_reference_Joint1_L"]), 3.0)
+            self.assertEqual(float(rows[1]["client_command_Joint1_L"]), 2.9)
+
+
 class RolloutArgumentTest(unittest.TestCase):
+    def test_execution_confirmation_accepts_only_single_uppercase_e(self):
+        args = parse_args(["--execute"])
+        observation = SimpleNamespace(
+            seq=1,
+            input_mode=3,
+            robot_state=(3, 3),
+            arm_state=(3, 3),
+        )
+        with patch("builtins.input", return_value="E"), redirect_stdout(io.StringIO()):
+            _confirm_execution(args, observation)
+        with (
+            patch("builtins.input", return_value="EXECUTE"),
+            redirect_stdout(io.StringIO()),
+            self.assertRaises(RolloutError),
+        ):
+            _confirm_execution(args, observation)
+
     def test_interpolated_two_times_configuration(self):
         args = parse_args(
             [
@@ -216,6 +353,56 @@ class RolloutArgumentTest(unittest.TestCase):
         self.assertEqual(args.control_hz, 100.0)
         self.assertEqual(args.model_hz, 15.0)
         self.assertEqual(args.playback_time_scale, 2.0)
+
+    def test_log_file_is_preserved_in_configuration(self):
+        args = parse_args(
+            [
+                "--log-level",
+                "DEBUG",
+                "--console-log-level",
+                "WARNING",
+                "--log-file",
+                "/tmp/marvinpro-rollout.log",
+            ]
+        )
+
+        self.assertEqual(args.log_level, "DEBUG")
+        self.assertEqual(args.console_log_level, "WARNING")
+        self.assertEqual(args.log_file, "/tmp/marvinpro-rollout.log")
+
+    def test_telemetry_file_is_preserved_in_configuration(self):
+        args = parse_args(
+            [
+                "--log-file",
+                "/tmp/marvinpro-rollout.log",
+                "--telemetry-file",
+                "/tmp/marvinpro-rollout.telemetry.csv",
+            ]
+        )
+        self.assertEqual(args.telemetry_file, "/tmp/marvinpro-rollout.telemetry.csv")
+
+    def test_hold_state_logging_is_throttled_more_than_active_motion(self):
+        self.assertEqual(_state_log_interval_s("trajectory"), 0.10)
+        self.assertEqual(_state_log_interval_s("hold"), 1.0)
+
+    def test_log_file_keeps_debug_while_console_defaults_to_warning(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "rollout.log"
+            args = parse_args(["--log-level", "DEBUG", "--log-file", str(log_path)])
+            console = io.StringIO()
+            with redirect_stderr(console), redirect_stdout(io.StringIO()):
+                _configure_logging(args, [])
+                self.assertEqual(args.telemetry_file, str(log_path.with_name("rollout.telemetry.csv")))
+                logging.getLogger("marvinpro_rollout").debug("file-detail")
+                logging.getLogger("marvinpro_rollout").warning("console-warning")
+                for handler in logging.getLogger().handlers:
+                    handler.flush()
+
+            self.assertNotIn("file-detail", console.getvalue())
+            self.assertIn("console-warning", console.getvalue())
+            contents = log_path.read_text(encoding="utf-8")
+            self.assertIn("file-detail", contents)
+            self.assertIn("console-warning", contents)
 
     def test_synchronized_schedule_configuration(self):
         args = parse_args(
@@ -268,10 +455,20 @@ class RolloutArgumentTest(unittest.TestCase):
                 "2",
                 "--execute-steps",
                 "10",
+                "--max-rtc-merges",
+                "2",
+                "--rtc-continuous",
             ]
         )
         self.assertEqual(args.rollout_schedule, "rtc")
         self.assertFalse(args.rtc_shadow)
+        self.assertTrue(args.rtc_continuous)
+        self.assertEqual(args.max_rtc_merges, 2)
+
+    def test_continuous_checkpoint_requires_rtc_schedule(self):
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parse_args(["--rtc-continuous"])
 
     def test_rejects_speedup(self):
         with redirect_stderr(io.StringIO()):

@@ -100,6 +100,13 @@ def _bare_node():
     node._trajectory_hold_action = None
     node._timeline_version = 7
     node._phase = None
+    node._joints_t = None
+    node._raw_reference = None
+    node._sent_target = None
+    node._tracking_error_rad = None
+    node._servo_error_rad = None
+    node._arm_clipped = False
+    node._frozen_reason = None
     return node
 
 
@@ -205,10 +212,113 @@ def test_checkpoint_requires_fresh_feedback_at_a3_for_full_settle_window():
     assert not node._events
 
     node._joints_t = 2.21
+    node._tracking_error_rad = 0.0
+    node._servo_error_rad = 0.0
+    node._sent_target = _action(0.03)
     node._update_pause_settle_locked(2.21, state_stale=False, timer_overrun=False)
     assert len(node._events) == 1
     assert node._events[0].event_type == "checkpoint_ready"
     assert node._events[0].stable_monotonic == 2.21
+    assert node._events[0].joint_source_monotonic == 2.21
+    assert abs(node._events[0].settle_duration_s - 0.21) < 1e-9
+    assert node._events[0].tracking_error_rad == 0.0
+    assert node._events[0].servo_error_rad == 0.0
+    assert node._events[0].raw_reference == node._events[0].sent_target
+
+
+def test_continuous_checkpoint_does_not_pause_and_accounts_for_elapsed_knots():
+    node = _bare_node()
+    node._trajectory_session_id = "session"
+    node._trajectory_plan_id = "plan"
+    node._timeline_version = 1
+    node._timeline = robot_bridge.TrajectoryTimeline(
+        tuple(_action(index * 0.01) for index in range(10)),
+        7.5,
+        4,
+    )
+    node._phase = 3.0
+    node._phase_rate = 1.0
+    node._handoff_phase = None
+    node._handoff_anchor = None
+    node._checkpoint_consumed = False
+    node._trajectory_paused = False
+    node._pause_kind = None
+    node._checkpoint_stable_since = None
+    node._checkpoint_emitted = False
+    node._checkpoint_id = 0
+    node._continuous_checkpoint = True
+    node._joints = (0.03,) * 14
+    node._joints_t = 5.0
+    node._seq = 12
+    node._raw_reference = _action(0.03)
+    node._sent_target = _action(0.03)
+    node._tracking_error_rad = 0.0
+    node._servo_error_rad = 0.0
+    node._active_request_id = None
+    node._active_predicted_delay = None
+    node._actual_delay_steps = 0
+    node._inference_invalid = False
+    node._pending_rtc = None
+    node._last_command_id = 1
+    node._last_command_status = "loaded"
+
+    node._advance_trajectory_locked(5.0, 0.01, 1.0)
+
+    checkpoint = node._events[0]
+    assert checkpoint.event_type == "checkpoint_ready"
+    assert checkpoint.continuous_checkpoint
+    assert checkpoint.settle_duration_s is None
+    assert checkpoint.stable_monotonic == 5.0
+    assert checkpoint.old_remaining_actions_absolute == node._timeline.knots[4:]
+    assert node._phase > 3.0
+    assert node._checkpoint_consumed
+    assert not node._trajectory_paused
+
+    node._phase = 4.25
+    node._accept_resume_locked(
+        robot_bridge.ResumeTrajectoryCommand(
+            command_id=2,
+            session_id="session",
+            plan_id="plan",
+            timeline_version=1,
+            checkpoint_id=1,
+            request_id="request",
+            predicted_delay_steps=3,
+        ),
+        5.2,
+    )
+
+    assert node._active_request_id == "request"
+    assert node._actual_delay_steps == 1
+    assert node._events[-1].event_type == "rtc_resumed"
+    assert node._events[-1].actual_delay_steps == 1
+
+    node._validate_trajectory_knots_locked = lambda timeline: None
+    node._governor = types.SimpleNamespace(reset=lambda: None)
+    rtc_knots = tuple(_action(0.02 + index * 0.004) for index in range(10))
+    node._accept_stage_rtc_locked(
+        robot_bridge.StageRtcChunkCommand(
+            command_id=3,
+            session_id="session",
+            base_plan_id="plan",
+            replacement_plan_id="replacement",
+            timeline_version=1,
+            checkpoint_id=1,
+            request_id="request",
+            predicted_delay_steps=3,
+            execution_horizon=4,
+            actions=rtc_knots,
+        ),
+        5.21,
+    )
+    node._advance_trajectory_locked(5.3, 0.10, 1.0)
+
+    merged = node._events[-1]
+    assert merged.event_type == "rtc_merged"
+    assert merged.actual_delay_steps == 2
+    assert node._trajectory_plan_id == "replacement"
+    assert node._phase == 1.0
+    assert not node._trajectory_paused
 
 
 def test_outbound_events_are_reliable_and_image_gets_fair_turn_after_state():
@@ -398,3 +508,7 @@ def test_fake_bridge_checkpoint_resume_and_atomic_rtc_merge(monkeypatch):
     assert node._timeline_version == 2
     assert node._phase == 0.0
     assert node._timeline.knots[0] == old_knots[4]
+    assert all(abs(value - 0.005) < 1e-12 for value in merged.boundary_old_velocity)
+    assert all(abs(value - 0.004) < 1e-12 for value in merged.boundary_new_velocity)
+    assert abs(merged.boundary_velocity_jump_rad - 0.001) < 1e-12
+    assert merged.boundary_acceleration_jump_rad < 1e-12

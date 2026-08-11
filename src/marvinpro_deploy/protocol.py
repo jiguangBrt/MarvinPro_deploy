@@ -105,6 +105,19 @@ class TrajectoryEvent:
     actual_delay_steps: int | None = None
     detail: str = ""
     version: int = PROTOCOL_VERSION
+    tracking_error_rad: float | None = None
+    servo_error_rad: float | None = None
+    joint_source_monotonic: float | None = None
+    settle_duration_s: float | None = None
+    raw_reference: tuple[float, ...] | None = None
+    sent_target: tuple[float, ...] | None = None
+    arm_clipped: bool = False
+    frozen_reason: str | None = None
+    boundary_old_velocity: tuple[float, ...] = ()
+    boundary_new_velocity: tuple[float, ...] = ()
+    boundary_velocity_jump_rad: float | None = None
+    boundary_acceleration_jump_rad: float | None = None
+    continuous_checkpoint: bool = False
 
 
 @dataclass(frozen=True)
@@ -127,6 +140,7 @@ class LoadTrajectoryCommand:
     knot_hz: float
     checkpoint_horizon: int
     execute: bool
+    continuous_checkpoint: bool = False
     version: int = PROTOCOL_VERSION
 
 

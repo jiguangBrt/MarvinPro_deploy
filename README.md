@@ -25,6 +25,30 @@ rollout 客户端应运行在当前电脑，不运行在机器人控制器。机
 bridge 不会调用 `/control/set_input`、`set_ready`、`go_home`、`clear_fault` 等 Service，也不会自动
 改变机器人模式。
 
+## 夹爪直接控制
+
+当 Apex Home 无法让夹爪完全张开时，可以从本机直接发送夹爪目标。先停止 rollout 和
+`run_bridge_on_controller.sh`，并确认 Apex 没有在运行 Teleop 或 Replay；执行闭合命令前让手和物体
+离开夹爪。
+
+```bash
+cd /home/jh/TianJi_data_collector/MarvinPro_deploy
+
+# 同时完全打开左右夹爪
+./scripts/control_gripper_on_controller.sh 0
+
+# 同时完全闭合左右夹爪
+./scripts/control_gripper_on_controller.sh 1
+
+# 只控制一侧
+./scripts/control_gripper_on_controller.sh 0 --side left
+./scripts/control_gripper_on_controller.sh 1 --side right
+```
+
+脚本将 `0` 或 `1` 短时连续发布到 `/control/gripperValueL/R`，不会调用 Home、切换 Apex Input Mode
+或发送机械臂关节命令。命令值 `1` 不要改成 `1.25`：`1.25` 只用于闭合状态的反馈标定。若检测到
+rollout bridge 仍在运行，脚本会拒绝发布，避免两个外部命令源互相覆盖。
+
 ## 1. GPU 服务器启动 policy
 
 在 `192.168.50.73`：
@@ -122,7 +146,7 @@ uv run python -m marvinpro_deploy.rollout_client \
   --episode-seconds 5
 ```
 
-程序打印实机状态后，必须手动输入 `EXECUTE` 才开始动作。5 秒动作结束后客户端只采样一次当前反馈
+程序打印实机状态后，必须手动输入单个大写 `E` 才开始动作。5 秒动作结束后客户端只采样一次当前反馈
 位姿，并持续发送这个固定目标作为 hold；它不会继续跟随后续反馈更新目标。此时在 Apex 把 Input Mode
 切回 **None**；客户端检测到模式不再是 Custom 后才断开。最后再用 `Ctrl+C` 停止 bridge。
 
@@ -133,7 +157,7 @@ uv run python -m marvinpro_deploy.rollout_client \
 真机动作要同时满足：
 
 1. bridge 使用 `--allow-motion` 启动；
-2. rollout 使用 `--execute` 并人工输入 `EXECUTE`；
+2. rollout 使用 `--execute` 并人工输入单个大写 `E`；
 3. `input_mode == 3`；
 4. `/info/robot_state == [3,3]` 且 `/info/arm_state == [3,3]`（关节阻抗模式）；
 5. 关节和夹爪反馈新鲜，policy action 为 finite `(16,)`；
@@ -172,10 +196,18 @@ synchronized 和诊断客户端仍使用 legacy `ActionCommand` 路径。
 
 ```bash
 # 控制器 bridge，Apex Input Mode 先保持 None
-./scripts/run_bridge_on_controller.sh --allow-motion --publish-hz 100
+cd /home/jh/TianJi_data_collector/MarvinPro_deploy
+export RUN_DIR="$PWD/logs/tracking_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$RUN_DIR"
+printf '%s\n' "$RUN_DIR" | tee /tmp/marvinpro_tracking_run_dir
+./scripts/run_bridge_on_controller.sh \
+  --local-log "$RUN_DIR/bridge.log" \
+  --allow-motion \
+  --publish-hz 100
 
 # 本机客户端，按提示完成确认后再切 Custom
 cd /home/jh/OpenPI_UR/openpi
+export RUN_DIR="$(cat /tmp/marvinpro_tracking_run_dir)"
 PYTHONPATH=/home/jh/TianJi_data_collector/MarvinPro_deploy/src \
 uv run python -m marvinpro_deploy.rollout_client \
   --robot-host 6.6.7.100 \
@@ -188,7 +220,28 @@ uv run python -m marvinpro_deploy.rollout_client \
   --model-hz 15 \
   --playback-time-scale 2 \
   --execute-steps 10 \
-  --log-level DEBUG
+  --log-level DEBUG \
+  --console-log-level WARNING \
+  --log-file "$RUN_DIR/rollout.log"
+```
+
+指定 `--log-file` 时，完整 DEBUG 诊断写入文件，终端默认仅显示 WARNING 和交互提示；可用
+`--console-log-level DEBUG` 临时恢复终端详细输出。运动完成后客户端会等待操作员把 Apex Input Mode 切回
+None，再安全退出。
+
+指定 `--log-file "$RUN_DIR/rollout.log"` 还会自动生成
+`$RUN_DIR/rollout.telemetry.csv`。它逐条保存 bridge 实测 14 个关节、bridge 插帧后的最终命令，以及
+prefetch/legacy 客户端插帧生成的请求目标和实际发送命令；`client_reference_*` 是插帧值，
+`client_command_*` 是 safety-filter 后的发送值，`record_type` 字段区分 `bridge_state` 和
+`client_command`。
+测试后可生成关节角对照图：
+
+```bash
+PYTHONPATH=/home/jh/TianJi_data_collector/MarvinPro_deploy/src \
+/home/jh/OpenPI_UR/openpi/.venv/bin/python \
+scripts/plot_rollout_joints.py \
+  "$RUN_DIR/rollout.telemetry.csv" \
+  -o "$RUN_DIR/joint_diagnostics.png"
 ```
 
 远程 OpenPI 必须先完成
@@ -197,6 +250,7 @@ uv run python -m marvinpro_deploy.rollout_client \
 记录 `d_actual`，但不合并 RTC 输出；随后本 episode 固定降级 synchronized。
 
 ```bash
+export RUN_DIR="$(cat /tmp/marvinpro_tracking_run_dir)"
 PYTHONPATH=/home/jh/TianJi_data_collector/MarvinPro_deploy/src \
 uv run python -m marvinpro_deploy.rollout_client \
   --robot-host 6.6.7.100 \
@@ -210,13 +264,22 @@ uv run python -m marvinpro_deploy.rollout_client \
   --model-hz 15 \
   --playback-time-scale 2 \
   --execute-steps 10 \
-  --log-level DEBUG
+  --log-level DEBUG \
+  --console-log-level WARNING \
+  --log-file "$RUN_DIR/rtc-shadow.log"
 ```
 
-shadow、单 chunk governor 和 synchronized 回归全部通过后，删除 `--rtc-shadow` 才允许实际 merge。RTC
+shadow、单 chunk governor 和 synchronized 回归全部通过后，删除 `--rtc-shadow` 才允许实际 merge；首轮实际
+测试必须加 `--max-rtc-merges 2`，达到两次成功 replacement merge 后，客户端会等待当前 RTC 段到达下一个稳定 checkpoint，再锁存 hold。RTC
 只在下一个整数 knot 边界替换 future，并由 bridge 重新计算 `d_actual`。clipping、hard freeze、反馈过期、
 heartbeat 超时、ID/version 不匹配或 `d_actual > d_pred` 都会拒绝结果；任一次失败后，本 episode 不再重试
 RTC，而是固定 hold、重新确认跟踪和新图像，然后使用 bridge-owned synchronized 执行。
+
+默认 RTC 使用 settled checkpoint，适合验证观测和 merge 证据，但会在每个 A3 等待跟踪到位并稳定
+`0.20 s`。settled 多 chunk 验收通过后，可显式增加 `--rtc-continuous`：bridge 在 A3 记录观测边界后继续
+旧轨迹，client 拿图期间跨过的 knot 会计入 `d_actual`，其余安全门不变。连续模式必须重新从
+`--rtc-continuous --rtc-shadow` 开始验收，shadow 通过后才允许单次实际 merge；详细顺序见
+[`ROBOT_RTC_TESTS.md`](ROBOT_RTC_TESTS.md)。
 
 若本机受代理或路由影响，禁止把连接失败误判成 RTC 算法失败，也不要自动尝试真机。按
 [`ROBOT_RTC_TESTS.md`](ROBOT_RTC_TESTS.md) 完成网络预检和现场分阶段验收。
@@ -263,7 +326,7 @@ uv run python -m marvinpro_deploy.rollout_client \
 ```
 
 客户端完成 warmup 后会明确提示切到 Custom。确认页必须显示 `effective knot rate: 7.50Hz`、
-`command rate: 100.0Hz` 和 `selected chunk: 10 knots over 1.333s`，再输入 `EXECUTE`。结束时按提示先
+`command rate: 100.0Hz` 和 `selected chunk: 10 knots over 1.333s`，再输入单个大写 `E`。结束时按提示先
 切回 None。`chunk_append_diag` 中稳态 `underruns_since_last` 应为 `0`，`queued_before` 应大于 `0`；
 若前者非零，先增大 `--chunk-prefetch-seconds`，不要放宽关节限幅。
 
@@ -285,13 +348,21 @@ uv run python -m marvinpro_deploy.rollout_client \
 
 ```bash
 cd /home/jh/TianJi_data_collector/MarvinPro_deploy
-./scripts/run_bridge_on_controller.sh --allow-motion --publish-hz 100
+export RUN_DIR="$PWD/logs/synchronized_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$RUN_DIR"
+printf '%s\n' "$RUN_DIR" | tee /tmp/marvinpro_synchronized_run_dir
+
+./scripts/run_bridge_on_controller.sh \
+  --local-log "$RUN_DIR/bridge.log" \
+  --allow-motion \
+  --publish-hz 100
 ```
 
 另一个终端运行首轮6秒、2倍时间尺度测试：
 
 ```bash
 cd /home/jh/OpenPI_UR/openpi
+export RUN_DIR="$(cat /tmp/marvinpro_synchronized_run_dir)"
 PYTHONPATH=/home/jh/TianJi_data_collector/MarvinPro_deploy/src \
 uv run python -m marvinpro_deploy.rollout_client \
   --robot-host 6.6.7.100 \
@@ -303,7 +374,10 @@ uv run python -m marvinpro_deploy.rollout_client \
   --control-hz 100 \
   --model-hz 15 \
   --playback-time-scale 2 \
-  --execute-steps 10
+  --execute-steps 10 \
+  --log-level DEBUG \
+  --console-log-level WARNING \
+  --log-file "$RUN_DIR/rollout.log"
 ```
 
 默认到位条件是所有臂关节误差不超过 `0.01 rad` 并连续保持 `0.20 s`，随后再稳定保持 `0.20 s`，每个
