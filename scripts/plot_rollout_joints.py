@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot measured arm joints, gripper feedback, commands, phase, and tracking error."""
+"""Plot measured arm joints, gripper state proxies, commands, phase, and tracking error."""
 
 from __future__ import annotations
 
@@ -60,6 +60,7 @@ def _empty_data() -> dict[str, list]:
         "command": [],
         "reference": [],
         "gripper_measured": [],
+        "gripper_proxy": [],
         "gripper_torque": [],
         "phase": [],
         "events": [],
@@ -96,6 +97,12 @@ def _load_csv(path: Path, event_log: Path | None) -> dict[str, list]:
                 )
                 if all(value is not None for value in gripper_measured):
                     data["gripper_measured"].append((recorded, gripper_measured))
+                gripper_proxy = (
+                    _float(row.get("gripper_command_proxy_L")),
+                    _float(row.get("gripper_command_proxy_R")),
+                )
+                if all(value is not None for value in gripper_proxy):
+                    data["gripper_proxy"].append((recorded, gripper_proxy))
                 gripper_torque = (
                     _float(row.get("measured_gripper_torque_L")),
                     _float(row.get("measured_gripper_torque_R")),
@@ -216,6 +223,10 @@ def plot(input_path: Path, output_path: Path, event_log: Path | None = None) -> 
             measured_time = [time_s - origin for time_s, _ in data["gripper_measured"]]
             measured = [values[side_index] for _, values in data["gripper_measured"]]
             axis.plot(measured_time, measured, color="#1769aa", linewidth=1.1, label="measured position")
+        elif data["gripper_proxy"]:
+            proxy_time = [time_s - origin for time_s, _ in data["gripper_proxy"]]
+            proxy = [values[side_index] for _, values in data["gripper_proxy"]]
+            axis.plot(proxy_time, proxy, color="#1769aa", linewidth=1.1, label="command state proxy")
         command_time = [time_s - origin for time_s, _ in data["command"]]
         command = [values[action_index] for _, values in data["command"]]
         axis.plot(command_time, command, color="#d95f02", linewidth=1.0, linestyle="--", label="sent command")
@@ -288,7 +299,8 @@ def plot(input_path: Path, output_path: Path, event_log: Path | None = None) -> 
 
     figure.suptitle(
         f"MarvinPro joint and gripper telemetry: {input_path.name}\n"
-        "Blue=measured arm/gripper position, green=measured gripper torque, "
+        "Blue=measured arm position and gripper state proxy/legacy measured position, "
+        "green=legacy measured gripper torque, "
         "orange dashed=interpolated command sent to the controller, "
         "gray dotted=pre-safety reference",
         fontsize=13,

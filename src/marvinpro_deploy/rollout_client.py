@@ -31,7 +31,7 @@ from .config import (
     JOINT_NAMES,
 )
 from .image_processing import ImageError, decode_and_split
-from .joint_mapping import build_state16, normalize_gripper
+from .joint_mapping import build_state16
 from .motion_profile import FrozenLinearPlan
 from .rtc import (
     DelayEstimator,
@@ -69,7 +69,7 @@ _RTC_PLAYBACK_TIME_SCALES = (2.0, 3.0)
 
 
 class JointTelemetryRecorder:
-    """Write arm feedback, gripper q/dq/tau, and outgoing commands."""
+    """Write arm feedback, gripper command proxies, and outgoing commands."""
 
     def __init__(self, path: Path) -> None:
         path = path.expanduser().resolve()
@@ -106,6 +106,8 @@ class JointTelemetryRecorder:
         columns.extend(f"measured_{name}" for name in JOINT_NAMES)
         columns.extend(
             (
+                "gripper_command_proxy_L",
+                "gripper_command_proxy_R",
                 "measured_gripper_position_raw_L",
                 "measured_gripper_position_raw_R",
                 "measured_gripper_position_L",
@@ -138,29 +140,14 @@ class JointTelemetryRecorder:
 
     @staticmethod
     def _gripper_values(message, target: tuple[float, ...] | None) -> list[float | str]:
-        def optional(name: str) -> float | str:
-            value = getattr(message, name, None)
-            return "" if value is None else float(value)
-
-        left = normalize_gripper(message.gripper_raw_left)
-        right = normalize_gripper(message.gripper_raw_right)
-        errors: tuple[float | str, float | str] = ("", "")
-        if target is not None and len(target) == 16:
-            errors = (abs(float(target[7]) - left), abs(float(target[15]) - right))
+        del target
         return [
             message.gripper_raw_left,
             message.gripper_raw_right,
-            left,
-            right,
-            optional("gripper_velocity_left"),
-            optional("gripper_velocity_right"),
-            optional("gripper_torque_left"),
-            optional("gripper_torque_right"),
-            *errors,
-            optional("gripper_mos_temperature_left"),
-            optional("gripper_mos_temperature_right"),
-            optional("gripper_motor_temperature_left"),
-            optional("gripper_motor_temperature_right"),
+            "", "", "", "",
+            "", "", "", "",
+            "", "", "", "",
+            "", "",
         ]
 
     def record_state(self, message: RobotStateUpdate, received_monotonic: float) -> None:
@@ -873,11 +860,7 @@ def validate_observation(observation: RobotObservation, max_source_age_s: float)
         raise RolloutError("robot observation has invalid joint state")
     if not observation.image:
         raise RolloutError("robot observation has no camera image")
-    ages = {
-        "joint state": observation.age_state_s,
-        "left gripper feedback": observation.age_gripper_left_s,
-        "right gripper feedback": observation.age_gripper_right_s,
-    }
+    ages = {"joint state": observation.age_state_s}
     for label, age in ages.items():
         if age is None or age > max_source_age_s:
             raise RolloutError(f"{label} is stale: age={age}")
@@ -1028,18 +1011,14 @@ def _confirm_and_refresh_execution_observation(
     validate_observation(fresh, args.max_source_age)
     LOGGER.warning(
         "post_confirmation_observation baseline_seq=%d fresh_seq=%d captured=%.6f "
-        "joint_age_ms=%.3f gripper_age_ms=(%.3f,%.3f) gripper_q_rad=(%.3f,%.3f) "
-        "gripper_tau=(%s,%s)",
+        "joint_age_ms=%.3f gripper_proxy=(%.3f,%.3f) source=%s",
         latest_after_confirmation.seq,
         fresh.seq,
         fresh.captured_monotonic,
         float(fresh.age_state_s) * 1000.0,
-        float(fresh.age_gripper_left_s) * 1000.0,
-        float(fresh.age_gripper_right_s) * 1000.0,
         fresh.gripper_raw_left,
         fresh.gripper_raw_right,
-        fresh.gripper_torque_left,
-        fresh.gripper_torque_right,
+        getattr(fresh, "extra", {}).get("gripper_state_source", "unknown"),
     )
     return fresh
 
@@ -1504,7 +1483,7 @@ def _wait_checkpoint_observation(
         LOGGER.info(
             "checkpoint_observation event_seq=%d checkpoint=%s image_seq=%d "
             "stable=%.6f captured=%.6f after_stable_ms=%.3f state_sampled=%.6f "
-            "state_image_skew_ms=%.3f joint_age_ms=%.3f gripper_q_rad=(%.3f,%.3f)",
+            "state_image_skew_ms=%.3f joint_age_ms=%.3f gripper_proxy=(%.3f,%.3f)",
             event.event_seq,
             event.checkpoint_id,
             observation.seq,
@@ -2005,8 +1984,7 @@ def run(args: argparse.Namespace) -> int:
         validate_observation(observation, args.max_source_age)
         LOGGER.info(
             "robot_observation_ready seq=%d captured=%.6f input_mode=%s robot_state=%s arm_state=%s "
-            "gate=%s reason=%r joint_age_ms=%.3f gripper_age_ms=(%.3f,%.3f) "
-            "gripper_q_rad=(%.3f,%.3f) gripper_tau=(%s,%s) source=%s",
+            "gate=%s reason=%r joint_age_ms=%.3f gripper_proxy=(%.3f,%.3f) source=%s",
             observation.seq,
             observation.captured_monotonic,
             observation.input_mode,
@@ -2015,13 +1993,9 @@ def run(args: argparse.Namespace) -> int:
             observation.motion_gate_open,
             observation.gate_reason,
             float(observation.age_state_s) * 1000.0,
-            float(observation.age_gripper_left_s) * 1000.0,
-            float(observation.age_gripper_right_s) * 1000.0,
             observation.gripper_raw_left,
             observation.gripper_raw_right,
-            observation.gripper_torque_left,
-            observation.gripper_torque_right,
-            observation.extra.get("gripper_state_source", "unknown"),
+            getattr(observation, "extra", {}).get("gripper_state_source", "unknown"),
         )
 
         if args.execute and not connection.hello.motion_allowed:

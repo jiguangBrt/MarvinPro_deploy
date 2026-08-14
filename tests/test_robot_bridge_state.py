@@ -99,6 +99,25 @@ def test_gripper_feedback_parser_preserves_q_velocity_torque_and_temperatures():
     assert robot_bridge.MarvinBridgeNode._gripper_feedback_values(
         _Message(data=[0.4, -0.02])
     ) is None
+
+
+def test_untrusted_gripper_feedback_does_not_overwrite_command_proxy(monkeypatch):
+    node = object.__new__(robot_bridge.MarvinBridgeNode)
+    node._lock = threading.RLock()
+    node._gripper_r = 0.75
+    node._gripper_feedback_r_position = None
+    node._gripper_r_velocity = None
+    node._gripper_r_torque = None
+    node._gripper_r_mos_temperature = None
+    node._gripper_r_motor_temperature = None
+    node._gripper_r_t = None
+    monkeypatch.setattr(robot_bridge, "_now", lambda: 12.0)
+
+    node._on_gripper_r(_Message(data=[-0.037, -0.007, 0.1, 31.0, 30.0]))
+
+    assert node._gripper_r == 0.75
+    assert node._gripper_feedback_r_position == -0.037
+    assert node._gripper_r_t == 12.0
     assert robot_bridge.MarvinBridgeNode._gripper_feedback_values(
         _Message(data=[0.4, float("nan"), 0.31])
     ) is None
@@ -170,7 +189,7 @@ def test_timer_state_update_preserves_joint_source_timestamp():
     assert node._latest_state.state_seq == 1
 
 
-def test_motion_gate_requires_fresh_measured_gripper_feedback():
+def test_motion_gate_ignores_untrusted_gripper_feedback_cache():
     node = _bare_node()
     node.allow_motion = True
     node._client_connected = True
@@ -187,8 +206,8 @@ def test_motion_gate_requires_fresh_measured_gripper_feedback():
 
     ready, reason = node._readiness_gate_locked(10.1)
 
-    assert not ready
-    assert reason == "left gripper feedback is stale"
+    assert ready
+    assert reason == "ready"
 
 
 def test_rejection_event_can_precede_trajectory_session():

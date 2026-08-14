@@ -6,7 +6,7 @@ Impedance Mode、Home 或清故障；这些步骤必须由现场人员确认。�
 
 ## 已离线验证
 
-- protocol v4 序列化、版本拒绝、高频 state/image/event 分流、乱序 event 丢弃和发送公平性；
+- protocol v5 序列化、版本拒绝、高频 state/image/event 分流、乱序 event 丢弃和发送公平性；
 - feedback source timestamp 不会被 100 Hz timer 伪装成新反馈；
 - 慢速一阶机器人会令 phase 减速/冻结，不按控制 tick 消费动作；
 - A5 feedback 仍在 A4 时不产生 checkpoint，stale feedback 不能累计 `0.20 s` settle；
@@ -52,7 +52,7 @@ cd /home/jh/TianJi_data_collector/MarvinPro_deploy
 记录所有 topic 频率和最新值。`/joint_states` 应足以支持 50 ms stale 门限；相机、左右夹爪、input mode、
 robot state 和 arm state 均必须有消息。doctor 不通过时停止，不得通过放宽 timeout 继续。
 
-## 3. protocol v4 dry-run
+## 3. protocol v5 dry-run
 
 控制器启动不允许动作的 bridge：
 
@@ -148,7 +148,7 @@ uv run python -m marvinpro_deploy.rollout_client \
 
 ## 5. synchronized 回归
 
-使用 README 中已验证的 synchronized 参数运行至少两个 chunk。protocol v4 更新后，边界误差、跟踪时间、
+使用 README 中已验证的 synchronized 参数运行至少两个 chunk。protocol v5 更新后，边界误差、跟踪时间、
 clipping 和固定 hold 行为不得劣于旧基线。回归失败时不进入 RTC shadow。
 
 Terminal A 在 Apex Input Mode 为 None 时启动 bridge，并记录本轮目录：

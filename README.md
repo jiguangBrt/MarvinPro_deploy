@@ -14,10 +14,12 @@ rollout 客户端应运行在当前电脑，不运行在机器人控制器。机
 
 - 观测/动作顺序：`[左臂7, 左夹爪, 右臂7, 右夹爪]`。
 - 关节单位：rad；policy server 输出已经过 `AbsoluteActions`，是绝对关节目标。
-- 夹爪：模型使用 `0=open, 1=closed`；命令直接向 `/control/gripperValueL/R` 发布 `0..1`。
-  `/info/gripper_feedback_L/R` 的五维反馈依次为
-  `[q_position_rad, dq_velocity_rad_s, tau_torque, temp_mos, temp_motor]`。bridge 使用真实 `q` 构造
-  policy state，并独立记录 `dq/tau`；`q` 按训练标定 `0..1.25 rad` 归一化到 `0..1`。
+- 夹爪：模型使用 `0=open, 1=closed`；命令直接向 `/control/gripperValueL/R` 发布 `0..1`。当前控制器
+  的 DM 反馈回传冻结，因此 policy state 临时使用 bridge 最近实际发布的命令作为代理，启动时默认
+  `0=open`。每次启动 bridge 前必须先把两侧夹爪实际打开，使物理状态与初始代理一致。
+- `/info/gripper_feedback_L/R` 的字段布局虽然是
+  `[q_position_rad, dq_velocity_rad_s, tau_torque, temp_mos, temp_motor]`，但 2026-08-11 动态开合验证中
+  23,452 条右侧消息完全相同。它只作“不可信缓存”诊断，不参与运动门、policy state 或遥测实测列。
 - 相机：四宫格左上=`cam_high`，左下=`cam_left_wrist`，右下=`cam_right_wrist`，右上忽略；底部
   时间戳区域不进入模型。
 - 双臂目标：`/control/user/joint_cmd_A/B`，消息类型
@@ -48,8 +50,8 @@ cd /home/jh/TianJi_data_collector/MarvinPro_deploy
 ```
 
 脚本将 `0` 或 `1` 短时连续发布到 `/control/gripperValueL/R`，不会调用 Home、切换 Apex Input Mode
-或发送机械臂关节命令。`/info/gripper_feedback_L/R` 的 `data[0]` 是实际位置 `q`，`data[2]` 是实际
-力矩 `tau`；脚本会打印完整反馈值。
+或发送机械臂关节命令。脚本打印的 `/info/gripper_feedback_L/R` 当前是冻结缓存，不能解释为实际位置
+或实际力矩；应以肉眼确认物理开合是否完成。
 若检测到 rollout bridge 仍在运行，脚本会拒绝发布，避免两个外部命令源互相覆盖。
 
 ## 1. GPU 服务器启动 policy
@@ -88,8 +90,8 @@ cd /home/jh/TianJi_data_collector/MarvinPro_deploy
 - `/control/input_mode`
 - `/info/robot_state`、`/info/arm_state`
 
-doctor 会打印 `/info/gripper_feedback_L/R` 的 `q/dq/tau/温度`；两侧反馈都必须存在且新鲜，才会打开
-rollout 运动门。
+doctor 会把 `/info/gripper_feedback_L/R` 标为 `UNTRUSTED frozen cache` 并打印其字段，仅用于后续修复
+诊断；该 topic 缺失或高频重复不会阻止 rollout 运动门。
 相机没有消息时，先在 Apex 启动 Camera。执行前还必须看到 `input_mode=3`、两个状态数组均为
 `(3, 3)`；这台控制器用状态 `3` 表示关节阻抗模式。dry-run 阶段可以仍为 None/`0`。
 
@@ -117,7 +119,7 @@ uv run python -m marvinpro_deploy.rollout_client \
 
 - policy 输出恒为 `(10, 16)` 且 finite；
 - `wall` 通常约为此前实测的 90-120 ms；
-- 相机、关节和夹爪 age 没有超限；
+- 相机和关节 age 没有超限，日志显示 `gripper_state_source=command_proxy`；
 - 能持续完成 inference，没有图像裁剪或连接错误。
 
 ## 4. 首次真机执行
@@ -164,7 +166,7 @@ uv run python -m marvinpro_deploy.rollout_client \
 2. rollout 使用 `--execute` 并人工输入单个大写 `E`；
 3. `input_mode == 3`；
 4. `/info/robot_state == [3,3]` 且 `/info/arm_state == [3,3]`（关节阻抗模式）；
-5. 关节和夹爪反馈新鲜，policy action 为 finite `(16,)`；
+5. 关节反馈新鲜，夹爪命令代理在 `[0,1]`，policy action 为 finite `(16,)`；
 6. 客户端单次相对当前反馈最多 `0.08 rad`，bridge 二次检查最多 `0.12 rad`；
 7. 目标位于当前 M6-696 URDF 硬限位内并保留 `0.02 rad` 边界；
 8. bridge 收到的 action 不超过 `0.25 s`，且对应观测不超过 8 帧。
@@ -185,7 +187,7 @@ hold，不会重复执行过时的预测动作。
 
 bridge 使用 pickle 传输 JPEG 和数据结构，只能暴露在可信的机器人私有网络，不应映射到公网。
 
-## 跟踪感知时间轴与 RTC（protocol v4）
+## 跟踪感知时间轴与 RTC（protocol v5）
 
 `tracking` 和 `rtc` 使用 bridge 本地 100 Hz trajectory owner。控制 timer 只对连续 phase 求值，不会按
 100 Hz 自动消费模型动作；机器人跟踪误差增大时，phase 会减速或冻结。RTC A5 checkpoint 只有在全部14个
@@ -196,10 +198,10 @@ RTC 默认使用 `--playback-time-scale 2`（有效 knot rate `7.5 Hz`）。仅�
 降速造成的停顿，可使用已限制的诊断配置 `--playback-time-scale 3`（有效 knot rate `5 Hz`）；其他倍率
 仍会被客户端拒绝。
 
-protocol v4 必须同时更新控制器上的 `MarvinPro_deploy` 和本机客户端；v4 恢复夹爪真实位置状态，并传输
-`dq/tau/温度` 诊断。RTC 的 tracking governor 只使用 14 个机械臂关节误差：夹爪接触物体后可能无法到达
-位置目标，若把夹爪误差放进推进门会造成错误冻结。夹爪位置误差和力矩仍写入 telemetry，用于判断闭合、
-接触和打滑，而不控制 RTC phase。
+protocol v5 必须同时更新控制器上的 `MarvinPro_deploy` 和本机客户端；版本提升用于阻止旧客户端把
+`0..1` 命令代理再次按 `1.25 rad` 标定。当前临时运行契约将 bridge 最后发布
+的夹爪命令作为状态代理；RTC 的 tracking governor 仍只使用 14 个机械臂关节误差。不可信的 DM
+`q/dq/tau/温度` 不写成实测 telemetry，也不能用于判断闭合、接触或打滑。
 trajectory session 每 `100 ms`
 发送 heartbeat；bridge 超过 `250 ms` 未收到会清空 trajectory 并停止发布。旧的 discrete、prefetch、
 synchronized 和诊断客户端仍使用 legacy `ActionCommand` 路径。
@@ -242,12 +244,12 @@ uv run python -m marvinpro_deploy.rollout_client \
 None，再安全退出。
 
 指定 `--log-file "$RUN_DIR/rollout.log"` 还会自动生成
-`$RUN_DIR/rollout.telemetry.csv`。它逐条保存 bridge 实测 14 个关节、夹爪 `q/dq/tau/温度`、夹爪
-位置目标误差、bridge 插帧后的最终命令，以及
+`$RUN_DIR/rollout.telemetry.csv`。它逐条保存 bridge 实测 14 个关节、夹爪命令代理、bridge 插帧后的
+最终命令，以及
 prefetch/legacy 客户端插帧生成的请求目标和实际发送命令；`client_reference_*` 是插帧值，
 `client_command_*` 是 safety-filter 后的发送值，`record_type` 字段区分 `bridge_state` 和
 `client_command`。
-测试后可生成关节角与夹爪位置/力矩对照图：
+测试后可生成关节角与夹爪命令代理对照图：
 
 ```bash
 PYTHONPATH=/home/jh/TianJi_data_collector/MarvinPro_deploy/src \

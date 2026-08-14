@@ -214,12 +214,13 @@ class RobotConnectionTest(unittest.TestCase):
             joints=(0.0,) * 14,
             image=b"jpeg",
             age_state_s=0.001,
-            age_gripper_left_s=0.002,
-            age_gripper_right_s=0.003,
+            age_gripper_left_s=None,
+            age_gripper_right_s=None,
             gripper_raw_left=0.4,
             gripper_raw_right=0.6,
             gripper_torque_left=0.1,
             gripper_torque_right=0.2,
+            extra={"gripper_state_source": "command_proxy"},
         )
 
         class FakeConnection:
@@ -271,7 +272,7 @@ class RobotConnectionTest(unittest.TestCase):
 
 
 class JointTelemetryRecorderTest(unittest.TestCase):
-    def test_records_arm_and_gripper_feedback_and_post_filter_command(self):
+    def test_records_arm_and_gripper_proxy_without_false_measured_feedback(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "rollout.telemetry.csv"
             recorder = JointTelemetryRecorder(path)
@@ -316,9 +317,10 @@ class JointTelemetryRecorderTest(unittest.TestCase):
                 rows = list(csv.DictReader(stream))
             self.assertEqual([row["record_type"] for row in rows], ["bridge_state", "client_command"])
             self.assertEqual(float(rows[0]["measured_Joint1_L"]), 0.1)
-            self.assertEqual(float(rows[0]["measured_gripper_position_raw_L"]), 0.2)
-            self.assertAlmostEqual(float(rows[0]["measured_gripper_position_L"]), 0.16)
-            self.assertEqual(float(rows[0]["measured_gripper_torque_L"]), 0.11)
+            self.assertEqual(float(rows[0]["gripper_command_proxy_L"]), 0.2)
+            self.assertEqual(rows[0]["measured_gripper_position_raw_L"], "")
+            self.assertEqual(rows[0]["measured_gripper_position_L"], "")
+            self.assertEqual(rows[0]["measured_gripper_torque_L"], "")
             self.assertEqual(float(rows[0]["bridge_command_Joint1_L"]), 2.0)
             self.assertEqual(float(rows[1]["client_reference_Joint1_L"]), 3.0)
             self.assertEqual(float(rows[1]["client_command_Joint1_L"]), 2.9)

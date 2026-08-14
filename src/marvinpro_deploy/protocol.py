@@ -41,8 +41,7 @@ class RobotObservation:
     image: bytes
     image_format: str
     joints: tuple[float, ...]
-    # Raw DM motor position feedback in radians. The client applies the
-    # training calibration before constructing the 16-dimensional state.
+    # Legacy wire name: these are 0..1 command proxies, not DM position feedback.
     gripper_raw_left: float
     gripper_raw_right: float
     input_mode: int | None
@@ -75,7 +74,7 @@ class RobotStateUpdate:
     state_seq: int
     sampled_monotonic: float
     joints: tuple[float, ...]
-    # Raw DM motor position feedback in radians.
+    # Legacy wire name: these are 0..1 command proxies, not DM position feedback.
     gripper_raw_left: float
     gripper_raw_right: float
     motion_gate_open: bool

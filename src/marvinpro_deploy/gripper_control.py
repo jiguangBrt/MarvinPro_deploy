@@ -171,9 +171,9 @@ def _run(command: str, side: str, duration_s: float) -> int:
                         f"{label}={value:.4f}" for label, value in zip(labels, values)
                     ) + "}"
                 )
-            print("Latest measured gripper feedback: " + ", ".join(readings) + ".")
+            print("Latest UNTRUSTED gripper feedback cache: " + ", ".join(readings) + ".")
         else:
-            print("No measured gripper feedback was received during the command.", file=sys.stderr)
+            print("No gripper feedback cache was received during the command.", file=sys.stderr)
         return 0
     finally:
         node.destroy_node()

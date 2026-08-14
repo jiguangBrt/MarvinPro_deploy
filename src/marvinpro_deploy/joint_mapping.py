@@ -1,4 +1,4 @@
-"""Pure-Python Marvin Pro state layout and gripper feedback calibration."""
+"""Pure-Python Marvin Pro state layout and gripper command handling."""
 
 from __future__ import annotations
 
@@ -48,16 +48,24 @@ def normalize_gripper(
     return max(0.0, min(1.0, (raw - open_raw) / span))
 
 
+def gripper_command_proxy(value: float) -> float:
+    """Validate and clamp a 0=open, 1=closed command used as state proxy."""
+    value = float(value)
+    if not math.isfinite(value):
+        raise ValueError("gripper command proxy must be finite")
+    return max(0.0, min(1.0, value))
+
+
 def build_state16(
     joints: tuple[float, ...],
-    gripper_raw_left: float,
-    gripper_raw_right: float,
+    gripper_proxy_left: float,
+    gripper_proxy_right: float,
 ) -> tuple[float, ...]:
     if len(joints) != 14 or not all(math.isfinite(value) for value in joints):
         raise ValueError("canonical joint state must have 14 finite values")
     return (
         *joints[:7],
-        normalize_gripper(gripper_raw_left),
+        gripper_command_proxy(gripper_proxy_left),
         *joints[7:],
-        normalize_gripper(gripper_raw_right),
+        gripper_command_proxy(gripper_proxy_right),
     )
