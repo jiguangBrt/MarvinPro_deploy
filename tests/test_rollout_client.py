@@ -21,6 +21,7 @@ from marvinpro_deploy.rollout_client import (
     _confirm_execution,
     _confirm_and_refresh_execution_observation,
     _configure_logging,
+    _is_observation_lag_rejection,
     _state_log_interval_s,
     ActionPlan,
     ActionPublisher,
@@ -327,6 +328,10 @@ class JointTelemetryRecorderTest(unittest.TestCase):
 
 
 class RolloutArgumentTest(unittest.TestCase):
+    def test_observation_lag_rejection_is_retryable_but_other_rejections_are_not(self):
+        self.assertTrue(_is_observation_lag_rejection(RolloutError("bridge rejected trajectory: action observation lag is 17 frames (limit 8)")))
+        self.assertFalse(_is_observation_lag_rejection(RolloutError("bridge rejected trajectory: robot_state=(3, 12)")))
+
     def test_execution_confirmation_accepts_only_single_uppercase_e(self):
         args = parse_args(["--execute"])
         observation = SimpleNamespace(

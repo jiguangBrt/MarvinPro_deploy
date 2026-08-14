@@ -1452,6 +1452,11 @@ def _load_bridge_trajectory(
     return event
 
 
+def _is_observation_lag_rejection(exc: BaseException) -> bool:
+    """Identify a stale-source rejection that can be retried after re-observing."""
+    return "action observation lag is" in str(exc)
+
+
 def _wait_checkpoint_observation(
     connection: RobotConnection,
     event: TrajectoryEvent,
@@ -1624,18 +1629,35 @@ def _run_bridge_synchronized(
             LOGGER.info("synchronized fallback inference wall_ms=%.1f", timing["wall_ms"])
         state = connection.latest_state(max_local_age_s=0.50)
         plan_id = f"sync-{uuid.uuid4().hex}"
-        loaded = _load_bridge_trajectory(
-            connection,
-            command_ids,
-            session_id=session_id,
-            plan_id=plan_id,
-            expected_timeline_version=state.timeline_version,
-            observation_seq=observation.seq,
-            actions=actions,
-            knot_hz=effective_knot_hz,
-            checkpoint_horizon=RTC_HORIZON,
-            timeout_s=args.tracking_timeout,
-        )
+        try:
+            loaded = _load_bridge_trajectory(
+                connection,
+                command_ids,
+                session_id=session_id,
+                plan_id=plan_id,
+                expected_timeline_version=state.timeline_version,
+                observation_seq=observation.seq,
+                actions=actions,
+                knot_hz=effective_knot_hz,
+                checkpoint_horizon=RTC_HORIZON,
+                timeout_s=args.tracking_timeout,
+            )
+        except RolloutError as exc:
+            if not _is_observation_lag_rejection(exc):
+                raise
+            latest = connection.latest(max_local_age_s=0.50)
+            LOGGER.warning(
+                "discarding synchronized fallback inference because source observation is stale: "
+                "source_seq=%d latest_seq=%d lag=%d; re-observing and retrying",
+                observation.seq,
+                latest.seq,
+                latest.seq - observation.seq,
+            )
+            # The action was conditioned on an observation that the bridge rejected.
+            # Keep the bridge's fixed hold and infer again from a fresh image.
+            observation = latest
+            actions = None
+            continue
         heartbeat.update_version(loaded.timeline_version)
         event = connection.wait_for_event(
             timeout_s=args.tracking_timeout + RTC_HORIZON / effective_knot_hz,
