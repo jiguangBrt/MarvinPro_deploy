@@ -6,7 +6,7 @@ Impedance Mode、Home 或清故障；这些步骤必须由现场人员确认。�
 
 ## 已离线验证
 
-- protocol v5 序列化、版本拒绝、高频 state/image/event 分流、乱序 event 丢弃和发送公平性；
+- protocol v6 序列化、版本拒绝、高频 state/image/event 分流、乱序 event 丢弃和发送公平性；
 - feedback source timestamp 不会被 100 Hz timer 伪装成新反馈；
 - 慢速一阶机器人会令 phase 减速/冻结，不按控制 tick 消费动作；
 - A5 feedback 仍在 A4 时不产生 checkpoint，stale feedback 不能累计 `0.20 s` settle；
@@ -52,7 +52,7 @@ cd /home/jh/TianJi_data_collector/MarvinPro_deploy
 记录所有 topic 频率和最新值。`/joint_states` 应足以支持 50 ms stale 门限；相机、左右夹爪、input mode、
 robot state 和 arm state 均必须有消息。doctor 不通过时停止，不得通过放宽 timeout 继续。
 
-## 3. protocol v5 dry-run
+## 3. protocol v6 dry-run
 
 控制器启动不允许动作的 bridge：
 
@@ -130,7 +130,7 @@ uv run python -m marvinpro_deploy.rollout_client \
   --playback-mode interpolated \
   --control-hz 100 \
   --model-hz 15 \
-  --playback-time-scale 2 \
+  --playback-time-scale 3 \
   --execute-steps 10 \
   --log-level DEBUG \
   --console-log-level WARNING \
@@ -148,7 +148,7 @@ uv run python -m marvinpro_deploy.rollout_client \
 
 ## 5. synchronized 回归
 
-使用 README 中已验证的 synchronized 参数运行至少两个 chunk。protocol v5 更新后，边界误差、跟踪时间、
+使用 README 中已验证的 synchronized 参数运行至少两个 chunk。protocol v6 更新后，边界误差、跟踪时间、
 clipping 和固定 hold 行为不得劣于旧基线。回归失败时不进入 RTC shadow。
 
 Terminal A 在 Apex Input Mode 为 None 时启动 bridge，并记录本轮目录：
@@ -180,7 +180,7 @@ uv run python -m marvinpro_deploy.rollout_client \
   --playback-mode interpolated \
   --control-hz 100 \
   --model-hz 15 \
-  --playback-time-scale 2 \
+  --playback-time-scale 3 \
   --execute-steps 10 \
   --log-level DEBUG \
   --console-log-level WARNING \
@@ -207,7 +207,7 @@ uv run python -m marvinpro_deploy.rollout_client \
   --playback-mode interpolated \
   --control-hz 100 \
   --model-hz 15 \
-  --playback-time-scale 2 \
+  --playback-time-scale 3 \
   --execute-steps 10 \
   --log-level DEBUG \
   --console-log-level WARNING \
@@ -230,7 +230,7 @@ knot 边界记录 `d_actual`；shadow 丢弃后，本 episode 只运行 synchron
 - 不出现约 `1.33 s` 周期回弹。
 
 任一项失败：切回 None/必要时急停，保存 bridge 和 rollout 完整日志。本 episode 的 RTC fallback 必须保持
-latched；不得现场放宽 `0.08/0.12 rad` 包络、URDF margin 或 tracking/stale 阈值。
+latched；不得现场放宽 `0.16 rad` 包络、URDF margin 或 tracking/stale 阈值。
 
 ## 8. 连续 RTC checkpoint
 
@@ -369,3 +369,13 @@ fallback 原因和操作员结论。
   有效请求成功。第一组 20 次 wall latency 出现 `p95=808.58 ms/max=1230.51 ms` 的链路尖峰，不通过
   delay 门槛；立即重复的稳定序列为 `225.34-413.38 ms`，server 为 `105.34-125.27 ms`，带 50 ms guard
   的预测上限为 4。真机必须重新从 continuous shadow 开始，不得直接执行 replacement。
+
+### 2026-08-14 governor 与 5 Hz 配置变更
+
+- protocol 提升到 v6；控制器 bridge 和客户端必须同时更新并重启；
+- `tracking/rtc` 固定为 15 Hz 模型节点、3.0x 时间尺度，即名义 `5 Hz` knot rate；旧 2.0x/7.5 Hz 配置被拒绝；
+- governor 使用 `run=0.02`、`resume=0.12`、`stop=0.16 rad`。正常运行时在 `0.02..0.16 rad` 线性降速，
+  error hard stop 锁存后降到 `0.12 rad` 才恢复；
+- trajectory arm clipping 和 bridge 目标校验包络统一为 `0.16 rad`；
+- 本条只记录代码和离线测试配置，不能视为新参数已通过真机验证。真机必须从单 chunk tracking 开始，确认
+  clipping、phase rate、timer gap 和最大 tracking error 后，再进入 continuous RTC shadow。

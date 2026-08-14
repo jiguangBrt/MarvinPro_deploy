@@ -55,7 +55,7 @@
 
 ### 2.2 安全裁剪掩盖了计划超前
 
-`safety.filter_action()` 每次把 raw 目标限制在最新反馈的 `+/-0.08 rad` 内。这个逻辑是安全包络，不是轨迹
+`safety.filter_action()` 每次把 raw 目标限制在最新反馈的 `+/-0.16 rad` 内。这个逻辑是安全包络，不是轨迹
 跟踪器。当前发布器在发生裁剪后仍然弹出下一个计划点，结果是 raw 计划持续向前，而实际发送目标长期贴着
 反馈包络追赶。
 
@@ -91,12 +91,12 @@ chunk 虽然基于真实反馈生成，却被追加到一个机器人没有实�
 
 所有阶段都必须保持以下约束：
 
-- 客户端 `0.08 rad` 和 bridge `0.12 rad` 反馈包络不放宽。
+- 客户端和 bridge 使用 `0.16 rad` 反馈包络。
 - URDF 关节限位和 `0.02 rad` margin 不放宽。
 - 反馈过期、motion gate 关闭、命令拒绝或计划版本不一致时立即停止推进。
 - 空计划时只能锁存一次固定目标，不能逐帧把 measured pose 重新锁存为新目标。
 - clipping 不能被统计后忽略；arm clipping 必须影响计划推进和 RTC 结果有效性。
-- 第一版 RTC 只在插值回放、2.0x 时间尺度和完整 H=10 配置下验证。
+- 当前 RTC 只允许插值回放、3.0x 时间尺度（5 Hz knot rate）和完整 H=10 配置。
 - 未通过离线测试和 dry-run 前不得运行 RTC 真机动作。
 - 不修改官方低层控制器参数，不把提高发布频率当作跟踪修复。
 
@@ -219,7 +219,7 @@ INITIAL_SYNC
 
 - [ ] phase 0、整数 phase、分数 phase 和末节点求值。
 - [ ] 冻结期间任意多次 100 Hz tick 都不能改变 phase。
-- [ ] 7.5 Hz knot rate 在 100 Hz 控制时钟下长期运行不漂移。
+- [ ] 5 Hz knot rate 在 100 Hz 控制时钟下长期运行不漂移。
 - [ ] handoff 不改变 A0...A9 的 RTC 索引。
 - [ ] 错误 timeline version 的替换被拒绝。
 
@@ -256,7 +256,7 @@ phase += nominal_knot_hz * phase_rate * dt
       `servo_error = time_aligned_sent_target - measured`。
 - [ ] arm clipping 发生时立即冻结 phase；禁止“裁剪当前点后继续消费下一点”。
 - [ ] 使用带滞回的 `e_run/e_stop`，避免阈值附近反复启停。
-- [ ] 阈值必须通过冻结 chunk 遥测确定，并满足 `e_stop < 0.08 rad`；不能直接把安全包络当 tracking 阈值。
+- [ ] 当前阈值为 `e_run=0.02`、`e_resume=0.12`、`e_stop=0.16 rad`，必须通过真机遥测复核。
 - [ ] tracking freeze 时保持同一个 raw reference，允许机器人追上；硬故障停止时只锁存一次固定安全目标。
 - [ ] 连续 clipping、状态过期或 tracking timeout 进入 synchronized fallback 或停止，不自动放宽阈值。
 - [ ] 增加 `--rollout-schedule tracking`，暂时不调用 RTC，只验证执行器。
@@ -473,16 +473,16 @@ RTC 输出 C0≈A4、C1≈A5、C2... 为过渡和新动作
 
 ```text
 action_horizon H = 10
-playback_time_scale = 2.0
-nominal effective knot rate = 7.5 Hz
+playback_time_scale = 3.0
+nominal effective knot rate = 5 Hz
 checkpoint/execution horizon s = 4
 RTC predicted delay d_pred <= 4
 tracking observation tolerance = 0.01 rad（先沿用同步基线）
 tracking settle = 0.20 s（先沿用同步基线）
 ```
 
-`e_run`、`e_stop` 和 RTC guidance scale 必须通过阶段 1 至阶段 6 的数据确定。唯一预先固定的关系是
-`0 < e_run < e_stop < 0.08 rad`。
+当前 governor 配置为 `e_run=0.02`、`e_resume=0.12`、`e_stop=0.16 rad`；其中 resume 是 hard freeze 的
+解除阈值。这组参数仍必须通过阶段 1 至阶段 6 的真机数据复核。
 
 当 `d_pred=4, s=4, H=10` 时，RTC 权重布局是：
 

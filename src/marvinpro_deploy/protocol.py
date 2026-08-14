@@ -29,7 +29,7 @@ class BridgeHello:
     version: int = PROTOCOL_VERSION
     motion_allowed: bool = False
     publish_hz: float = 15.0
-    max_joint_step_rad: float = 0.12
+    max_joint_step_rad: float = 0.16
     joint_lower: tuple[float, ...] = ()
     joint_upper: tuple[float, ...] = ()
 

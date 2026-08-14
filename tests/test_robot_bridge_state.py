@@ -1,5 +1,7 @@
 from collections import deque
+from contextlib import redirect_stderr
 import importlib
+import io
 import sys
 import threading
 import types
@@ -88,6 +90,25 @@ def _install_ros_stubs():
 
 _install_ros_stubs()
 robot_bridge = importlib.import_module("marvinpro_deploy.robot_bridge")
+
+
+def test_bridge_cli_uses_current_governor_and_safety_envelope_defaults():
+    args = robot_bridge.parse_args([])
+
+    assert args.max_joint_step_rad == 0.16
+    assert args.tracking_run_error_rad == 0.02
+    assert args.tracking_resume_error_rad == 0.12
+    assert args.tracking_stop_error_rad == 0.16
+
+
+def test_bridge_cli_rejects_validation_envelope_below_trajectory_clipping_envelope():
+    with redirect_stderr(io.StringIO()):
+        try:
+            robot_bridge.parse_args(["--max-joint-step-rad", "0.159"])
+        except SystemExit as exc:
+            assert exc.code == 2
+        else:
+            raise AssertionError("bridge accepted a validation envelope below the clipping envelope")
 
 
 def test_gripper_feedback_parser_preserves_q_velocity_torque_and_temperatures():
@@ -446,7 +467,7 @@ def test_fake_bridge_checkpoint_resume_and_atomic_rtc_merge(monkeypatch):
         allow_motion=True,
         publish_hz=100.0,
         command_timeout_s=0.25,
-        max_joint_step_rad=0.12,
+        max_joint_step_rad=0.16,
         max_state_age_s=0.20,
         max_status_age_s=0.50,
         max_observation_lag=8,
@@ -454,9 +475,9 @@ def test_fake_bridge_checkpoint_resume_and_atomic_rtc_merge(monkeypatch):
         trajectory_state_timeout_s=0.05,
         trajectory_timer_timeout_s=0.05,
         trajectory_heartbeat_timeout_s=0.25,
-        tracking_run_error_rad=0.01,
-        tracking_resume_error_rad=0.03,
-        tracking_stop_error_rad=0.04,
+        tracking_run_error_rad=0.02,
+        tracking_resume_error_rad=0.12,
+        tracking_stop_error_rad=0.16,
         tracking_tolerance_rad=0.01,
         tracking_settle_seconds=0.20,
     )
@@ -498,7 +519,7 @@ def test_fake_bridge_checkpoint_resume_and_atomic_rtc_merge(monkeypatch):
             plan_id="old-plan",
             expected_timeline_version=0,
             knots=old_knots,
-            knot_hz=7.5,
+            knot_hz=5.0,
             checkpoint_horizon=6,
             execute=True,
         )

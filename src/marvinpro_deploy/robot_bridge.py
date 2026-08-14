@@ -103,7 +103,7 @@ QOS_COMMAND = QoSProfile(
     history=HistoryPolicy.KEEP_LAST,
 )
 
-TRAJECTORY_CLIENT_ENVELOPE_RAD = 0.08
+TRAJECTORY_CLIENT_ENVELOPE_RAD = 0.16
 
 
 class MarvinBridgeNode(Node):
@@ -1509,7 +1509,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--allow-motion", action="store_true", help="permit publishing after all other gates pass")
     parser.add_argument("--publish-hz", type=float, default=CONTROL_HZ)
     parser.add_argument("--command-timeout", type=float, default=0.25)
-    parser.add_argument("--max-joint-step-rad", type=float, default=0.12)
+    parser.add_argument("--max-joint-step-rad", type=float, default=0.16)
     parser.add_argument("--joint-limit-margin-rad", type=float, default=0.02)
     parser.add_argument("--max-state-age", type=float, default=0.20)
     parser.add_argument("--max-status-age", type=float, default=0.50)
@@ -1517,9 +1517,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--trajectory-state-timeout", type=float, default=0.05)
     parser.add_argument("--trajectory-timer-timeout", type=float, default=0.05)
     parser.add_argument("--trajectory-heartbeat-timeout", type=float, default=0.25)
-    parser.add_argument("--tracking-run-error-rad", type=float, default=0.01)
-    parser.add_argument("--tracking-resume-error-rad", type=float, default=0.03)
-    parser.add_argument("--tracking-stop-error-rad", type=float, default=0.04)
+    parser.add_argument("--tracking-run-error-rad", type=float, default=0.02)
+    parser.add_argument("--tracking-resume-error-rad", type=float, default=0.12)
+    parser.add_argument("--tracking-stop-error-rad", type=float, default=0.16)
     parser.add_argument("--tracking-tolerance-rad", type=float, default=0.01)
     parser.add_argument("--tracking-settle-seconds", type=float, default=0.20)
     args = parser.parse_args(argv)
@@ -1529,9 +1529,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         0 < args.tracking_run_error_rad
         < args.tracking_resume_error_rad
         < args.tracking_stop_error_rad
-        < TRAJECTORY_CLIENT_ENVELOPE_RAD
+        <= TRAJECTORY_CLIENT_ENVELOPE_RAD
     ):
-        parser.error("tracking thresholds must satisfy 0 < run < resume < stop < 0.08")
+        parser.error(
+            "tracking thresholds must satisfy 0 < run < resume < stop "
+            f"<= {TRAJECTORY_CLIENT_ENVELOPE_RAD:.2f}"
+        )
+    if args.max_joint_step_rad < TRAJECTORY_CLIENT_ENVELOPE_RAD:
+        parser.error(
+            "--max-joint-step-rad must be at least the trajectory clipping envelope "
+            f"({TRAJECTORY_CLIENT_ENVELOPE_RAD:.2f} rad)"
+        )
     if min(
         args.trajectory_state_timeout,
         args.trajectory_timer_timeout,

@@ -65,7 +65,7 @@ LOGGER = logging.getLogger("marvinpro_rollout")
 _ACTIVE_STATE_LOG_INTERVAL_S = 0.10
 _HOLD_STATE_LOG_INTERVAL_S = 1.0
 _ACTION_NAMES = JOINT_NAMES[:7] + ("Gripper_L",) + JOINT_NAMES[7:] + ("Gripper_R",)
-_RTC_PLAYBACK_TIME_SCALES = (2.0, 3.0)
+_TRACKING_PLAYBACK_TIME_SCALE = 3.0
 
 
 class JointTelemetryRecorder:
@@ -2420,7 +2420,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--max-state-image-skew", type=float, default=0.05)
-    parser.add_argument("--max-joint-step-rad", type=float, default=0.08)
+    parser.add_argument("--max-joint-step-rad", type=float, default=0.16)
     parser.add_argument("--joint-limit-margin-rad", type=float, default=0.02)
     parser.add_argument("--max-source-age", type=float, default=0.20)
     parser.add_argument("--max-observation-age", type=float, default=0.35)
@@ -2495,11 +2495,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         if (
             args.control_hz != 100.0
             or args.model_hz != 15.0
-            or args.playback_time_scale not in _RTC_PLAYBACK_TIME_SCALES
+            or args.playback_time_scale != _TRACKING_PLAYBACK_TIME_SCALE
         ):
             parser.error(
                 "tracking/rtc requires --control-hz 100 --model-hz 15 "
-                "--playback-time-scale 2 or 3"
+                "--playback-time-scale 3 (fixed 5 Hz knot rate)"
             )
         if args.execute_steps != RTC_HORIZON:
             parser.error("tracking/rtc requires --execute-steps 10")

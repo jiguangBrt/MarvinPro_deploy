@@ -5,6 +5,7 @@ import unittest
 
 from marvinpro_deploy.protocol import (
     ActionCommand,
+    BridgeHello,
     LoadTrajectoryCommand,
     ProtocolError,
     RobotStateUpdate,
@@ -16,6 +17,9 @@ from marvinpro_deploy.protocol import (
 
 
 class ProtocolTest(unittest.TestCase):
+    def test_bridge_hello_uses_current_safety_envelope(self):
+        self.assertEqual(BridgeHello().max_joint_step_rad, 0.16)
+
     def test_socket_round_trip(self):
         left, right = socket.socketpair()
         try:
@@ -60,7 +64,7 @@ class ProtocolTest(unittest.TestCase):
                 plan_id="plan",
                 expected_timeline_version=1,
                 knots=((0.0,) * 16,) * 10,
-                knot_hz=7.5,
+                knot_hz=5.0,
                 checkpoint_horizon=6,
                 execute=True,
                 continuous_checkpoint=True,

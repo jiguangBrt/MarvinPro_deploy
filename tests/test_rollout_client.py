@@ -457,33 +457,7 @@ class RolloutArgumentTest(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     parse_args(argv)
 
-    def test_rtc_schedule_requires_fixed_first_version_configuration(self):
-        args = parse_args(
-            [
-                "--execute",
-                "--rollout-schedule",
-                "rtc",
-                "--playback-mode",
-                "interpolated",
-                "--control-hz",
-                "100",
-                "--model-hz",
-                "15",
-                "--playback-time-scale",
-                "2",
-                "--execute-steps",
-                "10",
-                "--max-rtc-merges",
-                "2",
-                "--rtc-continuous",
-            ]
-        )
-        self.assertEqual(args.rollout_schedule, "rtc")
-        self.assertFalse(args.rtc_shadow)
-        self.assertTrue(args.rtc_continuous)
-        self.assertEqual(args.max_rtc_merges, 2)
-
-    def test_rtc_schedule_allows_validated_slow_playback(self):
+    def test_rtc_schedule_requires_fixed_five_hz_configuration(self):
         args = parse_args(
             [
                 "--execute",
@@ -499,10 +473,37 @@ class RolloutArgumentTest(unittest.TestCase):
                 "3",
                 "--execute-steps",
                 "10",
+                "--max-rtc-merges",
+                "2",
+                "--rtc-continuous",
             ]
         )
-
+        self.assertEqual(args.rollout_schedule, "rtc")
+        self.assertFalse(args.rtc_shadow)
+        self.assertTrue(args.rtc_continuous)
+        self.assertEqual(args.max_rtc_merges, 2)
         self.assertEqual(args.playback_time_scale, 3.0)
+        self.assertEqual(args.max_joint_step_rad, 0.16)
+
+    def test_rtc_schedule_rejects_previous_seven_point_five_hz_rate(self):
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parse_args(
+                [
+                    "--execute",
+                    "--rollout-schedule",
+                    "rtc",
+                    "--playback-mode",
+                    "interpolated",
+                    "--control-hz",
+                    "100",
+                    "--model-hz",
+                    "15",
+                    "--playback-time-scale",
+                    "2",
+                    "--execute-steps",
+                    "10",
+                ]
+            )
 
     def test_rtc_schedule_rejects_unvalidated_playback_scale(self):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):

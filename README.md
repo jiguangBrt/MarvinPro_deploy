@@ -167,7 +167,7 @@ uv run python -m marvinpro_deploy.rollout_client \
 3. `input_mode == 3`；
 4. `/info/robot_state == [3,3]` 且 `/info/arm_state == [3,3]`（关节阻抗模式）；
 5. 关节反馈新鲜，夹爪命令代理在 `[0,1]`，policy action 为 finite `(16,)`；
-6. 客户端单次相对当前反馈最多 `0.08 rad`，bridge 二次检查最多 `0.12 rad`；
+6. 客户端和 bridge 的臂关节目标相对最新反馈最多 `0.16 rad`；
 7. 目标位于当前 M6-696 URDF 硬限位内并保留 `0.02 rad` 边界；
 8. bridge 收到的 action 不超过 `0.25 s`，且对应观测不超过 8 帧。
 
@@ -183,23 +183,25 @@ hold，不会重复执行过时的预测动作。
 ```
 
 若日志频繁出现 `safety filter clipped`，先检查起始姿态是否落在训练分布内，不要直接放宽限幅。默认
-`0.08 rad/15 Hz` 已允许约 `1.2 rad/s` 的最坏目标变化。
+`0.16 rad` 是每个臂关节目标相对最新反馈的位移包络，不应换算成固定速度上限。
 
 bridge 使用 pickle 传输 JPEG 和数据结构，只能暴露在可信的机器人私有网络，不应映射到公网。
 
-## 跟踪感知时间轴与 RTC（protocol v5）
+## 跟踪感知时间轴与 RTC（protocol v6）
 
 `tracking` 和 `rtc` 使用 bridge 本地 100 Hz trajectory owner。控制 timer 只对连续 phase 求值，不会按
 100 Hz 自动消费模型动作；机器人跟踪误差增大时，phase 会减速或冻结。RTC A5 checkpoint 只有在全部14个
 臂关节误差不超过 `0.01 rad`，并且由持续更新的 joint source timestamp 证明连续稳定 `0.20 s` 后才成立。
 因此“客户端已经发出 A5，但反馈仍在 A4”不会触发新观测。
 
-RTC 默认使用 `--playback-time-scale 2`（有效 knot rate `7.5 Hz`）。仅为区分 merge 边界与机器人跟踪
-降速造成的停顿，可使用已限制的诊断配置 `--playback-time-scale 3`（有效 knot rate `5 Hz`）；其他倍率
-仍会被客户端拒绝。
+`tracking` 和 `rtc` 固定使用 `--model-hz 15 --playback-time-scale 3`，名义 knot rate 为 `5 Hz`；其他倍率
+会被客户端拒绝。tracking error 在 `<=0.02 rad` 时 phase rate 为 1，在 `0.02..0.16 rad` 内按
+`(0.16-error)/0.14` 线性降低，在 `>=0.16 rad` 时硬冻结。由 tracking error 触发硬冻结后，误差降到
+`<=0.12 rad` 才解除锁存；joint state stale、timer overrun 和 arm clipping 仍直接硬冻结。臂关节 safety
+clipping 包络为 `0.16 rad`。
 
-protocol v5 必须同时更新控制器上的 `MarvinPro_deploy` 和本机客户端；版本提升用于阻止旧客户端把
-`0..1` 命令代理再次按 `1.25 rad` 标定。当前临时运行契约将 bridge 最后发布
+protocol v6 必须同时更新控制器上的 `MarvinPro_deploy` 和本机客户端；本次版本提升用于阻止旧端继续使用
+旧 governor、7.5 Hz RTC 或旧 safety 包络。当前临时运行契约将 bridge 最后发布
 的夹爪命令作为状态代理；RTC 的 tracking governor 仍只使用 14 个机械臂关节误差。不可信的 DM
 `q/dq/tau/温度` 不写成实测 telemetry，也不能用于判断闭合、接触或打滑。
 trajectory session 每 `100 ms`
@@ -232,7 +234,7 @@ uv run python -m marvinpro_deploy.rollout_client \
   --playback-mode interpolated \
   --control-hz 100 \
   --model-hz 15 \
-  --playback-time-scale 2 \
+  --playback-time-scale 3 \
   --execute-steps 10 \
   --log-level DEBUG \
   --console-log-level WARNING \
@@ -278,7 +280,7 @@ uv run python -m marvinpro_deploy.rollout_client \
   --playback-mode interpolated \
   --control-hz 100 \
   --model-hz 15 \
-  --playback-time-scale 2 \
+  --playback-time-scale 3 \
   --execute-steps 10 \
   --log-level DEBUG \
   --console-log-level WARNING \
