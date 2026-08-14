@@ -215,6 +215,7 @@ class MarvinBridgeNode(Node):
         self._frozen_reason: str | None = None
         self._active_request_id: str | None = None
         self._active_predicted_delay: int | None = None
+        self._late_result_policy = "discard"
         self._actual_delay_steps = 0
         self._inference_invalid = False
         self._pending_rtc: StageRtcChunkCommand | None = None
@@ -486,6 +487,7 @@ class MarvinBridgeNode(Node):
         self._frozen_reason = None
         self._active_request_id = None
         self._active_predicted_delay = None
+        self._late_result_policy = "discard"
         self._actual_delay_steps = 0
         self._inference_invalid = False
         self._pending_rtc = None
@@ -666,6 +668,7 @@ class MarvinBridgeNode(Node):
         self._frozen_reason = None
         self._active_request_id = None
         self._active_predicted_delay = None
+        self._late_result_policy = "discard"
         self._actual_delay_steps = 0
         self._inference_invalid = False
         self._pending_rtc = None
@@ -705,6 +708,8 @@ class MarvinBridgeNode(Node):
         max_delay = min(self._timeline.checkpoint_horizon, self._timeline.horizon - self._timeline.checkpoint_horizon)
         if not 1 <= message.predicted_delay_steps <= max_delay:
             raise SafetyError(f"predicted delay must be within 1..{max_delay}")
+        if message.late_result_policy not in ("discard", "wait"):
+            raise SafetyError("late result policy must be discard or wait")
         elapsed_steps = 0
         if continuous_checkpoint:
             assert self._phase is not None
@@ -723,6 +728,7 @@ class MarvinBridgeNode(Node):
             self._checkpoint_consumed = True
         self._active_request_id = message.request_id
         self._active_predicted_delay = message.predicted_delay_steps
+        self._late_result_policy = message.late_result_policy
         self._actual_delay_steps = elapsed_steps
         self._inference_invalid = False
         self._pending_rtc = None
@@ -801,6 +807,7 @@ class MarvinBridgeNode(Node):
         self._checkpoint_emitted = False
         self._active_request_id = None
         self._active_predicted_delay = None
+        self._late_result_policy = "discard"
         actual_delay = self._actual_delay_steps
         self._actual_delay_steps = 0
         self._pending_rtc = None
@@ -874,6 +881,10 @@ class MarvinBridgeNode(Node):
         self._raw_reference = target
         self._sent_target = target
         self._active_request_id = None
+        self._active_predicted_delay = None
+        self._late_result_policy = "discard"
+        self._actual_delay_steps = 0
+        self._inference_invalid = False
         self._pending_rtc = None
         self._last_command_id = message.command_id
         self._last_command_status = f"holding fixed position: {message.reason}"
@@ -1131,15 +1142,19 @@ class MarvinBridgeNode(Node):
                 self._trajectory_paused = True
                 self._pause_kind = "rtc_deadline"
                 self._phase_rate = 0.0
-                self._frozen_reason = "waiting for RTC result at predicted delay boundary"
-                self._emit_event_locked(
-                    "rtc_waiting_at_deadline",
-                    now,
-                    checkpoint_id=self._checkpoint_id,
-                    request_id=self._active_request_id,
-                    predicted_delay_steps=self._active_predicted_delay,
-                    actual_delay_steps=self._actual_delay_steps,
-                )
+                if self._late_result_policy == "wait":
+                    self._frozen_reason = "waiting for RTC result at predicted delay boundary"
+                    self._emit_event_locked(
+                        "rtc_waiting_at_deadline",
+                        now,
+                        checkpoint_id=self._checkpoint_id,
+                        request_id=self._active_request_id,
+                        predicted_delay_steps=self._active_predicted_delay,
+                        actual_delay_steps=self._actual_delay_steps,
+                    )
+                else:
+                    self._frozen_reason = "RTC result missed predicted delay boundary"
+                    self._invalidate_active_rtc_locked(now, self._frozen_reason)
                 return
 
         if not self._checkpoint_consumed and new_phase >= self._timeline.checkpoint_phase:

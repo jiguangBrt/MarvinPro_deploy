@@ -484,6 +484,30 @@ class RolloutArgumentTest(unittest.TestCase):
         self.assertEqual(args.max_rtc_merges, 2)
         self.assertEqual(args.playback_time_scale, 3.0)
         self.assertEqual(args.max_joint_step_rad, 0.16)
+        self.assertEqual(args.rtc_late_result_policy, "discard")
+
+    def test_rtc_schedule_allows_wait_late_result_comparison_policy(self):
+        args = parse_args(
+            [
+                "--execute",
+                "--rollout-schedule",
+                "rtc",
+                "--playback-mode",
+                "interpolated",
+                "--control-hz",
+                "100",
+                "--model-hz",
+                "15",
+                "--playback-time-scale",
+                "3",
+                "--execute-steps",
+                "10",
+                "--rtc-late-result-policy",
+                "wait",
+            ]
+        )
+
+        self.assertEqual(args.rtc_late_result_policy, "wait")
 
     def test_rtc_schedule_rejects_previous_seven_point_five_hz_rate(self):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):

@@ -9,6 +9,7 @@ from marvinpro_deploy.protocol import (
     LoadTrajectoryCommand,
     ProtocolError,
     RobotStateUpdate,
+    ResumeTrajectoryCommand,
     TrajectoryEvent,
     recv_message,
     require_current_version,
@@ -19,6 +20,10 @@ from marvinpro_deploy.protocol import (
 class ProtocolTest(unittest.TestCase):
     def test_bridge_hello_uses_current_safety_envelope(self):
         self.assertEqual(BridgeHello().max_joint_step_rad, 0.16)
+
+    def test_resume_command_defaults_to_discarding_late_results(self):
+        command = ResumeTrajectoryCommand(1, "session", "plan", 2, 3, "request", 4)
+        self.assertEqual(command.late_result_policy, "discard")
 
     def test_socket_round_trip(self):
         left, right = socket.socketpair()

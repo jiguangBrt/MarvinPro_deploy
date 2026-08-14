@@ -6,7 +6,7 @@ Impedance Mode、Home 或清故障；这些步骤必须由现场人员确认。�
 
 ## 已离线验证
 
-- protocol v6 序列化、版本拒绝、高频 state/image/event 分流、乱序 event 丢弃和发送公平性；
+- protocol v7 序列化、版本拒绝、高频 state/image/event 分流、乱序 event 丢弃和发送公平性；
 - feedback source timestamp 不会被 100 Hz timer 伪装成新反馈；
 - 慢速一阶机器人会令 phase 减速/冻结，不按控制 tick 消费动作；
 - A5 feedback 仍在 A4 时不产生 checkpoint，stale feedback 不能累计 `0.20 s` settle；
@@ -52,7 +52,7 @@ cd /home/jh/TianJi_data_collector/MarvinPro_deploy
 记录所有 topic 频率和最新值。`/joint_states` 应足以支持 50 ms stale 门限；相机、左右夹爪、input mode、
 robot state 和 arm state 均必须有消息。doctor 不通过时停止，不得通过放宽 timeout 继续。
 
-## 3. protocol v6 dry-run
+## 3. protocol v7 dry-run
 
 控制器启动不允许动作的 bridge：
 
@@ -148,7 +148,7 @@ uv run python -m marvinpro_deploy.rollout_client \
 
 ## 5. synchronized 回归
 
-使用 README 中已验证的 synchronized 参数运行至少两个 chunk。protocol v6 更新后，边界误差、跟踪时间、
+使用 README 中已验证的 synchronized 参数运行至少两个 chunk。protocol v7 更新后，边界误差、跟踪时间、
 clipping 和固定 hold 行为不得劣于旧基线。回归失败时不进入 RTC shadow。
 
 Terminal A 在 Apex Input Mode 为 None 时启动 bridge，并记录本轮目录：
@@ -379,3 +379,31 @@ fallback 原因和操作员结论。
 - trajectory arm clipping 和 bridge 目标校验包络统一为 `0.16 rad`；
 - 本条只记录代码和离线测试配置，不能视为新参数已通过真机验证。真机必须从单 chunk tracking 开始，确认
   clipping、phase rate、timer gap 和最大 tracking error 后，再进入 continuous RTC shadow。
+
+### 2026-08-14 d_pred 与迟到结果治理
+
+已完成的非真机验证：
+
+- protocol v7 在 `ResumeTrajectoryCommand` 中携带 `discard|wait`，默认 `discard`；bridge 在实际
+  `d_actual == d_pred` 时使迟到 epoch 无效，消除客户端事件接收竞态；
+- estimator 使用 epoch 内可行样本的保守 p95 和 `50 ms` guard。`1.56 s` 类 horizon fault 及任何错过物理
+  deadline 的样本会被记录但不进入稳定分布；fallback 清空旧 epoch；
+- 保持 `d_max=4`、H=10、s=6 和 bridge 物理 knot crossing 的 `d_actual`，没有改成 wall-time 估算；
+- 本地单元/fake bridge 套件为 `77 passed`；远端 CPU 套件为 `23 passed, 2 deselected`。两个仓库的 Ruff
+  检查均通过。
+
+当前电脑未连接机器人且未运行 GPU 推理，以下项目仍必须按顺序完成：
+
+1. 同时部署 protocol v7 controller bridge 和客户端，先做 motion-disabled dry-run，确认旧协议端被拒绝；
+2. 从已提交的远端代码重启 policy service，执行两次 discarded warmup 和至少 20 次 persistent-connection
+   RTC 请求；确认日志非空记录 request serialization、transport/network estimate、server queue、denoise 和 decode；
+3. 在 GPU 上复核 `d_pred=1..4` 不发生 shape-dependent JIT，记录稳定 p50/p95/max；稳定 p95 若消耗 3-4 个
+   5 Hz knot，停止真机 RTC 并评估更长 action horizon、降低链路延迟或本地推理，不得把 `d_max` 提高到 4 以上；
+4. continuous shadow 使用默认 `--rtc-late-result-policy discard` 注入/等待一次超过 deadline 的结果，确认
+   bridge 发出匹配 request ID 的 `rtc_invalid`、没有 `rtc_merged`，随后固定 hold、重新观测并进入 synchronized；
+5. 单独使用 `--rtc-late-result-policy wait` 做对照，不与正常验收混用；比较 deadline 停顿、最大位置/速度/
+   加速度边界跳变和任务恢复率。历史 `1.56 s` wait 样本曾冻结约 `1.02 s`，速度跳变为
+   `0.10757 rad/knot`，这是必须优于的失败基线；
+6. 验证 fallback 后 estimator 日志进入新 epoch，旧 outlier 不改变新 epoch 的 `d_pred`；确认所有 merge 的
+   `d_actual` 来自 bridge 实际 knot crossing，且满足 `d_actual <= d_pred <= 4`；
+7. 完成默认 discard 的单次 merge、连续多次 merge 和任务恢复率验收前，不提高 episode 长度。

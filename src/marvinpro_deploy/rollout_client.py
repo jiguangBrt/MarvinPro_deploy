@@ -37,6 +37,7 @@ from .rtc import (
     DelayEstimator,
     RTC_EXECUTION_HORIZON,
     RTC_HORIZON,
+    RTC_MAX_DELAY,
     RtcError,
     build_rtc_request,
     parse_rtc_response,
@@ -461,6 +462,24 @@ class RobotConnection:
                     expected = "any" if event_types is None else ",".join(event_types)
                     raise RolloutError(f"timed out waiting for trajectory event ({expected})")
                 self._condition.wait(timeout=min(remaining, 0.25))
+
+    def poll_event(
+        self,
+        *,
+        event_types: tuple[str, ...] | None = None,
+        newer_than: int | None = None,
+    ) -> TrajectoryEvent | None:
+        with self._condition:
+            if self._error is not None:
+                raise RolloutError(f"robot bridge receive failed: {self._error}")
+            for event in tuple(self._events):
+                if newer_than is not None and event.event_seq <= newer_than:
+                    self._events.popleft()
+                    continue
+                if event_types is None or event.event_type in event_types:
+                    self._events.remove(event)
+                    return event
+            return None
 
     def wait_for_observation(
         self,
@@ -905,10 +924,12 @@ def build_policy_observation(observation: RobotObservation, prompt: str) -> dict
 
 def infer_actions(policy, observation: RobotObservation, prompt: str) -> tuple[np.ndarray, dict]:
     started = time.monotonic()
+    preparation_started = started
     try:
         policy_observation = build_policy_observation(observation, prompt)
     except (ImageError, SafetyError, ValueError) as exc:
         raise RolloutError(f"cannot build policy observation: {exc}") from exc
+    observation_preparation_ms = (time.monotonic() - preparation_started) * 1000.0
     result = policy.infer(policy_observation)
     wall_ms = (time.monotonic() - started) * 1000.0
     actions = np.asarray(result.get("actions"))
@@ -918,6 +939,8 @@ def infer_actions(policy, observation: RobotObservation, prompt: str) -> tuple[n
         raise RolloutError("policy returned NaN or Inf")
     timing = {
         "wall_ms": wall_ms,
+        "observation_preparation_ms": observation_preparation_ms,
+        "client_timing": result.get("client_timing", {}),
         "policy_timing": result.get("policy_timing", {}),
         "server_timing": result.get("server_timing", {}),
     }
@@ -986,6 +1009,8 @@ def _confirm_execution(args: argparse.Namespace, observation: RobotObservation) 
                 )
             if args.rollout_schedule == "rtc" and args.max_rtc_merges is not None:
                 print(f"  maximum RTC merges: {args.max_rtc_merges}")
+            if args.rollout_schedule == "rtc":
+                print(f"  RTC late result policy: {args.rtc_late_result_policy}")
     print("Keep the emergency stop reachable. Switch Input Mode to None before stopping the bridge.")
     if args.yes:
         LOGGER.warning("real_robot_execution_confirmed method=--yes")
@@ -1678,6 +1703,45 @@ def _run_bridge_synchronized(
     return inference_count
 
 
+def _record_rtc_delay_sample(
+    estimator: DelayEstimator,
+    latency_ms: float,
+    knot_hz: float,
+    *,
+    source: str,
+    eligible: bool = True,
+    rejection_reason: str | None = None,
+):
+    decision = estimator.record_seconds(
+        latency_ms / 1000.0,
+        knot_hz=knot_hz,
+        eligible=eligible,
+        rejection_reason=rejection_reason,
+    )
+    log = LOGGER.info if decision.accepted else LOGGER.warning
+    log(
+        "rtc_delay_sample source=%s epoch=%d latency_ms=%.1f classification=%s reason=%s "
+        "stable_samples=%d rejected_samples=%d",
+        source,
+        decision.epoch,
+        latency_ms,
+        "stable" if decision.accepted else "link_fault",
+        decision.reason,
+        decision.stable_samples,
+        estimator.rejected_samples,
+    )
+    return decision
+
+
+def _timing_ms(values: object, key: str) -> float | None:
+    if not isinstance(values, dict):
+        return None
+    value = values.get(key)
+    if not isinstance(value, int | float) or not math.isfinite(float(value)):
+        return None
+    return float(value)
+
+
 def _run_trajectory_schedule(
     args: argparse.Namespace,
     connection: RobotConnection,
@@ -1689,20 +1753,23 @@ def _run_trajectory_schedule(
     command_ids = _CommandIds()
     heartbeat_stop = threading.Event()
     heartbeat = _TrajectoryHeartbeat(connection, session_id, heartbeat_stop)
+    effective_knot_hz = args.model_hz / args.playback_time_scale
     estimator = DelayEstimator()
     for latency_ms in warmup_latencies_ms:
-        estimator.record_seconds(latency_ms / 1000.0)
-    effective_knot_hz = args.model_hz / args.playback_time_scale
+        _record_rtc_delay_sample(estimator, latency_ms, effective_knot_hz, source="warmup")
     inference_count = 0
     fallback = args.rollout_schedule == "tracking"
 
     actions, timing = infer_actions(policy, observation, args.prompt)
     inference_count += 1
-    estimator.record_seconds(timing["wall_ms"] / 1000.0)
+    _record_rtc_delay_sample(estimator, timing["wall_ms"], effective_knot_hz, source="initial_inference")
     LOGGER.info(
-        "trajectory_initial_inference observation_seq=%d wall_ms=%.1f policy_timing=%s server_timing=%s",
+        "trajectory_initial_inference observation_seq=%d wall_ms=%.1f observation_preparation_ms=%.1f "
+        "client_timing=%s policy_timing=%s server_timing=%s",
         observation.seq,
         timing["wall_ms"],
+        timing["observation_preparation_ms"],
+        timing["client_timing"],
         timing["policy_timing"],
         timing["server_timing"],
     )
@@ -1805,8 +1872,11 @@ def _run_trajectory_schedule(
             )
             try:
                 predicted_delay = estimator.predicted_steps(effective_knot_hz)
+                observation_preparation_started = time.monotonic()
                 policy_observation = build_policy_observation(observation, args.prompt)
+                observation_preparation_ms = (time.monotonic() - observation_preparation_started) * 1000.0
                 request_id = uuid.uuid4().hex
+                request_build_started = time.monotonic()
                 request = build_rtc_request(
                     request_id=request_id,
                     plan_id=checkpoint.plan_id,
@@ -1816,6 +1886,7 @@ def _run_trajectory_schedule(
                     old_remaining_actions_absolute=checkpoint.old_remaining_actions_absolute,
                     predicted_delay_steps=predicted_delay,
                 )
+                request_build_ms = (time.monotonic() - request_build_started) * 1000.0
                 result_box: dict[str, object] = {}
 
                 def infer_rtc() -> None:
@@ -1826,6 +1897,7 @@ def _run_trajectory_schedule(
 
                 worker = threading.Thread(target=infer_rtc, name=f"rtc-{request_id[:8]}", daemon=True)
                 worker.start()
+                resume_send_started = time.monotonic()
                 connection.send(
                     ResumeTrajectoryCommand(
                         command_id=command_ids.next(),
@@ -1835,40 +1907,113 @@ def _run_trajectory_schedule(
                         checkpoint_id=checkpoint.checkpoint_id or 0,
                         request_id=request_id,
                         predicted_delay_steps=predicted_delay,
+                        late_result_policy=args.rtc_late_result_policy,
                     )
                 )
+                resume_send_ms = (time.monotonic() - resume_send_started) * 1000.0
+                deadline_event = None
                 while worker.is_alive():
-                    worker.join(timeout=0.05)
+                    worker.join(timeout=0.02)
                     if heartbeat.error is not None:
                         raise RolloutError(f"trajectory heartbeat failed: {heartbeat.error}")
+                    event = connection.poll_event(
+                        event_types=("rtc_waiting_at_deadline", "rtc_invalid", "trajectory_stopped")
+                    )
+                    if event is not None:
+                        if event.request_id not in (None, request_id):
+                            raise RtcError(
+                                f"bridge deadline event belongs to another request: {event.request_id}"
+                            )
+                        deadline_event = event
+                        LOGGER.warning(
+                            "RTC request %s bridge event while inference is active: type=%s "
+                            "d_actual=%s d_pred=%d detail=%r",
+                            request_id,
+                            event.event_type,
+                            event.actual_delay_steps,
+                            predicted_delay,
+                            event.detail,
+                        )
+                if deadline_event is None:
+                    deadline_event = connection.poll_event(
+                        event_types=("rtc_waiting_at_deadline", "rtc_invalid", "trajectory_stopped")
+                    )
                 if "error" in result_box:
                     raise RtcError(f"RTC inference transport failed: {result_box['error']}")
                 rtc_actions, rtc_timing = parse_rtc_response(result_box["result"], request=request)
                 inference_count += 1
-                estimator.record_seconds(rtc_timing["wall_ms"] / 1000.0)
+                client_timing = rtc_timing["client_timing"]
+                server_timing = rtc_timing["server_timing"]
+                policy_timing = rtc_timing["policy_timing"]
+                rtc_server_timing = rtc_timing["rtc_timing"]
                 LOGGER.info(
-                    "RTC request %s wall_ms=%.1f d_pred=%d",
+                    "RTC latency request=%s epoch=%d d_pred=%d deadline_event=%s "
+                    "observation_preparation_ms=%.3f request_build_ms=%.3f resume_send_ms=%.3f "
+                    "wall_ms=%.3f request_serialization_ms=%s transport_round_trip_ms=%s "
+                    "network_round_trip_estimate_ms=%s server_queue_ms=%s denoise_ms=%s "
+                    "response_decode_ms=%s client_timing=%s server_timing=%s policy_timing=%s rtc_timing=%s",
                     request_id,
-                    rtc_timing["wall_ms"],
+                    estimator.epoch,
                     predicted_delay,
+                    None if deadline_event is None else deadline_event.event_type,
+                    observation_preparation_ms,
+                    request_build_ms,
+                    resume_send_ms,
+                    rtc_timing["wall_ms"],
+                    _timing_ms(client_timing, "request_serialization_ms"),
+                    _timing_ms(client_timing, "transport_round_trip_ms"),
+                    _timing_ms(client_timing, "network_round_trip_estimate_ms"),
+                    _timing_ms(server_timing, "queue_ms"),
+                    _timing_ms(rtc_server_timing, "denoise_ms"),
+                    _timing_ms(client_timing, "response_decode_ms"),
+                    client_timing,
+                    server_timing,
+                    policy_timing,
+                    rtc_server_timing,
                 )
-                if args.rtc_shadow:
-                    shadow_event = connection.wait_for_event(
-                        timeout_s=args.tracking_timeout,
-                        event_types=(
-                            "rtc_waiting_at_deadline",
-                            "rtc_invalid",
-                            "trajectory_stopped",
-                        ),
+                sample = _record_rtc_delay_sample(
+                    estimator,
+                    rtc_timing["wall_ms"],
+                    effective_knot_hz,
+                    source=f"request:{request_id}",
+                    eligible=deadline_event is None,
+                    rejection_reason=(
+                        None if deadline_event is None else f"bridge_{deadline_event.event_type}"
+                    ),
+                )
+                if not sample.accepted and sample.reason == "exceeds_rtc_horizon":
+                    feasible_budget_ms = max(
+                        0.0,
+                        RTC_MAX_DELAY / effective_knot_hz - estimator.guard_seconds,
+                    ) * 1000.0
+                    raise RtcError(
+                        f"RTC link fault: request wall latency {rtc_timing['wall_ms']:.1f}ms "
+                        f"exceeds the {feasible_budget_ms:.1f}ms estimator budget after guard; "
+                        f"physical old-tail horizon is {RTC_MAX_DELAY / effective_knot_hz * 1000.0:.1f}ms"
                     )
-                    if shadow_event.event_type != "rtc_waiting_at_deadline":
-                        raise RtcError(
-                            f"RTC shadow invalidated before merge boundary: "
-                            f"{shadow_event.detail or shadow_event.event_type}"
+                if deadline_event is not None and (
+                    deadline_event.event_type != "rtc_waiting_at_deadline"
+                    or args.rtc_late_result_policy == "discard"
+                ):
+                    raise RtcError(
+                        f"RTC late result discarded after bridge event {deadline_event.event_type} "
+                        f"at d_actual={deadline_event.actual_delay_steps}"
+                    )
+                if args.rtc_shadow:
+                    shadow_event = deadline_event
+                    if shadow_event is None:
+                        shadow_event = connection.wait_for_event(
+                            timeout_s=args.tracking_timeout,
+                            event_types=(
+                                "rtc_waiting_at_deadline",
+                                "rtc_invalid",
+                                "trajectory_stopped",
+                            ),
                         )
                     LOGGER.info(
-                        "RTC shadow request=%s d_actual=%s d_pred=%d result discarded",
+                        "RTC shadow request=%s event=%s d_actual=%s d_pred=%d result discarded",
                         request_id,
+                        shadow_event.event_type,
                         shadow_event.actual_delay_steps,
                         predicted_delay,
                     )
@@ -1876,6 +2021,7 @@ def _run_trajectory_schedule(
                         f"RTC shadow result discarded at d_actual={shadow_event.actual_delay_steps}"
                     )
                 replacement_plan_id = f"plan-{uuid.uuid4().hex}"
+                stage_started = time.monotonic()
                 connection.send(
                     StageRtcChunkCommand(
                         command_id=command_ids.next(),
@@ -1890,6 +2036,7 @@ def _run_trajectory_schedule(
                         actions=_actions_tuple(rtc_actions),
                     )
                 )
+                stage_send_ms = (time.monotonic() - stage_started) * 1000.0
                 merged = connection.wait_for_event(
                     timeout_s=args.tracking_timeout,
                     event_types=(
@@ -1901,17 +2048,25 @@ def _run_trajectory_schedule(
                 )
                 if merged.event_type != "rtc_merged" or merged.request_id != request_id:
                     raise RtcError(f"bridge rejected RTC merge: {merged.detail or merged.event_type}")
+                stage_merge_ms = (time.monotonic() - stage_started) * 1000.0
                 LOGGER.info(
-                    "RTC merged request=%s d_actual=%s version=%d",
+                    "RTC merged request=%s d_actual=%s version=%d stage_send_ms=%.3f stage_merge_ms=%.3f "
+                    "boundary_velocity_jump_rad=%s boundary_acceleration_jump_rad=%s",
                     request_id,
                     merged.actual_delay_steps,
                     merged.timeline_version,
+                    stage_send_ms,
+                    stage_merge_ms,
+                    merged.boundary_velocity_jump_rad,
+                    merged.boundary_acceleration_jump_rad,
                 )
                 heartbeat.update_version(merged.timeline_version)
                 rtc_merge_count += 1
                 LOGGER.info("RTC merge count=%d limit=%s", rtc_merge_count, args.max_rtc_merges)
             except Exception as exc:
                 LOGGER.warning("RTC disabled for the rest of this episode: %s", exc)
+                new_epoch = estimator.reset_epoch()
+                LOGGER.warning("rtc_delay_estimator_reset new_epoch=%d reason=%r", new_epoch, str(exc))
                 holding = _hold_bridge_position(
                     connection,
                     command_ids,
@@ -2406,6 +2561,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--warmup-inferences", type=int, default=1)
     parser.add_argument("--rtc-shadow", action="store_true", help="run one RTC request, discard it, then use sync fallback")
+    parser.add_argument(
+        "--rtc-late-result-policy",
+        choices=("discard", "wait"),
+        default="discard",
+        help="rtc mode: discard results that miss the physical d_pred boundary, or wait and accept them for comparison",
+    )
     parser.add_argument(
         "--rtc-continuous",
         action="store_true",

@@ -161,6 +161,7 @@ def _bare_node():
     node._servo_error_rad = None
     node._arm_clipped = False
     node._frozen_reason = None
+    node._late_result_policy = "discard"
     node._gripper_l_velocity = None
     node._gripper_r_velocity = None
     node._gripper_l_torque = None
@@ -257,6 +258,106 @@ def _action(value):
 
 def _arm_action(value):
     return (float(value),) * 7 + (0.0,) + (float(value),) * 7 + (0.0,)
+
+
+def _active_rtc_deadline_node(late_result_policy):
+    node = _bare_node()
+    node._trajectory_session_id = "session"
+    node._trajectory_plan_id = "plan"
+    node._timeline_version = 1
+    node._timeline = robot_bridge.TrajectoryTimeline(
+        tuple(_action(index * 0.01) for index in range(10)),
+        5.0,
+        6,
+    )
+    node._phase = 6.0
+    node._phase_rate = 1.0
+    node._handoff_phase = None
+    node._handoff_anchor = None
+    node._checkpoint_consumed = True
+    node._trajectory_paused = False
+    node._pause_kind = None
+    node._checkpoint_stable_since = None
+    node._checkpoint_emitted = True
+    node._checkpoint_id = 1
+    node._continuous_checkpoint = True
+    node._raw_reference = _action(0.06)
+    node._sent_target = _action(0.06)
+    node._active_request_id = "request"
+    node._active_predicted_delay = 1
+    node._late_result_policy = late_result_policy
+    node._actual_delay_steps = 0
+    node._inference_invalid = False
+    node._pending_rtc = None
+    return node
+
+
+def test_discard_policy_invalidates_rtc_at_physical_delay_boundary():
+    node = _active_rtc_deadline_node("discard")
+
+    node._advance_trajectory_locked(1.0, 0.20, 1.0)
+
+    assert node._actual_delay_steps == 1
+    assert node._trajectory_paused
+    assert node._pause_kind == "rtc_invalid"
+    assert node._inference_invalid
+    assert node._events[-1].event_type == "rtc_invalid"
+    assert "missed predicted delay" in node._events[-1].detail
+
+    try:
+        node._accept_stage_rtc_locked(
+            robot_bridge.StageRtcChunkCommand(
+                command_id=2,
+                session_id="session",
+                base_plan_id="plan",
+                replacement_plan_id="replacement",
+                timeline_version=1,
+                checkpoint_id=1,
+                request_id="request",
+                predicted_delay_steps=1,
+                execution_horizon=6,
+                actions=tuple(_action(0.07 + index * 0.001) for index in range(10)),
+            ),
+            1.1,
+        )
+    except robot_bridge.SafetyError as exc:
+        assert "invalidated" in str(exc)
+    else:
+        raise AssertionError("discard policy accepted a result after the physical deadline")
+
+
+def test_wait_policy_keeps_deadline_epoch_mergeable_for_comparison():
+    node = _active_rtc_deadline_node("wait")
+
+    node._advance_trajectory_locked(1.0, 0.20, 1.0)
+
+    assert node._actual_delay_steps == 1
+    assert node._trajectory_paused
+    assert node._pause_kind == "rtc_deadline"
+    assert not node._inference_invalid
+    assert node._events[-1].event_type == "rtc_waiting_at_deadline"
+
+    node._validate_trajectory_knots_locked = lambda timeline: None
+    node._governor = types.SimpleNamespace(reset=lambda: None)
+    node._accept_stage_rtc_locked(
+        robot_bridge.StageRtcChunkCommand(
+            command_id=2,
+            session_id="session",
+            base_plan_id="plan",
+            replacement_plan_id="replacement",
+            timeline_version=1,
+            checkpoint_id=1,
+            request_id="request",
+            predicted_delay_steps=1,
+            execution_horizon=6,
+            actions=tuple(_action(0.07 + index * 0.001) for index in range(10)),
+        ),
+        1.1,
+    )
+
+    assert node._events[-1].event_type == "rtc_merged"
+    assert node._events[-1].actual_delay_steps == 1
+    assert node._trajectory_plan_id == "replacement"
 
 
 def test_checkpoint_requires_fresh_feedback_at_a3_for_full_settle_window():

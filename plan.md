@@ -414,10 +414,14 @@ RTC 输出 C0≈A4、C1≈A5、C2... 为过渡和新动作
 
 任务：
 
-- [ ] `d_pred` 使用历史 phase 延迟的保守上界，并受最大 nominal phase rate 限制；不能用
+- [x] `d_pred` 使用当前 estimator epoch 内稳定 latency 的保守 p95 和 `50 ms` guard；不能用
       `wall_ms * 100 Hz`。
+- [x] 超过四个 old-tail knot 可行预算或错过物理 deadline 的样本记录为 link fault，不污染稳定分布。
+- [x] 默认丢弃迟到结果；保留显式 `wait` 模式，只用于比较停顿、边界跳变和任务恢复率。
+- [x] fallback 后重置 estimator epoch；旧异常不会进入新的 RTC epoch。
+- [x] 分段记录 observation preparation、client transport、server queue/denoise/decode 和 bridge stage/merge。
 - [ ] 推理开始时冻结一份 old remaining reference 和 timeline version。
-- [ ] 返回后从 governor 读取 `d_actual`；不要假设它等于 `d_pred`。
+- [x] 返回后从 bridge 读取按实际 phase knot crossing 累积的 `d_actual`；不要假设它等于 `d_pred`。
 - [ ] 仅当 request ID、plan ID、timeline version、反馈新鲜度和 RTC 约束都有效时允许 merge。
 - [ ] `d_actual > d_pred`、旧 prefix 耗尽或到达结果时已经越过可替换边界，丢弃结果并 fallback。
 - [ ] 第一版中，推理期间任意 arm clipping、tracking hard freeze 或状态过期都使结果失效。
@@ -475,7 +479,7 @@ RTC 输出 C0≈A4、C1≈A5、C2... 为过渡和新动作
 action_horizon H = 10
 playback_time_scale = 3.0
 nominal effective knot rate = 5 Hz
-checkpoint/execution horizon s = 4
+checkpoint/execution horizon s = 6
 RTC predicted delay d_pred <= 4
 tracking observation tolerance = 0.01 rad（先沿用同步基线）
 tracking settle = 0.20 s（先沿用同步基线）
@@ -484,7 +488,10 @@ tracking settle = 0.20 s（先沿用同步基线）
 当前 governor 配置为 `e_run=0.02`、`e_resume=0.12`、`e_stop=0.16 rad`；其中 resume 是 hard freeze 的
 解除阈值。这组参数仍必须通过阶段 1 至阶段 6 的真机数据复核。
 
-当 `d_pred=4, s=4, H=10` 时，RTC 权重布局是：
+H=10、s=6 时物理 old tail 只有 4 个 knot，`d_max` 不能继续放大。如果稳定 p95 已经长期消耗 3-4 个 knot，
+应降低并稳定链路延迟、增加模型 action horizon 或本地化推理，而不是放宽安全门或伪造更大的 delay budget。
+
+当 `d_pred=4, s=6, H=10` 时，RTC 权重布局是：
 
 ```text
 [hard, hard, hard, hard, soft, soft, fresh, fresh, fresh, fresh]

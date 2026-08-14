@@ -187,7 +187,7 @@ hold，不会重复执行过时的预测动作。
 
 bridge 使用 pickle 传输 JPEG 和数据结构，只能暴露在可信的机器人私有网络，不应映射到公网。
 
-## 跟踪感知时间轴与 RTC（protocol v6）
+## 跟踪感知时间轴与 RTC（protocol v7）
 
 `tracking` 和 `rtc` 使用 bridge 本地 100 Hz trajectory owner。控制 timer 只对连续 phase 求值，不会按
 100 Hz 自动消费模型动作；机器人跟踪误差增大时，phase 会减速或冻结。RTC A5 checkpoint 只有在全部14个
@@ -200,8 +200,14 @@ bridge 使用 pickle 传输 JPEG 和数据结构，只能暴露在可信的机�
 `<=0.12 rad` 才解除锁存；joint state stale、timer overrun 和 arm clipping 仍直接硬冻结。臂关节 safety
 clipping 包络为 `0.16 rad`。
 
-protocol v6 必须同时更新控制器上的 `MarvinPro_deploy` 和本机客户端；本次版本提升用于阻止旧端继续使用
-旧 governor、7.5 Hz RTC 或旧 safety 包络。当前临时运行契约将 bridge 最后发布
+`d_pred` 使用当前 estimator epoch 内可行 latency 样本的保守 p95 和 `50 ms` guard。会超过四个 old-tail
+knot 的样本作为 link fault 单独记录，不进入稳定分布。RTC 默认使用 `--rtc-late-result-policy discard`：
+bridge 在物理 `d_actual == d_pred` 边界使迟到 epoch 无效，结果不得 merge；`wait` 仅保留用于比较 deadline
+停顿、边界跳变和恢复率。fallback 会重置 estimator epoch，但 bridge 的 `d_actual` 始终按实际 phase 跨过的
+knot 计数，不使用 `wall_time * nominal_rate`。
+
+protocol v7 必须同时更新控制器上的 `MarvinPro_deploy` 和本机客户端；本次版本提升用于让 bridge 强制执行
+迟到结果策略，避免客户端事件接收竞态。当前临时运行契约将 bridge 最后发布
 的夹爪命令作为状态代理；RTC 的 tracking governor 仍只使用 14 个机械臂关节误差。不可信的 DM
 `q/dq/tau/温度` 不写成实测 telemetry，也不能用于判断闭合、接触或打滑。
 trajectory session 每 `100 ms`
@@ -290,8 +296,12 @@ uv run python -m marvinpro_deploy.rollout_client \
 shadow、单 chunk governor 和 synchronized 回归全部通过后，删除 `--rtc-shadow` 才允许实际 merge；首轮实际
 测试必须加 `--max-rtc-merges 1`，达到一次成功 replacement merge 后，客户端会等待当前 RTC 段到达下一个 checkpoint，再锁存 hold。RTC
 只在下一个整数 knot 边界替换 future，并由 bridge 重新计算 `d_actual`。clipping、hard freeze、反馈过期、
-heartbeat 超时、ID/version 不匹配或 `d_actual > d_pred` 都会拒绝结果；任一次失败后，本 episode 不再重试
+heartbeat 超时、ID/version 不匹配、迟到结果或 `d_actual > d_pred` 都会拒绝结果；任一次失败后，本 episode 不再重试
 RTC，而是固定 hold、重新确认跟踪和新图像，然后使用 bridge-owned synchronized 执行。
+
+每次 RTC 请求日志分别记录 observation preparation、request build/serialization、transport round trip、
+估算的 network round trip、server deserialize/queue/infer、RTC preprocess/denoise/postprocess、response decode
+和 bridge stage/merge。network 字段是 transport 减去已测 server path 的残差估计，不是单向网络测量。
 
 默认 RTC 使用 settled checkpoint，适合验证观测和 merge 证据，但会在每个 A5 等待跟踪到位并稳定
 `0.20 s`。settled 多 chunk 验收通过后，可显式增加 `--rtc-continuous`：bridge 在 A5 记录观测边界后继续

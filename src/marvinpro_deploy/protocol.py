@@ -171,6 +171,7 @@ class ResumeTrajectoryCommand:
     checkpoint_id: int
     request_id: str
     predicted_delay_steps: int
+    late_result_policy: str = "discard"
     version: int = PROTOCOL_VERSION
 
 
