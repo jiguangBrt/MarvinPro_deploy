@@ -356,27 +356,178 @@ knot 与静止状态之间存在明显速度变化。当前没有阈值阻止该
 `0.10757 rad/knot` 对应约 `0.538 rad/s` 的离散速度变化量；在 7.5 Hz 下会更大。因此只比较
 `rad/knot` 还不足以评价真机冲击。
 
-### 5.4 优化方向
+2026-08-17 的 10-merge soak 真机测试进一步提供了支持证据。该轮前 8 次 RTC replacement 成功，第 9 次
+因链路长尾迟到而进入 fallback；操作员报告整轮长任务存在明显抽动和卡顿。8 次成功 merge 的最大边界指标为：
 
-1. **把边界指标从诊断升级为准入条件。** 对 position、velocity、acceleration jump 分别设定经过真机验证的
-   阈值；超过阈值的 result 不应直接 merge。
-2. **使用多点衔接而不是单点覆盖。** 可在 anchor 后的 2-3 个 knot 内进行短窗口 blend，使位置、速度至少
-   达到 C1 连续，并检查是否仍保持在 RTC guidance 允许的未来区域内。
-3. **deadline merge 与正常 merge 使用不同规则。** 如果机器人已在 deadline 静止较长时间，旧边界速度
-   接近零，应使用从静止重新启动的衔接约束，而不是沿用正常连续运动 merge 的阈值。
-4. **在物理单位下评价。** 记录 `rad/s`、`rad/s^2` 或更完整的关节速度/加速度估计，同时保留
-   `rad/knot` 便于检查模型序列。
-5. **不要用 safety envelope 代替平滑。** `0.08/0.12 rad` 包络只能限制目标离当前反馈的距离，不能保证
-   相邻 knot 的速度或加速度连续。
-6. **对 blend 后轨迹重新做完整验证。** 包括 finite、URDF limit、相对当前反馈包络、old-tail 边界和
-   timeline version；平滑器不能绕过现有事务与安全门。
+```text
+boundary_velocity_jump_rad = 0.09202511599 rad/knot
+boundary_acceleration_jump_rad = 0.05314748920 rad/knot^2
+effective knot rate = 5 Hz
+等效速度变化量约为 0.460 rad/s
+```
 
-### 5.5 验收指标
+同一轮另外两次较大的速度跳变约为 `0.0440` 和 `0.0429 rad/knot`；作为对照，现场无异常的 2-merge
+短测试约为 `0.0143` 和 `0.0135 rad/knot`。soak 中没有 arm clipping，bridge 平均仍约 `99.49 Hz`，最大
+timer gap 约 `30.1 ms`，最大 tracking error 约 `0.0413 rad`。因此抽动与 merge 边界导数突变一致，不能
+归因于 100 Hz publisher 停顿或关节目标被 clipping。证据见
+[`logs/rtc_v7_soak10_20260817_114935/rollout-soak10.log`](logs/rtc_v7_soak10_20260817_114935/rollout-soak10.log)。
+
+该轮后半段的周期卡顿是另一条故障链：第 9 个请求 wall latency 达到 `372.7 ms`，其中 transport residual
+约 `272.3 ms`，而 server denoise 仍约 `89.3 ms`。结果错过 `d_pred=2` 后被正确丢弃，随后 synchronized
+fallback 的 settle/observe/infer 周期产生停顿。C1 blend 只能治理成功 merge 的抽动，不能替代第 4、6 节的
+延迟和 fallback 治理。
+
+### 5.4 C0、C1 与 C2 的含义
+
+本项目下发的是绝对关节位置。对某一关节，设旧轨迹在接管边界前后为：
+
+```text
+旧轨迹：... q[k-1] ---- q[k] |
+新轨迹：                    | q'[k] ---- q'[k+1] ...
+```
+
+离散 C0 位置连续只要求：
+
+```text
+q'[k] = q[k]
+```
+
+离散 C1 还要求边界两侧的一阶差分一致：
+
+```text
+q'[k+1] - q'[k] = q[k] - q[k-1]
+```
+
+C2 则进一步要求二阶差分，也就是离散加速度，在边界两侧一致。对于当前 5 Hz knot，`rad/knot` 乘以
+`5` 得到对应的 `rad/s`；二阶差分需要再乘以 `5^2` 才能转换为 `rad/s^2`。
+
+这三者不是互斥选项：C1 按定义包含 C0，C2 又包含 C1。不能通过允许位置不连续来换取速度连续。如果
+`q'[k] != q[k]`，绝对位置参考在同一时刻发生阶跃，连续时间导数在该点不存在；100 Hz 位置控制、governor
+或驱动器只会把这一步骤变成一次受限但仍然很快的追赶。即使新 chunk 内部的
+`q'[k+1] - q'[k]` 恰好等于旧速度，也不能消除接管瞬间的位置冲击。
+
+当前 piecewise-linear playback 在每对 5 Hz knot 之间生成 100 Hz 线性位置命令。它可以让位置采样变密，
+但每个 knot 处的线段斜率仍可能突变。要在接管边界获得真正的 C1，必须让进入 blend 的旧速度和离开 blend
+的新速度相等；若还要限制冲击，应进一步约束加速度和 jerk。
+
+### 5.5 RTC 原论文与公开实现的处理方式
+
+Physical Intelligence 的
+[RTC 原论文](https://arxiv.org/abs/2506.07339)把异步 chunk 接管建模为 flow/diffusion inpainting。
+设预测 horizon 为 `H`、本轮执行 horizon 为 `s`、推理延迟为 `d`，其 prefix guidance 分成三段：
+
+```text
+index < d       : weight = 1，推理期间确定会执行的动作被强约束
+d <= index < H-s: weight 从 1 向 0 逐渐衰减，形成 soft overlap
+index >= H-s    : weight = 0，允许新观测自由决定未来动作
+```
+
+新结果返回后，执行器跳过推理期间已经过去的 `new[:d]`，从 `new[d:]` 接管。论文的真实机器人配置是
+`H=50`、`s_min=25`、`beta=5`、delay buffer `b=10`，目标控制频率为 `50 Hz`；因此预测 horizon 约为
+`1 s`，并有约半个 chunk 可用于跨 chunk 过渡。参数和控制频率见
+[论文 PDF 的 Appendix A.5](https://www.pi.website/download/real_time_chunking.pdf)，模拟参考代码见
+[real-time-chunking-kinetix](https://github.com/Physical-Intelligence/real-time-chunking-kinetix)。
+
+Hugging Face 的 [LeRobot RTC 文档](https://huggingface.co/docs/lerobot/en/rtc)采用同一思路。其
+[`ActionQueue.merge`](https://github.com/huggingface/lerobot/blob/main/src/lerobot/policies/rtc/action_queue.py)
+直接用 `new_actions[real_delay:]` 替换未执行队列；
+[`RTCProcessor`](https://github.com/huggingface/lerobot/blob/main/src/lerobot/policies/rtc/modeling_rtc.py)
+在 denoise 阶段对旧 prefix 施加 soft weights。公开代码没有额外的 cubic、quintic 或 Ruckig C1 拼接器。
+
+由论文和代码可以得出一个重要边界：标准 RTC 通过多个相邻位置 action 的一致性，间接降低速度和加速度
+突变，但没有给出“接管处一阶导数严格相等”的数学保证。它是生成阶段的经验平滑，而不是执行端的硬 C1
+约束。当前项目增加 hard anchor 能把数值 C0 误差压到零，但无法弥补 soft overlap 太短或 guidance 不足。
+
+工业轨迹系统通常把这一问题作为独立的 trajectory blending 层处理。例如
+[MoveIt Pro 的轨迹拼接](https://docs.picknik.ai/how_to/robotics_applications/stitch_trajectories/)使用 Ruckig
+在连接点附近生成满足速度、加速度和 jerk 限制的过渡段，并要求输入 waypoint 具有 position、velocity 和
+acceleration。这类方法可作为 RTC 之后的执行安全层，但会修改策略轨迹，因此仍需重新做限位、碰撞和任务
+准确性验证。
+
+### 5.6 当前短 horizon 的定量诊断
+
+当前 OpenPI server 使用官方指数 soft-mask 公式，见 OpenPI
+[`src/openpi/models/pi0.py`](../../OpenPI_UR/openpi/src/openpi/models/pi0.py)。对本次 soak 的常见参数：
+
+```text
+H = 10
+s = 6
+prefix attention horizon = H - s = 4
+d_pred = d_actual = 2
+```
+
+对应的 action 维度权重约为：
+
+```text
+action index   0       1      |    2       3     | 4 ... 9
+RTC weight     1.000   1.000  |  0.368   0.077   | 0
+                               ^
+                         merge 后第一个新动作
+```
+
+index 0、1 在推理期间已经由旧轨迹执行；`d_actual=2` 时，bridge 把当前旧 reference 写入 replacement 的
+index 1，然后向新 chunk 的 index 2 插值。index 2 恰好只有约 `0.368` 的旧 prefix 权重，index 3 又迅速
+降到约 `0.077`。因此只剩两个很弱的过渡点，无法像论文 `H=50` 的长 overlap 那样逐步改变方向。此次
+`0.092 rad/knot` 的速度跳变与这一结构相符。
+
+LeRobot 不覆盖 index 1，但它在接管前最后执行的同样是旧 index 1，随后下发的也是新 index 2。因此删除
+本项目 hard anchor 不会自动恢复 C1；它只会重新引入新旧 index 1 的数值位置误差。真正需要处理的是
+`old[1] -> new[2]` 的边界斜率，以及后续若干点如何平滑回到模型轨迹。
+
+把 action chunk 改成 50 可能显著增加 soft overlap，因此可能缓解该问题，但不能只修改客户端参数：
+
+- 当前 `pi05_marvinpro_red_cones` checkpoint 明确按 `action_horizon=10` 训练；50 点输出需要重新训练或至少
+  针对新 horizon 微调，并同步修改 policy metadata、prefix shape、`s`、`d_max`、bridge 和测试协议；
+- 原论文 50 点运行在 50 Hz，物理 horizon 约 1 秒；本项目当前 effective knot rate 是 5 Hz，直接使用
+  50 点会得到 10 秒物理 horizon；
+- 若照搬 `s=25`，两次新观测影响执行之间会相隔数秒，可能破坏接触和抓取阶段的响应性；
+- 若保持 `s=6`，虽然 overlap 很长，但每轮实际执行的前几个新点仍被旧 prefix 强约束，新观测可能很难在
+  下一 checkpoint 前产生足够影响；
+- 更长 horizon 不能自动修复错误的 `d_pred`。本次 `372.7 ms` 延迟应使用 `d_pred=3`，现有 H=10 已可容纳；
+  若 estimator 仍预测 2，即使 H=50 也会在边界 2 按 discard 策略拒绝结果。
+
+因此 `H=50` 应视为需要重新确定时间尺度的训练实验，而不是部署参数修复。一个较保守的首轮 A/B 候选是
+`H=20、s≈10`：在 5 Hz 下对应约 4 秒预测 horizon，并将 `d=2` 后的 soft transition 从当前 2 点扩展到
+约 8 点。这个参数只是待验证假设，必须用数据集 episode 长度、任务响应性、推理延迟和真机跟踪共同定标。
+
+### 5.7 优化方向
+
+1. **禁止用位置不连续换速度连续。** C0 是绝对位置控制的最低接管条件；任何 post-processing 都必须保留
+   `q_new_start == q_old_current`。
+2. **增加执行端 C1/C2 blend。** 以当前旧轨迹的 `q/v`（必要时包括 `a`）为起点，以新 chunk 中未来
+   2-3 个 knot 的 `q/v` 为终点，在 100 Hz 上生成 cubic Hermite、quintic 或 jerk-limited 过渡段。窗口长度
+   应根据剩余 horizon 和动态限制自适应，不能固定假设总有 3 个可用 knot。
+3. **把边界指标升级为 merge 准入和 blend 可行性条件。** 原始 replacement 或 blend 后轨迹超过 position、
+   velocity、acceleration、jerk、URDF 或 tracking envelope 限制时，不应直接 merge；应继续安全 old tail、
+   固定 hold 或进入明确的 fallback。
+4. **对 blend 后的每个 100 Hz sample 重新验证。** 不能只检查 5 Hz knot；finite、URDF limit、速度、加速度、
+   jerk、相对当前反馈包络、timeline version 和事务 ID 均不能被平滑器绕过。
+5. **deadline merge 使用独立规则。** 如果机器人已经在 deadline 静止，起点速度应按零或可靠反馈估计，使用
+   从静止重新启动的轨迹；不能把正常运动中的旧斜率套到 hold 后的 merge。
+6. **先对 H=10 的 guidance 做离线消融。** 比较 exponential/linear schedule、`beta` 和更早 checkpoint，
+   检查它们能否降低 `new[d]` 的位置及速度偏差。增强 guidance 可以缓解，但不能替代执行端 C1 保证。
+7. **研究 phase-aware checkpoint。** [PACE](https://arxiv.org/abs/2606.00537)根据预测 chunk 的低速阶段动态
+   选择执行 horizon。优先在低速、非接触边界 replan/merge 可降低冲击，但它是 C1 blend 的补充，不是替代。
+8. **将长 overlap 作为独立训练路线。** 从 `H=20、s≈10` 开始，与 H=10 在相同任务和物理时间尺度下 A/B；
+   只有确认响应性、推理成本和数据覆盖后再评估 H=50。
+9. **若已决定重训，评估 learned continuation。** 原 RTC 作者后续的
+   [Training-Time Action Conditioning](https://arxiv.org/abs/2512.05964)在训练时模拟 delay 并直接条件化 action
+   prefix；[REMAC](https://arxiv.org/abs/2601.20130)则用 masked action chunk 和 prefix-preserved sampling
+   同时处理 inter-chunk discontinuity 与 observation/action mismatch。这些方案比部署端不断加 heuristic 更
+   接近模型原生 continuation，但训练和验证成本更高。
+10. **在物理单位下评价。** 同时记录 `rad/knot`、`rad/s`、`rad/s^2`、jerk 以及真实反馈导数，不以
+    `0.08/0.12 rad` 位置包络代替平滑性指标。
+
+### 5.8 验收指标
 
 - merge position jump 恒为 0 或在数值容差内；
 - velocity/acceleration jump 的 p95/max 均有明确上限；
+- blend 起点和终点分别满足 C0/C1；若宣称 C2，则加速度也必须在数值容差内连续；
+- 100 Hz blend sample 的速度、加速度和 jerk 均不超过已确认的真机限制；
 - deadline merge 单独统计，不与正常 staged merge 混合；
 - blend 后所有 knot 仍通过 URDF、finite 和安全包络检查；
+- 对 H=10、候选长 horizon 和不同 soft-mask 分别报告 `new[d]` 的位置、速度及加速度偏差；
+- 在相同物理时间尺度下比较任务响应延迟，不能只用 knot 数判断 H=20/H=50 更平滑；
 - 100 Hz command、真实 joint feedback 和 raw reference 三者在 merge 前后同时画图检查；
 - 操作者盲测和任务成功率验证不能被“位置不跳”单一指标替代。
 
@@ -472,7 +623,8 @@ synchronized fallback 本质上放弃了实时 chunking：每个 chunk 执行完
 |---|---|---|
 | P0 | continuous RTC 作为正式性能基线 | 默认 settled 已确认产生 0.37-1.29 s 周期停顿 |
 | P0 | 分解并治理 transport/wall-latency 尖峰 | 1.56 s 尖峰会触发 deadline hold 和 episode fallback |
-| P1 | 对 hard anchor 增加 C1/C2 连续性与准入阈值 | 当前可接受 `0.10757 rad/knot` 的速度跳变 |
+| P1 | 对 hard anchor 增加 C1/C2 连续性与准入阈值 | 2026-08-17 soak 在 `0.09203 rad/knot` 时出现明显抽动，历史上还接受过 `0.10757` |
+| P1 | 恢复足够的 RTC soft overlap，并 A/B 新 horizon | 当前 H=10/s=6/d=2 在接管后的权重仅约 `0.368, 0.077` |
 | P1 | 找到固定可跟踪 knot rate，减少持续 phase time-warp | 当前 5/7.5 Hz 之上仍会动态降速 |
 | P2 | 将 fallback 故障分类并研究安全的新 RTC epoch | 当前任一异常都会永久退化为 synchronized |
 
@@ -495,7 +647,8 @@ synchronized fallback 本质上放弃了实时 chunking：每个 chunk 执行完
 A: 当前 continuous RTC
 B: continuous RTC + 优化后的稳定延迟链路
 C: B + derivative-aware merge
-D: C + 优化后的 fixed-rate/soft governor
+D: C + 经过重训和离线验证的长 overlap RTC
+E: D + 优化后的 fixed-rate/soft governor
 ```
 
 每个配置至少记录：
@@ -511,3 +664,26 @@ D: C + 优化后的 fixed-rate/soft governor
 
 在这些数据完成前，可以确认 settled、动态时间伸缩、deadline freeze、单点 anchor 和同步 fallback 会降低某些
 性能指标，但不能客观宣称当前系统的堆叠成功率整体低于或高于 PI 原始 RTC。
+
+## 9. 本次 RTC 连续性调研资料
+
+以下资料于 2026-08-17 核对。优先列出论文作者、官方代码和机器人轨迹工具的原始资料：
+
+- Physical Intelligence, [Real-Time Execution of Action Chunking Flow Policies](https://arxiv.org/abs/2506.07339)：
+  RTC 算法、delay-aware freezing、soft prefix inpainting 和异步执行定义；
+- Physical Intelligence, [论文 PDF](https://www.pi.website/download/real_time_chunking.pdf)：真实机器人
+  `H=50`、`s_min=25`、`beta=5`、`b=10` 以及 50 Hz 控制背景；
+- Physical Intelligence,
+  [real-time-chunking-kinetix](https://github.com/Physical-Intelligence/real-time-chunking-kinetix)：公开模拟参考实现；
+- Hugging Face, [LeRobot RTC 文档](https://huggingface.co/docs/lerobot/en/rtc)、
+  [ActionQueue](https://github.com/huggingface/lerobot/blob/main/src/lerobot/policies/rtc/action_queue.py) 和
+  [RTCProcessor](https://github.com/huggingface/lerobot/blob/main/src/lerobot/policies/rtc/modeling_rtc.py)：公开的
+  RTC action queue、real-delay skip 和 denoise guidance 实现；
+- PickNik, [Stitch Trajectories with Smooth Blending](https://docs.picknik.ai/how_to/robotics_applications/stitch_trajectories/)：
+  使用 Ruckig 生成局部 jerk-limited 轨迹过渡的工业实现参考；
+- Nie et al., [PACE: Phase-Aware Chunk Execution](https://arxiv.org/abs/2606.00537)：利用预测速度结构选择低速
+  replan 边界的训练外方法；
+- Black et al., [Training-Time Action Conditioning for Efficient Real-Time Chunking](https://arxiv.org/abs/2512.05964)：
+  在训练阶段模拟 inference delay 并学习 prefix continuation；
+- Wang et al., [Real-Time Robot Execution with Masked Action Chunking](https://arxiv.org/abs/2601.20130)：通过
+  masked action chunking 和 prefix-preserved sampling 同时处理 chunk 间及 chunk 内不一致。
