@@ -50,6 +50,46 @@ class TrajectoryTimelineTest(unittest.TestCase):
                     anchor=knot(0),
                 )
 
+    def test_quintic_replacement_is_c2_at_both_ends(self):
+        timeline = TrajectoryTimeline(tuple(knot(index * 0.01) for index in range(20)), 5.0, 10)
+        actions = tuple(knot(0.2 + index * 0.02) for index in range(20))
+        replacement, phase = timeline.replacement(
+            actions,
+            actual_delay_steps=2,
+            anchor=knot(0.1),
+            blend_knots=3,
+            start_velocity=knot(0.01),
+            start_acceleration=knot(0.0),
+        )
+
+        self.assertEqual(phase, 1.0)
+        self.assertEqual(replacement.value(phase), knot(0.1))
+        start = replacement.phase_kinematics(phase)
+        end = replacement.phase_kinematics(phase + 3.0)
+        for actual, expected in zip(start[1], knot(0.01)):
+            self.assertAlmostEqual(actual, expected)
+        for actual in start[2]:
+            self.assertAlmostEqual(actual, 0.0)
+        for actual, expected in zip(end[0], actions[4]):
+            self.assertAlmostEqual(actual, expected)
+        for actual, expected in zip(end[1], knot(0.02)):
+            self.assertAlmostEqual(actual, expected)
+        for actual in end[2]:
+            self.assertAlmostEqual(actual, 0.0)
+
+    def test_quintic_replacement_must_finish_before_checkpoint(self):
+        timeline = TrajectoryTimeline(tuple(knot(i) for i in range(10)), 5.0, 6)
+
+        with self.assertRaisesRegex(ValueError, "does not fit"):
+            timeline.replacement(
+                tuple(knot(100 + i) for i in range(10)),
+                actual_delay_steps=4,
+                anchor=knot(5),
+                blend_knots=3,
+                start_velocity=knot(1),
+                start_acceleration=knot(0),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

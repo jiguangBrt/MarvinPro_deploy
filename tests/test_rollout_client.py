@@ -15,6 +15,7 @@ from unittest.mock import patch
 import numpy as np
 
 from marvinpro_deploy.protocol import BridgeHello, RobotStateUpdate, TrajectoryEvent, send_message
+from marvinpro_deploy.rtc import RTC_HORIZON
 from marvinpro_deploy.rollout_client import (
     _TrajectoryHeartbeat,
     _actions_tuple,
@@ -59,9 +60,9 @@ class InterpolatedActionPlanTest(unittest.TestCase):
         self.assertIsNone(plan.pop())
 
     def test_trajectory_actions_project_only_grippers_to_policy_domain(self):
-        actions = np.arange(160, dtype=np.float64).reshape(10, 16) / 100.0
-        actions[:, 7] = np.linspace(-0.01, 1.01, 10)
-        actions[:, 15] = np.linspace(1.02, -0.02, 10)
+        actions = np.arange(RTC_HORIZON * 16, dtype=np.float64).reshape(RTC_HORIZON, 16) / 100.0
+        actions[:, 7] = np.linspace(-0.01, 1.01, RTC_HORIZON)
+        actions[:, 15] = np.linspace(1.02, -0.02, RTC_HORIZON)
         original_arms = np.concatenate((actions[:, :7], actions[:, 8:15]), axis=1).copy()
 
         prepared = np.asarray(_actions_tuple(actions))
@@ -361,7 +362,7 @@ class RolloutArgumentTest(unittest.TestCase):
                 "--playback-time-scale",
                 "2",
                 "--execute-steps",
-                "10",
+                str(RTC_HORIZON),
                 "--chunk-prefetch-seconds",
                 "0.30",
             ]
@@ -437,7 +438,7 @@ class RolloutArgumentTest(unittest.TestCase):
                 "--playback-time-scale",
                 "2",
                 "--execute-steps",
-                "10",
+                str(RTC_HORIZON),
             ]
         )
 
@@ -472,7 +473,7 @@ class RolloutArgumentTest(unittest.TestCase):
                 "--playback-time-scale",
                 "3",
                 "--execute-steps",
-                "10",
+                str(RTC_HORIZON),
                 "--max-rtc-merges",
                 "2",
                 "--rtc-continuous",
@@ -501,7 +502,7 @@ class RolloutArgumentTest(unittest.TestCase):
                 "--playback-time-scale",
                 "3",
                 "--execute-steps",
-                "10",
+                str(RTC_HORIZON),
                 "--rtc-late-result-policy",
                 "wait",
             ]

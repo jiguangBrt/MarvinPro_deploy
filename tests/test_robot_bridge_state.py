@@ -99,6 +99,9 @@ def test_bridge_cli_uses_current_governor_and_safety_envelope_defaults():
     assert args.tracking_run_error_rad == 0.02
     assert args.tracking_resume_error_rad == 0.12
     assert args.tracking_stop_error_rad == 0.16
+    assert args.rtc_blend_max_velocity_rad_s == 0.45
+    assert args.rtc_blend_max_acceleration_rad_s2 == 2.0
+    assert args.rtc_blend_max_jerk_rad_s3 == 20.0
 
 
 def test_bridge_cli_rejects_validation_envelope_below_trajectory_clipping_envelope():
@@ -162,6 +165,12 @@ def _bare_node():
     node._arm_clipped = False
     node._frozen_reason = None
     node._late_result_policy = "discard"
+    node.publish_hz = 100.0
+    node.max_joint_step_rad = 0.16
+    node.joint_limit_margin_rad = 0.02
+    node.rtc_blend_max_velocity_rad_s = 0.45
+    node.rtc_blend_max_acceleration_rad_s2 = 2.0
+    node.rtc_blend_max_jerk_rad_s3 = 20.0
     node._gripper_l_velocity = None
     node._gripper_r_velocity = None
     node._gripper_l_torque = None
@@ -360,6 +369,41 @@ def test_wait_policy_keeps_deadline_epoch_mergeable_for_comparison():
     assert node._trajectory_plan_id == "replacement"
 
 
+def test_infeasible_deadline_blend_invalidates_rtc_without_replacing_timeline():
+    node = _active_rtc_deadline_node("wait")
+    original_timeline = node._timeline
+    node._advance_trajectory_locked(1.0, 0.20, 1.0)
+    node._validate_trajectory_knots_locked = lambda timeline: None
+    node._governor = types.SimpleNamespace(reset=lambda: None)
+
+    message = robot_bridge.StageRtcChunkCommand(
+        command_id=2,
+        session_id="session",
+        base_plan_id="plan",
+        replacement_plan_id="unsafe-replacement",
+        timeline_version=1,
+        checkpoint_id=1,
+        request_id="request",
+        predicted_delay_steps=1,
+        execution_horizon=6,
+        actions=tuple(_action(0.5 + index * 0.01) for index in range(10)),
+    )
+    try:
+        node._accept_stage_rtc_locked(message, 1.1)
+    except robot_bridge.SafetyError as exc:
+        assert "blend is infeasible" in str(exc)
+    else:
+        raise AssertionError("unsafe RTC blend was accepted")
+
+    event_types = [event.event_type for event in node._events]
+    assert "rtc_invalid" in event_types
+    assert event_types[-1] == "rtc_invalid"
+    assert "blend is infeasible" in node._events[-1].detail
+    assert node._inference_invalid
+    assert node._trajectory_plan_id == "plan"
+    assert node._timeline is original_timeline
+
+
 def test_checkpoint_requires_fresh_feedback_at_a3_for_full_settle_window():
     node = _bare_node()
     node._trajectory_session_id = "session"
@@ -479,7 +523,7 @@ def test_continuous_checkpoint_does_not_pause_and_accounts_for_elapsed_knots():
 
     node._validate_trajectory_knots_locked = lambda timeline: None
     node._governor = types.SimpleNamespace(reset=lambda: None)
-    rtc_knots = tuple(_action(0.02 + index * 0.004) for index in range(10))
+    rtc_knots = tuple(_action(0.066 + index * 0.004) for index in range(10))
     node._accept_stage_rtc_locked(
         robot_bridge.StageRtcChunkCommand(
             command_id=3,
@@ -581,6 +625,9 @@ def test_fake_bridge_checkpoint_resume_and_atomic_rtc_merge(monkeypatch):
         tracking_stop_error_rad=0.16,
         tracking_tolerance_rad=0.01,
         tracking_settle_seconds=0.20,
+        rtc_blend_max_velocity_rad_s=0.45,
+        rtc_blend_max_acceleration_rad_s2=2.0,
+        rtc_blend_max_jerk_rad_s3=20.0,
     )
     node._client_connected = True
     node._joints = (0.0,) * 14
@@ -611,7 +658,9 @@ def test_fake_bridge_checkpoint_resume_and_atomic_rtc_merge(monkeypatch):
         motion_gate_open=True,
         gate_reason="ready",
     )
-    old_knots = tuple(_arm_action(index * 0.005) for index in range(10))
+    old_knots = tuple(
+        _arm_action(index * 0.005) for index in range(robot_bridge.RTC_HORIZON)
+    )
     node.accept_command(
         robot_bridge.LoadTrajectoryCommand(
             command_id=1,
@@ -621,12 +670,12 @@ def test_fake_bridge_checkpoint_resume_and_atomic_rtc_merge(monkeypatch):
             expected_timeline_version=0,
             knots=old_knots,
             knot_hz=5.0,
-            checkpoint_horizon=6,
+            checkpoint_horizon=robot_bridge.RTC_EXECUTION_HORIZON,
             execute=True,
         )
     )
 
-    for _ in range(200):
+    for _ in range(300):
         raw = node._trajectory_reference_locked()
         node._joints = robot_bridge.action_arms(raw)
         node._joints_t = clock[0]
@@ -640,9 +689,9 @@ def test_fake_bridge_checkpoint_resume_and_atomic_rtc_merge(monkeypatch):
         clock[0] += 0.01
 
     checkpoint = next(event for event in node._events if event.event_type == "checkpoint_ready")
-    assert checkpoint.phase == 5.0
+    assert checkpoint.phase == 9.0
     assert checkpoint.checkpoint_id == 1
-    assert checkpoint.old_remaining_actions_absolute == old_knots[6:]
+    assert checkpoint.old_remaining_actions_absolute == old_knots[10:]
     assert clock[0] - 100.0 > 0.20
 
     node.accept_command(
@@ -656,7 +705,9 @@ def test_fake_bridge_checkpoint_resume_and_atomic_rtc_merge(monkeypatch):
             predicted_delay_steps=2,
         )
     )
-    rtc_knots = tuple(_arm_action(0.030 + index * 0.004) for index in range(10))
+    rtc_knots = tuple(
+        _arm_action(0.050 + index * 0.004) for index in range(robot_bridge.RTC_HORIZON)
+    )
     node.accept_command(
         robot_bridge.StageRtcChunkCommand(
             command_id=3,
@@ -667,7 +718,7 @@ def test_fake_bridge_checkpoint_resume_and_atomic_rtc_merge(monkeypatch):
             checkpoint_id=1,
             request_id="request",
             predicted_delay_steps=2,
-            execution_horizon=6,
+            execution_horizon=robot_bridge.RTC_EXECUTION_HORIZON,
             actions=rtc_knots,
         )
     )
@@ -691,8 +742,12 @@ def test_fake_bridge_checkpoint_resume_and_atomic_rtc_merge(monkeypatch):
     assert node._trajectory_plan_id == "new-plan"
     assert node._timeline_version == 2
     assert node._phase == 0.0
-    assert node._timeline.knots[0] == old_knots[6]
+    assert node._timeline.knots[0] == old_knots[10]
     assert all(abs(value - 0.005) < 1e-12 for value in merged.boundary_old_velocity)
     assert all(abs(value - 0.004) < 1e-12 for value in merged.boundary_new_velocity)
     assert abs(merged.boundary_velocity_jump_rad - 0.001) < 1e-12
     assert merged.boundary_acceleration_jump_rad < 1e-12
+    assert merged.blend_duration_knots == 3
+    assert merged.blend_max_velocity_rad_s <= 0.45
+    assert merged.blend_max_acceleration_rad_s2 <= 2.0
+    assert merged.blend_max_jerk_rad_s3 <= 20.0

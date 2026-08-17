@@ -6,7 +6,7 @@ M6-S-{L,R}-CCS-696-V4 URDF on 6.6.7.100 (checked 2026-08-05).
 
 from __future__ import annotations
 
-PROTOCOL_VERSION = 7
+PROTOCOL_VERSION = 8
 DEFAULT_BRIDGE_HOST = "6.6.7.100"
 DEFAULT_BRIDGE_PORT = 7332
 DEFAULT_POLICY_HOST = "192.168.50.73"
@@ -59,6 +59,9 @@ JOINT_UPPER = (
     1.0472,
     1.5708,
 )
+# Both active M6-S-{L,R}-CCS-696-V4 URDFs specify 3.1416 rad/s for
+# Joint1..Joint7. Deployment may impose a lower RTC blend cap.
+JOINT_VELOCITY = (3.1416,) * 14
 
 TOPIC_JOINT_STATES = "/joint_states"
 # DM driver layout verified from the installed controller source on 2026-08-11:

@@ -136,6 +136,10 @@ class TrajectoryEvent:
     boundary_velocity_jump_rad: float | None = None
     boundary_acceleration_jump_rad: float | None = None
     continuous_checkpoint: bool = False
+    blend_duration_knots: int | None = None
+    blend_max_velocity_rad_s: float | None = None
+    blend_max_acceleration_rad_s2: float | None = None
+    blend_max_jerk_rad_s3: float | None = None
 
 
 @dataclass(frozen=True)

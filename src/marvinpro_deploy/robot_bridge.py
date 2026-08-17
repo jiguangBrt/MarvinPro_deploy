@@ -34,6 +34,7 @@ from .config import (
     DEFAULT_BRIDGE_PORT,
     JOINT_LOWER,
     JOINT_UPPER,
+    JOINT_VELOCITY,
     READY_STATE,
     TOPIC_ARM_STATE,
     TOPIC_GRIPPER_CMD_L,
@@ -65,6 +66,7 @@ from .protocol import (
     require_current_version,
     send_message,
 )
+from .rtc import RTC_EXECUTION_HORIZON, RTC_HORIZON
 from .safety import SafetyError, action_arms, filter_action, validate_action
 from .tracking import TrackingGovernor
 from .trajectory_timeline import TrajectoryTimeline
@@ -126,6 +128,9 @@ class MarvinBridgeNode(Node):
         tracking_stop_error_rad: float,
         tracking_tolerance_rad: float,
         tracking_settle_seconds: float,
+        rtc_blend_max_velocity_rad_s: float,
+        rtc_blend_max_acceleration_rad_s2: float,
+        rtc_blend_max_jerk_rad_s3: float,
     ) -> None:
         super().__init__("marvinpro_rollout_bridge")
         self.allow_motion = allow_motion
@@ -141,6 +146,9 @@ class MarvinBridgeNode(Node):
         self.trajectory_heartbeat_timeout_s = trajectory_heartbeat_timeout_s
         self.tracking_tolerance_rad = tracking_tolerance_rad
         self.tracking_settle_seconds = tracking_settle_seconds
+        self.rtc_blend_max_velocity_rad_s = rtc_blend_max_velocity_rad_s
+        self.rtc_blend_max_acceleration_rad_s2 = rtc_blend_max_acceleration_rad_s2
+        self.rtc_blend_max_jerk_rad_s3 = rtc_blend_max_jerk_rad_s3
         self._governor = TrackingGovernor(
             run_error_rad=tracking_run_error_rad,
             resume_error_rad=tracking_resume_error_rad,
@@ -401,6 +409,10 @@ class MarvinBridgeNode(Node):
         boundary_new_velocity: tuple[float, ...] = (),
         boundary_velocity_jump_rad: float | None = None,
         boundary_acceleration_jump_rad: float | None = None,
+        blend_duration_knots: int | None = None,
+        blend_max_velocity_rad_s: float | None = None,
+        blend_max_acceleration_rad_s2: float | None = None,
+        blend_max_jerk_rad_s3: float | None = None,
         detail: str = "",
     ) -> None:
         resolved_session_id = session_id or self._trajectory_session_id
@@ -441,6 +453,10 @@ class MarvinBridgeNode(Node):
             boundary_velocity_jump_rad=boundary_velocity_jump_rad,
             boundary_acceleration_jump_rad=boundary_acceleration_jump_rad,
             continuous_checkpoint=getattr(self, "_continuous_checkpoint", False),
+            blend_duration_knots=blend_duration_knots,
+            blend_max_velocity_rad_s=blend_max_velocity_rad_s,
+            blend_max_acceleration_rad_s2=blend_max_acceleration_rad_s2,
+            blend_max_jerk_rad_s3=blend_max_jerk_rad_s3,
         )
         self._events.append(event)
         self.get_logger().info(
@@ -456,6 +472,10 @@ class MarvinBridgeNode(Node):
             f"boundary_new_velocity={event.boundary_new_velocity} "
             f"boundary_velocity_jump_rad={event.boundary_velocity_jump_rad} "
             f"boundary_acceleration_jump_rad={event.boundary_acceleration_jump_rad} "
+            f"blend_duration_knots={event.blend_duration_knots} "
+            f"blend_max_velocity_rad_s={event.blend_max_velocity_rad_s} "
+            f"blend_max_acceleration_rad_s2={event.blend_max_acceleration_rad_s2} "
+            f"blend_max_jerk_rad_s3={event.blend_max_jerk_rad_s3} "
             f"raw_reference={event.raw_reference} sent_target={event.sent_target} detail={event.detail!r}"
         )
         if len(self._events) > 128:
@@ -619,6 +639,59 @@ class MarvinBridgeNode(Node):
                 joint_limit_margin_rad=self.joint_limit_margin_rad,
             )
 
+    def _validate_rtc_blend_locked(
+        self, timeline: TrajectoryTimeline
+    ) -> tuple[float, float, float]:
+        blend = timeline.blend
+        if blend is None:
+            raise SafetyError("RTC replacement is missing its C1/C2 blend")
+        duration_s = blend.duration_phases / timeline.knot_hz
+        sample_count = max(1, int(math.ceil(duration_s * self.publish_hz)))
+        max_velocity = 0.0
+        max_acceleration = 0.0
+        max_jerk = 0.0
+        for sample_index in range(sample_count + 1):
+            fraction = sample_index / sample_count
+            phase = blend.start_phase + blend.duration_phases * fraction
+            position, velocity_phase, acceleration_phase, jerk_phase = blend.kinematics(phase)
+            validate_action(
+                position,
+                action_arms(position),
+                max_joint_step_rad=self.max_joint_step_rad,
+                joint_limit_margin_rad=self.joint_limit_margin_rad,
+            )
+            arm_velocity = tuple(abs(value) * timeline.knot_hz for value in action_arms(velocity_phase))
+            arm_acceleration = tuple(
+                abs(value) * timeline.knot_hz**2 for value in action_arms(acceleration_phase)
+            )
+            arm_jerk = tuple(abs(value) * timeline.knot_hz**3 for value in action_arms(jerk_phase))
+            velocity = max(arm_velocity)
+            acceleration = max(arm_acceleration)
+            jerk = max(arm_jerk)
+            max_velocity = max(max_velocity, velocity)
+            max_acceleration = max(max_acceleration, acceleration)
+            max_jerk = max(max_jerk, jerk)
+            for joint_index, (value, urdf_limit) in enumerate(zip(arm_velocity, JOINT_VELOCITY)):
+                limit = min(urdf_limit, self.rtc_blend_max_velocity_rad_s)
+                if value > limit + 1e-9:
+                    raise SafetyError(
+                        f"RTC blend joint {joint_index} velocity {value:.5f}rad/s exceeds "
+                        f"{limit:.5f}rad/s at 100Hz sample {sample_index}/{sample_count}"
+                    )
+            if acceleration > self.rtc_blend_max_acceleration_rad_s2 + 1e-9:
+                raise SafetyError(
+                    f"RTC blend acceleration {acceleration:.5f}rad/s^2 exceeds "
+                    f"{self.rtc_blend_max_acceleration_rad_s2:.5f}rad/s^2 at 100Hz sample "
+                    f"{sample_index}/{sample_count}"
+                )
+            if jerk > self.rtc_blend_max_jerk_rad_s3 + 1e-9:
+                raise SafetyError(
+                    f"RTC blend jerk {jerk:.5f}rad/s^3 exceeds "
+                    f"{self.rtc_blend_max_jerk_rad_s3:.5f}rad/s^3 at 100Hz sample "
+                    f"{sample_index}/{sample_count}"
+                )
+        return max_velocity, max_acceleration, max_jerk
+
     def _accept_load_trajectory_locked(self, message: LoadTrajectoryCommand, now: float) -> None:
         require_current_version(message)
         if not message.execute:
@@ -637,11 +710,13 @@ class MarvinBridgeNode(Node):
             )
         timeline = TrajectoryTimeline(message.knots, message.knot_hz, message.checkpoint_horizon)
         self._validate_trajectory_knots_locked(timeline)
-        if timeline.horizon != 10:
-            raise SafetyError("trajectory mode currently requires horizon 10")
+        if timeline.horizon != RTC_HORIZON:
+            raise SafetyError(f"trajectory mode currently requires horizon {RTC_HORIZON}")
         continuous_checkpoint = bool(getattr(message, "continuous_checkpoint", False))
-        if continuous_checkpoint and timeline.checkpoint_horizon != 6:
-            raise SafetyError("continuous checkpoints require execution horizon 6")
+        if continuous_checkpoint and timeline.checkpoint_horizon != RTC_EXECUTION_HORIZON:
+            raise SafetyError(
+                f"continuous checkpoints require execution horizon {RTC_EXECUTION_HORIZON}"
+            )
         assert self._joints is not None
         self._clear_target_locked("trajectory ownership enabled")
         self._trajectory_session_id = message.session_id
@@ -755,44 +830,78 @@ class MarvinBridgeNode(Node):
         old_timeline = self._timeline
         old_phase = self._phase
         anchor = self._raw_reference
-        timeline, phase = old_timeline.replacement(
+        if old_phase is None or abs(old_phase - round(old_phase)) > 1e-6:
+            raise SafetyError("RTC replacement must occur at an integer knot boundary")
+        anchored_timeline, phase = old_timeline.replacement(
             message.actions,
             actual_delay_steps=self._actual_delay_steps,
             anchor=anchor,
         )
-        self._validate_trajectory_knots_locked(timeline)
+        self._validate_trajectory_knots_locked(anchored_timeline)
+        _, start_velocity, start_acceleration, _ = old_timeline.phase_kinematics(
+            old_phase, side="left"
+        )
+        if self._trajectory_paused and self._pause_kind == "rtc_deadline":
+            start_velocity = (0.0,) * 16
+            start_acceleration = (0.0,) * 16
+
+        timeline = None
+        blend_metrics = None
+        blend_errors = []
+        for blend_knots in (3, 2):
+            try:
+                candidate, candidate_phase = old_timeline.replacement(
+                    message.actions,
+                    actual_delay_steps=self._actual_delay_steps,
+                    anchor=anchor,
+                    blend_knots=blend_knots,
+                    start_velocity=start_velocity,
+                    start_acceleration=start_acceleration,
+                )
+                self._validate_trajectory_knots_locked(candidate)
+                candidate_metrics = self._validate_rtc_blend_locked(candidate)
+            except (SafetyError, ValueError) as exc:
+                blend_errors.append(f"{blend_knots}-knot: {exc}")
+                continue
+            timeline = candidate
+            phase = candidate_phase
+            blend_metrics = (blend_knots, *candidate_metrics)
+            break
+        if timeline is None or blend_metrics is None:
+            raise SafetyError("RTC C1/C2 blend is infeasible (" + "; ".join(blend_errors) + ")")
+
         boundary_old_velocity: tuple[float, ...] = ()
         boundary_new_velocity: tuple[float, ...] = ()
         boundary_velocity_jump_rad = None
         boundary_acceleration_jump_rad = None
-        if old_phase is not None and abs(old_phase - round(old_phase)) <= 1e-6:
-            old_index = round(old_phase)
-            if old_index >= 2 and phase + 2.0 <= timeline.final_phase:
-                old_anchor = action_arms(anchor)
-                old_previous = action_arms(old_timeline.value(old_index - 1))
-                old_before_previous = action_arms(old_timeline.value(old_index - 2))
-                new_next = action_arms(timeline.value(phase + 1.0))
-                new_after_next = action_arms(timeline.value(phase + 2.0))
-                boundary_old_velocity = tuple(
-                    current - previous for current, previous in zip(old_anchor, old_previous)
-                )
-                boundary_new_velocity = tuple(
-                    current - previous for current, previous in zip(new_next, old_anchor)
-                )
-                old_acceleration = tuple(
-                    current - 2.0 * previous + before
-                    for current, previous, before in zip(old_anchor, old_previous, old_before_previous)
-                )
-                new_acceleration = tuple(
-                    after - 2.0 * current + previous
-                    for after, current, previous in zip(new_after_next, new_next, old_anchor)
-                )
-                boundary_velocity_jump_rad = max(
-                    abs(new - old) for old, new in zip(boundary_old_velocity, boundary_new_velocity)
-                )
-                boundary_acceleration_jump_rad = max(
-                    abs(new - old) for old, new in zip(old_acceleration, new_acceleration)
-                )
+        old_index = round(old_phase)
+        if old_index >= 2 and phase + 2.0 <= anchored_timeline.final_phase:
+            old_anchor = action_arms(anchor)
+            old_previous = action_arms(old_timeline.value(old_index - 1))
+            old_before_previous = action_arms(old_timeline.value(old_index - 2))
+            new_next = action_arms(anchored_timeline.value(phase + 1.0))
+            new_after_next = action_arms(anchored_timeline.value(phase + 2.0))
+            boundary_old_velocity = tuple(
+                current - previous for current, previous in zip(old_anchor, old_previous)
+            )
+            boundary_new_velocity = tuple(
+                current - previous for current, previous in zip(new_next, old_anchor)
+            )
+            old_acceleration = tuple(
+                current - 2.0 * previous + before
+                for current, previous, before in zip(old_anchor, old_previous, old_before_previous)
+            )
+            new_acceleration = tuple(
+                after - 2.0 * current + previous
+                for after, current, previous in zip(new_after_next, new_next, old_anchor)
+            )
+            boundary_velocity_jump_rad = max(
+                abs(new - old) for old, new in zip(boundary_old_velocity, boundary_new_velocity)
+            )
+            boundary_acceleration_jump_rad = max(
+                abs(new - old) for old, new in zip(old_acceleration, new_acceleration)
+            )
+        blend_duration_knots, blend_max_velocity, blend_max_acceleration, blend_max_jerk = blend_metrics
         old_plan_id = self._trajectory_plan_id
         self._timeline = timeline
         self._trajectory_plan_id = message.replacement_plan_id
@@ -824,7 +933,14 @@ class MarvinBridgeNode(Node):
             boundary_new_velocity=boundary_new_velocity,
             boundary_velocity_jump_rad=boundary_velocity_jump_rad,
             boundary_acceleration_jump_rad=boundary_acceleration_jump_rad,
-            detail=f"replaced {old_plan_id} with {message.replacement_plan_id}",
+            blend_duration_knots=blend_duration_knots,
+            blend_max_velocity_rad_s=blend_max_velocity,
+            blend_max_acceleration_rad_s2=blend_max_acceleration,
+            blend_max_jerk_rad_s3=blend_max_jerk,
+            detail=(
+                f"replaced {old_plan_id} with {message.replacement_plan_id} using "
+                f"{blend_duration_knots}-knot quintic C2 blend"
+            ),
         )
 
     def _accept_stage_rtc_locked(self, message: StageRtcChunkCommand, now: float) -> None:
@@ -848,7 +964,11 @@ class MarvinBridgeNode(Node):
         self._validate_trajectory_knots_locked(candidate)
         self._last_command_id = message.command_id
         if self._trajectory_paused and self._pause_kind == "rtc_deadline":
-            self._apply_rtc_replacement_locked(message, now)
+            try:
+                self._apply_rtc_replacement_locked(message, now)
+            except (SafetyError, ValueError) as exc:
+                self._invalidate_active_rtc_locked(now, str(exc))
+                raise
             return
         if self._pending_rtc is not None:
             raise SafetyError("an RTC replacement is already staged")
@@ -1488,6 +1608,9 @@ def serve(args: argparse.Namespace) -> int:
         tracking_stop_error_rad=args.tracking_stop_error_rad,
         tracking_tolerance_rad=args.tracking_tolerance_rad,
         tracking_settle_seconds=args.tracking_settle_seconds,
+        rtc_blend_max_velocity_rad_s=args.rtc_blend_max_velocity_rad_s,
+        rtc_blend_max_acceleration_rad_s2=args.rtc_blend_max_acceleration_rad_s2,
+        rtc_blend_max_jerk_rad_s3=args.rtc_blend_max_jerk_rad_s3,
     )
     executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
@@ -1537,6 +1660,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--tracking-stop-error-rad", type=float, default=0.16)
     parser.add_argument("--tracking-tolerance-rad", type=float, default=0.01)
     parser.add_argument("--tracking-settle-seconds", type=float, default=0.20)
+    parser.add_argument("--rtc-blend-max-velocity-rad-s", type=float, default=0.45)
+    parser.add_argument("--rtc-blend-max-acceleration-rad-s2", type=float, default=2.0)
+    parser.add_argument("--rtc-blend-max-jerk-rad-s3", type=float, default=20.0)
     args = parser.parse_args(argv)
     if args.publish_hz <= 0 or args.command_timeout <= 0 or args.duration <= 0:
         parser.error("rates, timeouts, and duration must be positive")
@@ -1561,8 +1687,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.trajectory_heartbeat_timeout,
         args.tracking_tolerance_rad,
         args.tracking_settle_seconds,
+        args.rtc_blend_max_velocity_rad_s,
+        args.rtc_blend_max_acceleration_rad_s2,
+        args.rtc_blend_max_jerk_rad_s3,
     ) <= 0:
         parser.error("trajectory timeouts and tracking parameters must be positive")
+    if args.rtc_blend_max_velocity_rad_s > min(JOINT_VELOCITY):
+        parser.error(
+            "--rtc-blend-max-velocity-rad-s cannot exceed the active URDF joint velocity limit "
+            f"({min(JOINT_VELOCITY):.4f} rad/s)"
+        )
     return args
 
 

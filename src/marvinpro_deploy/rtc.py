@@ -11,8 +11,8 @@ import numpy as np
 
 
 RTC_REQUEST_TYPE = "rtc_v1"
-RTC_HORIZON = 10
-RTC_EXECUTION_HORIZON = 6
+RTC_HORIZON = 20
+RTC_EXECUTION_HORIZON = 10
 RTC_MAX_DELAY = 4
 
 
@@ -159,7 +159,9 @@ def parse_rtc_response(result: dict, *, request: dict) -> tuple[np.ndarray, dict
             raise RtcError(f"RTC response {key} mismatch: {result.get(key)!r} != {request.get(key)!r}")
     actions = np.asarray(result.get("actions"), dtype=np.float64)
     if actions.shape != (RTC_HORIZON, 16) or not np.isfinite(actions).all():
-        raise RtcError(f"RTC actions must have shape (10, 16) and be finite, got {actions.shape}")
+        raise RtcError(
+            f"RTC actions must have shape ({RTC_HORIZON}, 16) and be finite, got {actions.shape}"
+        )
     timing = {
         "wall_ms": (time.monotonic() - float(request["client_request_monotonic"])) * 1000.0,
         "client_timing": result.get("client_timing", {}),

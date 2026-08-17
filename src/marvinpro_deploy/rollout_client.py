@@ -357,7 +357,9 @@ class RobotConnection:
                                 "reference_delta=%s arm_clipped=%s frozen=%s continuous_checkpoint=%s "
                                 "raw_reference=%s "
                                 "sent_target=%s boundary_old_velocity=%s boundary_new_velocity=%s "
-                                "boundary_velocity_jump_rad=%s boundary_acceleration_jump_rad=%s detail=%r",
+                                "boundary_velocity_jump_rad=%s boundary_acceleration_jump_rad=%s "
+                                "blend_duration_knots=%s blend_max_velocity_rad_s=%s "
+                                "blend_max_acceleration_rad_s2=%s blend_max_jerk_rad_s3=%s detail=%r",
                                 message.event_type,
                                 message.event_seq,
                                 message.session_id,
@@ -382,6 +384,10 @@ class RobotConnection:
                                 getattr(message, "boundary_new_velocity", ()),
                                 getattr(message, "boundary_velocity_jump_rad", None),
                                 getattr(message, "boundary_acceleration_jump_rad", None),
+                                getattr(message, "blend_duration_knots", None),
+                                getattr(message, "blend_max_velocity_rad_s", None),
+                                getattr(message, "blend_max_acceleration_rad_s2", None),
+                                getattr(message, "blend_max_jerk_rad_s3", None),
                                 message.detail,
                             )
                     else:
@@ -2051,7 +2057,9 @@ def _run_trajectory_schedule(
                 stage_merge_ms = (time.monotonic() - stage_started) * 1000.0
                 LOGGER.info(
                     "RTC merged request=%s d_actual=%s version=%d stage_send_ms=%.3f stage_merge_ms=%.3f "
-                    "boundary_velocity_jump_rad=%s boundary_acceleration_jump_rad=%s",
+                    "boundary_velocity_jump_rad=%s boundary_acceleration_jump_rad=%s "
+                    "blend_duration_knots=%s blend_max_velocity_rad_s=%s "
+                    "blend_max_acceleration_rad_s2=%s blend_max_jerk_rad_s3=%s",
                     request_id,
                     merged.actual_delay_steps,
                     merged.timeline_version,
@@ -2059,6 +2067,10 @@ def _run_trajectory_schedule(
                     stage_merge_ms,
                     merged.boundary_velocity_jump_rad,
                     merged.boundary_acceleration_jump_rad,
+                    merged.blend_duration_knots,
+                    merged.blend_max_velocity_rad_s,
+                    merged.blend_max_acceleration_rad_s2,
+                    merged.blend_max_jerk_rad_s3,
                 )
                 heartbeat.update_version(merged.timeline_version)
                 rtc_merge_count += 1
@@ -2626,8 +2638,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         or args.exit_mode_timeout <= 0
     ):
         parser.error("episode duration and control rate must be positive")
-    if not 1 <= args.execute_steps <= 10:
-        parser.error("--execute-steps must be in [1, 10] for this checkpoint")
+    if not 1 <= args.execute_steps <= RTC_HORIZON:
+        parser.error(f"--execute-steps must be in [1, {RTC_HORIZON}] for this checkpoint")
     if args.playback_mode == "discrete" and not 0 <= args.prefetch_steps < args.execute_steps:
         parser.error("--prefetch-steps must be >=0 and smaller than --execute-steps")
     if args.chunk_prefetch_seconds < 0:
@@ -2663,7 +2675,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                 "--playback-time-scale 3 (fixed 5 Hz knot rate)"
             )
         if args.execute_steps != RTC_HORIZON:
-            parser.error("tracking/rtc requires --execute-steps 10")
+            parser.error(f"tracking/rtc requires --execute-steps {RTC_HORIZON}")
     if args.rtc_shadow and args.rollout_schedule != "rtc":
         parser.error("--rtc-shadow requires --rollout-schedule rtc")
     if args.rtc_continuous and args.rollout_schedule != "rtc":

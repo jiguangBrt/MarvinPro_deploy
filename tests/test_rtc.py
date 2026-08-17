@@ -77,7 +77,7 @@ class RtcClientTest(unittest.TestCase):
             predicted_delay_steps=2,
         )
         self.assertEqual(request["d_pred"], 2)
-        self.assertEqual(request["s"], 6)
+        self.assertEqual(request["s"], RTC_EXECUTION_HORIZON)
         self.assertEqual(request["schedule"], "exp")
         self.assertEqual(request["beta"], 5.0)
         self.assertNotIn("predicted_delay_steps", request)
@@ -87,11 +87,11 @@ class RtcClientTest(unittest.TestCase):
             "plan_id": "plan",
             "timeline_version": 3,
             "checkpoint_id": 4,
-            "actions": np.zeros((10, 16)),
+            "actions": np.zeros((RTC_HORIZON, 16)),
             "client_timing": {"request_serialization_ms": 1.0},
         }
         actions, timing = parse_rtc_response(response, request=request)
-        self.assertEqual(actions.shape, (10, 16))
+        self.assertEqual(actions.shape, (RTC_HORIZON, 16))
         self.assertEqual(timing["client_timing"]["request_serialization_ms"], 1.0)
 
         response["timeline_version"] = 2

@@ -15,6 +15,7 @@ from marvinpro_deploy.protocol import (
     require_current_version,
     send_message,
 )
+from marvinpro_deploy.rtc import RTC_EXECUTION_HORIZON, RTC_HORIZON
 
 
 class ProtocolTest(unittest.TestCase):
@@ -61,6 +62,10 @@ class ProtocolTest(unittest.TestCase):
                 boundary_velocity_jump_rad=0.01,
                 boundary_acceleration_jump_rad=0.03,
                 continuous_checkpoint=True,
+                blend_duration_knots=3,
+                blend_max_velocity_rad_s=0.2,
+                blend_max_acceleration_rad_s2=0.8,
+                blend_max_jerk_rad_s3=4.0,
             ),
             LoadTrajectoryCommand(
                 command_id=3,
@@ -68,9 +73,9 @@ class ProtocolTest(unittest.TestCase):
                 session_id="session",
                 plan_id="plan",
                 expected_timeline_version=1,
-                knots=((0.0,) * 16,) * 10,
+                knots=((0.0,) * 16,) * RTC_HORIZON,
                 knot_hz=5.0,
-                checkpoint_horizon=6,
+                checkpoint_horizon=RTC_EXECUTION_HORIZON,
                 execute=True,
                 continuous_checkpoint=True,
             ),
