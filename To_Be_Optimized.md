@@ -29,12 +29,12 @@
 当前固定参数为：
 
 ```text
-H = 10
-s = 6
-old tail = H - s = 4 knots
+H = 20
+s = 10
+old tail = H - s = 10 knots
 d_pred <= 4
 model/data rate = 15 Hz
-effective knot rate = 15 / playback_time_scale = 7.5 Hz 或 5 Hz
+effective knot rate = 15 / playback_time_scale = 5 Hz
 bridge interpolation/publish rate = 100 Hz
 ```
 
@@ -45,7 +45,7 @@ bridge interpolation/publish rate = 100 Hz
 
 ### 2.1 当前行为
 
-RTC 轨迹在 phase 到达 execution horizon `s=6` 的 checkpoint 后有两种模式：
+RTC 轨迹在 phase 到达 execution horizon `s=10` 的 checkpoint 后有两种模式：
 
 - 默认 settled 模式：固定在 checkpoint reference，等待真实关节跟踪到位；
 - `--rtc-continuous` 模式：发出 checkpoint 事件后继续执行旧轨迹 tail，不等待 settle。
@@ -63,10 +63,10 @@ joint source timestamp 持续前进
 
 ### 2.2 为什么它有用
 
-settled checkpoint 解决的是“名义 phase 已经到 A5，但机器人实际还在 A4 附近”的物理错位。若直接使用
+settled checkpoint 解决的是“名义 phase 已经到 A9，但机器人实际还在 A8 附近”的物理错位。若直接使用
 名义 checkpoint 采图，可能发生：
 
-- RTC old prefix 以 A5 为起点，但真实机器人尚未到 A5；
+- RTC old prefix 以 A9 为边界，但真实机器人尚未到 A9；
 - 图像中的物体状态、关节 state 和旧 action tail 不对应同一物理时刻；
 - 新 chunk 即使数学上与 old prefix 连续，部署到真机时仍可能产生跳变；
 - 把跟踪落后误判成策略需要修正，形成错误闭环。
@@ -125,16 +125,16 @@ settled checkpoint 解决的是“名义 phase 已经到 A5，但机器人实际
 tracking governor 根据当前 raw trajectory reference 与 14 个真实关节反馈之间的最大误差控制 phase rate：
 
 ```text
-error <= 0.01 rad:
+error <= 0.02 rad:
     phase_rate = 1
 
-0.01 < error < 0.04 rad:
-    phase_rate = (0.04 - error) / (0.04 - 0.01)
+0.02 < error < 0.16 rad:
+    phase_rate = (0.16 - error) / (0.16 - 0.02)
 
-error >= 0.04 rad:
+error >= 0.16 rad:
     hard freeze
 
-hard freeze 后，error <= 0.03 rad 才允许恢复
+hard freeze 后，error <= 0.12 rad 才允许恢复
 ```
 
 此外，joint state stale、trajectory timer overrun 和 arm safety clipping 也会触发 hard freeze。代码见
@@ -145,7 +145,7 @@ hard freeze 后，error <= 0.03 rad 才允许恢复
 
 ```text
 model_hz = 15
-playback_time_scale = 2 或 3
+playback_time_scale = 3
 ```
 
 因此在 governor 介入之前，模型 knot 已经只按 `7.5 Hz` 或 `5 Hz` 执行。governor 的 phase rate 再乘到
@@ -180,7 +180,7 @@ clipped tick，说明直接按固定速度消费动作在当前配置下确实�
 - 动态减速虽然减小 tracking error，却可能降低闭环纠错频率和任务完成速度。
 
 这类影响在静态到位任务中通常可接受，但在抓取、接触、堆叠、双臂协同等依赖时间关系的任务中可能更
-明显。protocol v9 已恢复归一化夹爪实测 feedback，因此可以观察物理夹爪是否按相同节奏完成动作；但当前
+明显。protocol v10 使用归一化夹爪实测 feedback，因此可以观察物理夹爪是否按相同节奏完成动作；但当前
 tracking governor 仍只按 14 个机械臂关节误差调节 phase，不会根据夹爪位置误差主动减速或冻结。
 
 ### 3.4 优化方向
@@ -214,12 +214,12 @@ tracking governor 仍只按 14 个机械臂关节误差调节 phase，不会根�
 客户端的延迟估计器保存最近 20 次 RTC wall latency，并按下式预测：
 
 ```text
-d_pred = ceil((max(last_20_wall_latency) + 0.05 s) * effective_knot_hz)
+d_pred = ceil((p95(last_20_stable_latency) + 0.05 s) * effective_knot_hz)
 ```
 
 结果必须满足 `1 <= d_pred <= 4`。没有稳定延迟样本，或者预测超过 4 步时，RTC 直接失败并进入回退。
 
-当前每次 checkpoint 后只剩 4 个 old-tail knot。推理开始后 bridge 继续推进旧轨迹，并按真实跨过的整数
+当前每次 checkpoint 后有 10 个 old-tail knot，但 `d_max` 仍固定为 4。推理开始后 bridge 继续推进旧轨迹，并按真实跨过的整数
 knot 计算 `d_actual`。如果新结果尚未到达，而 `d_actual` 达到 `d_pred`，bridge 会：
 
 ```text
@@ -229,15 +229,15 @@ pause_kind = rtc_deadline
 等待 RTC 结果
 ```
 
-如果结果提前返回，则先 stage，在下一个整数 knot 边界原子 merge；如果结果晚于预测边界，则真机会在
-deadline 上保持，结果返回后仍可 merge。
+如果结果提前返回，则先 stage，在下一个整数 knot 边界原子 merge；默认 `discard` 在结果错过预测边界时
+使旧 request 失效并进入受控恢复，不再等待并接受迟到结果。`wait` 仅保留为诊断比较模式。
 
 ### 4.2 为什么它有用
 
 这组机制保护 RTC guidance 的前提。服务端生成新 chunk 时，`d_pred` 决定前多少个 old-prefix action 应被
 强约束。若实际执行远远越过该区域还继续接管，新 chunk 与旧轨迹的连续性保证会减弱。
 
-取最近历史最大延迟而不是均值，可以降低低估概率；`50 ms` guard 可以覆盖图像、序列化、调度和网络的
+取当前 epoch 的稳定 p95 而不是均值，可以降低低估概率；`50 ms` guard 可以覆盖图像、序列化、调度和网络的
 小抖动；deadline freeze 则阻止时间轴消费掉所有 old tail。其安全目标是合理的。
 
 ### 4.3 已确认的性能损失
@@ -265,8 +265,8 @@ deadline 上保持，结果返回后仍可 merge。
 4. **wall latency 混合多种来源。** server denoise、远程排队、图像/网络传输、客户端线程调度被合并成一个
    数值。即使模型计算稳定，链路尖峰也会让下一次 RTC 不可用。
 
-PI RTC 同样使用历史延迟的保守估计；当前问题不是“使用最大值”这一点本身，而是最大值、额外 guard、
-固定四步 tail、远程 WebSocket 和 episode-latched fallback 叠加后形成了较脆弱的系统。
+上述 2026-08-12 结果属于旧 H10/protocol v5 历史问题。当前 H20/protocol v10 会把超过 horizon 的样本标为
+link fault、不写入稳定分布，并在恢复前重建 estimator epoch；仍需真机验证该机制不会形成恢复振荡。
 
 ### 4.4 优化方向
 
@@ -294,7 +294,7 @@ PI RTC 同样使用历史延迟的保守估计；当前问题不是“使用最�
 - 链路恢复后是否允许建立新 estimator epoch，由明确测试验证；
 - 不以删除 guard 或忽略 outlier 作为通过标准。
 
-## 5. Hard anchor 只保证位置连续
+## 5. Hard anchor 与执行端 C2 blend
 
 ### 5.1 当前行为
 
@@ -306,7 +306,9 @@ merge_phase = d_actual - 1
 C[merge_phase] = current_old_reference
 ```
 
-之后新的 timeline 从 `merge_phase` 开始，100 Hz bridge 在新 knot 之间继续线性插值。实现见
+protocol v10 不再只依赖该单点。bridge 从 hard anchor 的真实旧 `q/v/a` 出发，优先生成 3-knot quintic
+C2 blend，失败再尝试 2-knot，并在 100 Hz 上检查 URDF、速度 `0.45 rad/s`、加速度 `2.0 rad/s^2` 和
+jerk `20 rad/s^3`。两种都不可行时原子拒绝 merge，不发送部分轨迹。实现见
 [`src/marvinpro_deploy/trajectory_timeline.py`](src/marvinpro_deploy/trajectory_timeline.py) 和
 [`src/marvinpro_deploy/robot_bridge.py`](src/marvinpro_deploy/robot_bridge.py)。
 
@@ -318,7 +320,7 @@ v_new = new_next - old_anchor
 velocity_jump = max(abs(v_new - v_old))
 ```
 
-但这些值目前只写入 telemetry，不参与 merge 接受或拒绝。
+这些指标和 blend 的物理最大值同时写入 telemetry；动力学最大值已参与 merge 接受或拒绝。
 
 ### 5.2 为什么它有用
 
@@ -332,9 +334,9 @@ position_before_merge == position_at_new_timeline_start
 这直接消除了最容易被真机感知的目标位置瞬跳。settled 五 chunk 测试中没有可感知边界回弹，说明该机制
 在位置层面有实际价值。
 
-### 5.3 已确认的性能损失
+### 5.3 历史性能损失与当前剩余风险
 
-只覆盖一个 anchor 会改变新 chunk 原本的局部形状，却不调整下一点和下下点。因此可能出现：
+protocol v7 只覆盖一个 anchor，会改变新 chunk 原本的局部形状，却不调整下一点和下下点。因此可能出现：
 
 - C0 连续，但 C1 速度不连续；
 - 下一 knot 为追赶模型原预测而产生较大步长；
@@ -350,7 +352,8 @@ boundary_acceleration_jump_rad = 0.0625047561 rad/knot^2
 ```
 
 该次 merge 前 bridge 处于 `rtc_deadline`，因此旧参考已经固定。虽然接管位置完全连续，但新 chunk 的下一
-knot 与静止状态之间存在明显速度变化。当前没有阈值阻止该 replacement。
+knot 与静止状态之间存在明显速度变化。旧版本没有阈值阻止该 replacement；protocol v10 已由 C2 准入
+替代这一行为。
 
 还需要注意：`rad/knot` 会随 effective knot rate 转换成不同的物理速度。在 5 Hz 下，
 `0.10757 rad/knot` 对应约 `0.538 rad/s` 的离散速度变化量；在 7.5 Hz 下会更大。因此只比较
@@ -447,7 +450,8 @@ acceleration。这类方法可作为 RTC 之后的执行安全层，但会修改
 ### 5.6 当前短 horizon 的定量诊断
 
 当前 OpenPI server 使用官方指数 soft-mask 公式，见 OpenPI
-[`src/openpi/models/pi0.py`](../../OpenPI_UR/openpi/src/openpi/models/pi0.py)。对本次 soak 的常见参数：
+[`src/openpi/models/pi0.py`](../../OpenPI_UR/openpi/src/openpi/models/pi0.py)。下列是 H10 历史 soak 的参数和
+权重，用于解释旧证据，不是当前 H20 配置：
 
 ```text
 H = 10
@@ -486,9 +490,9 @@ LeRobot 不覆盖 index 1，但它在接管前最后执行的同样是旧 index 
 - 更长 horizon 不能自动修复错误的 `d_pred`。本次 `372.7 ms` 延迟应使用 `d_pred=3`，现有 H=10 已可容纳；
   若 estimator 仍预测 2，即使 H=50 也会在边界 2 按 discard 策略拒绝结果。
 
-因此 `H=50` 应视为需要重新确定时间尺度的训练实验，而不是部署参数修复。一个较保守的首轮 A/B 候选是
-`H=20、s≈10`：在 5 Hz 下对应约 4 秒预测 horizon，并将 `d=2` 后的 soft transition 从当前 2 点扩展到
-约 8 点。这个参数只是待验证假设，必须用数据集 episode 长度、任务响应性、推理延迟和真机跟踪共同定标。
+因此 `H=50` 应视为需要重新确定时间尺度的训练实验，而不是部署参数修复。当前已采用 `H=20、s=10`：
+5 Hz 下约 4 秒预测 horizon，`d=2` 后有约 8 个 soft transition knot。H20 真机仍出现过 C2 jerk 超限，说明
+更长 soft overlap 能缓解生成边界，但不能替代执行端 C2 准入和 fallback 恢复。
 
 ### 5.7 优化方向
 
@@ -535,23 +539,22 @@ LeRobot 不覆盖 index 1，但它在接管前最后执行的同样是旧 index 
 
 ### 6.1 当前行为
 
-当前 RTC 主循环中，只要请求、响应、事务、delay、tracking 或 merge 任一步抛出异常，就会对本 episode
-锁存关闭 RTC：
+protocol v10 已把失败分成结构化的可恢复和不可恢复 reason code。可恢复路径为：
 
 ```text
-RTC exception
--> bridge 固定 hold
--> 等待全部手臂关节跟踪到 hold reference
--> 连续稳定 0.20 s
--> 等待稳定时刻之后的新图像
--> synchronized policy inference
--> 执行完整同步 chunk
--> 到 chunk 末端再次 settle、采图、推理
--> 本 episode 不再恢复 RTC
+late/discard、transport timeout、observation lag 或单次 C2 merge 不可行
+-> 旧 request / WebSocket connection / estimator epoch 失效
+-> controller 原子锁存当前实测双臂位置，夹爪保持最后命令
+-> 稳定 0.20 s 后取得 state/image skew <= 50 ms 的新观测
+-> 执行至少一个 timed synchronized H20 clean chunk
+-> 用末端新观测做普通 H20 推理，初始化新 estimator epoch
+-> 以 s=10 和 C2 handoff bootstrap 新 RTC timeline
+-> 回到 RTC，最多恢复 3 次
 ```
 
-代码见 [`src/marvinpro_deploy/rollout_client.py`](src/marvinpro_deploy/rollout_client.py)。当前工作树还对同步
-fallback 中的 observation-lag rejection 增加了重新观测并重推理逻辑，避免直接采用已经过期的 action。
+clipping、hard freeze、stale、heartbeat/timer、控制状态、事务 ID、protocol/shape/finite/URDF 等错误只进入
+fixed hold，不自动重进 RTC。`--rtc-shadow` 仍只做一次 shadow 后进入 timed synchronized，不自动循环。
+代码见 [`src/marvinpro_deploy/rollout_client.py`](src/marvinpro_deploy/rollout_client.py)。
 
 ### 6.2 为什么它有用
 
@@ -568,9 +571,9 @@ fallback 还能防止 RTC 在同一故障条件下反复重试、反复 merge �
 
 ### 6.3 已确认的性能损失
 
-synchronized fallback 本质上放弃了实时 chunking：每个 chunk 执行完后都等待跟踪、settle、新图像和推理。
-已有 synchronized 真机调查确认 chunk 间会产生明显空档，增大 playback time scale 只能减少 clipping，不能
-消除同步等待。
+恢复过程至少有一个 synchronized chunk，因此仍会产生一次 settle、取图和普通推理空档。它不是正常 RTC
+性能路径，而是用一次可观察的停顿换取重新建立可信物理边界。若第 4 次可恢复错误发生，剩余 episode 会
+继续 timed synchronized，此时才会持续失去实时 chunking。
 
 2026-08-12 的长运行在第 10 次 RTC merge 后，因为历史 latency 推导出 `d_pred=9` 而进入 fallback：
 
@@ -584,31 +587,29 @@ synchronized fallback 本质上放弃了实时 chunking：每个 chunk 执行完
 - 抓取或接触动作在 hold 时改变物体受力；
 - 双臂协作的连续动作被切断；
 - 任务闭环频率下降到完整 chunk 周期；
-- 即使网络恢复，本 episode 仍不能回到 RTC；
+- 旧版本即使网络恢复也不能回到 RTC；protocol v10 已允许有限恢复；
 - 若把 fallback 完成的动作计入 RTC 成功，会掩盖 RTC 的真实可用率。
 
-### 6.4 优化方向
+### 6.4 已实现约束和剩余优化
 
-1. **继续保留固定 hold 作为安全起点。** 不应在事务不确定时直接采用迟到 result，也不应自动放宽 ID、
+1. **继续保留实测 fixed hold 作为安全起点。** 不应在事务不确定时直接采用迟到 result，也不应自动放宽 ID、
    version、stale 或 delay 条件。
-2. **细分失败类型。** 将故障至少分为 policy/server、transport、delay budget、tracking/safety、transaction、
-   observation freshness 和本地软件错误。不同故障不一定需要相同的 episode-latched 策略。
-3. **定义可恢复 RTC epoch。** 对纯 transport 尖峰，在 hold、重新同步观测、清空旧请求并建立新
-   session/timeline epoch 后，研究是否可以安全恢复 RTC。tracking hard stop、clipping 或控制模式异常则应
-   保持更严格的 latched fallback。
-4. **回退过程避免连续同步停顿。** 可以研究重新初始化一个安全的异步 timeline，而不是永久使用完整
-   synchronized chunk 循环；前提是新 epoch 的观测、ID 和延迟预算全部重新建立。
+2. **故障分类已经结构化。** 后续真机重点是验证分类不会把 safety/transaction fault 误判为网络故障。
+3. **可恢复 RTC epoch 已实现。** fake bridge 已跑通 C2 reject、measured hold、clean sync、bootstrap 和新
+   RTC merge，并验证旧 request/timeline 被拒绝；仍需真机自然故障证据，特别是旧 worker 迟到返回、新
+   connection generation 和 timeline version 同时变化时的拒绝行为。
+4. **timed chunk 需要真机定标。** 当前 H20/5 Hz 是 4 秒名义执行加 1 秒 grace；不能用碰桌或人为阻挡测试，
+   应在安全空间验证 5 秒不误报，并确认 timeout 后不再发送旧不可达 reference。
 5. **回退结果单独计分。** 实验中至少区分：RTC-only 完成、RTC 后恢复完成、synchronized fallback 完成、
    安全 abort 和任务失败。
-6. **设置恢复次数上限。** 即使实现自动恢复，也不应无限循环。连续链路 fault 或 tracking fault 应转入
-   hold 并要求操作员处理。
+6. **保持恢复次数上限。** 当前最多 3 次；第 4 次只留在 timed synchronized，连续两个卡住 chunk 则 hold。
 7. **先解决根因再提高恢复复杂度。** 如果 transport 仍出现 1 秒以上尖峰，增加复杂恢复状态机可能只是
    隐藏基础设施问题。
 
 ### 6.5 验收指标
 
 - 每类 fallback reason 有独立计数和完整事务上下文；
-- fault 到固定 hold 的时间有上限，且 hold action 与当前 reference 一致；
+- fault 到固定 hold 的时间有上限，双臂 hold action 与同一 controller lock 内读取的实测位置一致，夹爪命令不变；
 - fallback 后使用的第一张图像和 action 都来自新同步 epoch；
 - 不采用旧 request、旧 timeline version 或过期 observation 的 result；
 - 分别报告 RTC-only success rate、recovered success rate 和 fallback rate；

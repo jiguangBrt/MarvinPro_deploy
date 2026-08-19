@@ -33,6 +33,7 @@ from .config import (
     CUSTOM_INPUT_MODE,
     DEFAULT_BRIDGE_PORT,
     JOINT_LOWER,
+    JOINT_NAMES,
     JOINT_UPPER,
     JOINT_VELOCITY,
     READY_STATE,
@@ -53,6 +54,7 @@ from .protocol import (
     ActionCommand,
     BridgeHello,
     HoldPositionCommand,
+    LatchMeasuredHoldCommand,
     LoadTrajectoryCommand,
     ProtocolError,
     RobotObservation,
@@ -228,6 +230,8 @@ class MarvinBridgeNode(Node):
         self._inference_invalid = False
         self._pending_rtc: StageRtcChunkCommand | None = None
         self._trajectory_hold_action: tuple[float, ...] | None = None
+        self._trajectory_loaded_monotonic: float | None = None
+        self._trajectory_deadline_monotonic: float | None = None
 
         self.create_subscription(JointState, TOPIC_JOINT_STATES, self._on_joint_state, QOS_SENSOR)
         self.create_subscription(
@@ -427,6 +431,11 @@ class MarvinBridgeNode(Node):
         blend_max_velocity_rad_s: float | None = None,
         blend_max_acceleration_rad_s2: float | None = None,
         blend_max_jerk_rad_s3: float | None = None,
+        reason_code: str | None = None,
+        deadline_monotonic: float | None = None,
+        elapsed_s: float | None = None,
+        worst_joint: str | None = None,
+        final_error_rad: float | None = None,
         detail: str = "",
     ) -> None:
         resolved_session_id = session_id or self._trajectory_session_id
@@ -471,6 +480,11 @@ class MarvinBridgeNode(Node):
             blend_max_velocity_rad_s=blend_max_velocity_rad_s,
             blend_max_acceleration_rad_s2=blend_max_acceleration_rad_s2,
             blend_max_jerk_rad_s3=blend_max_jerk_rad_s3,
+            reason_code=reason_code,
+            deadline_monotonic=deadline_monotonic,
+            elapsed_s=elapsed_s,
+            worst_joint=worst_joint,
+            final_error_rad=final_error_rad,
         )
         self._events.append(event)
         self.get_logger().info(
@@ -490,6 +504,9 @@ class MarvinBridgeNode(Node):
             f"blend_max_velocity_rad_s={event.blend_max_velocity_rad_s} "
             f"blend_max_acceleration_rad_s2={event.blend_max_acceleration_rad_s2} "
             f"blend_max_jerk_rad_s3={event.blend_max_jerk_rad_s3} "
+            f"reason_code={event.reason_code} deadline={event.deadline_monotonic} "
+            f"elapsed_s={event.elapsed_s} worst_joint={event.worst_joint} "
+            f"final_error_rad={event.final_error_rad} "
             f"raw_reference={event.raw_reference} sent_target={event.sent_target} detail={event.detail!r}"
         )
         if len(self._events) > 128:
@@ -526,6 +543,8 @@ class MarvinBridgeNode(Node):
         self._inference_invalid = False
         self._pending_rtc = None
         self._trajectory_hold_action = None
+        self._trajectory_loaded_monotonic = None
+        self._trajectory_deadline_monotonic = None
         self._governor.reset()
         self._clear_target_locked(status)
 
@@ -702,6 +721,80 @@ class MarvinBridgeNode(Node):
                 )
         return max_velocity, max_acceleration, max_jerk
 
+    def _measured_hold_action_locked(self) -> tuple[float, ...]:
+        assert self._joints is not None and self._gripper_l is not None and self._gripper_r is not None
+        previous = self._sent_target or self._trajectory_hold_action
+        gripper_l = self._gripper_l if previous is None else previous[7]
+        gripper_r = self._gripper_r if previous is None else previous[15]
+        return build_state16(self._joints, gripper_l, gripper_r)
+
+    def _tracking_diag_locked(
+        self, reference: tuple[float, ...] | None = None
+    ) -> tuple[float | None, str | None]:
+        if self._joints is None or (reference or self._raw_reference) is None:
+            return None, None
+        target = reference or self._raw_reference
+        assert target is not None
+        errors = tuple(abs(expected - actual) for expected, actual in zip(action_arms(target), self._joints))
+        worst_index = max(range(len(errors)), key=errors.__getitem__)
+        return errors[worst_index], JOINT_NAMES[worst_index]
+
+    def _enter_hold_locked(
+        self,
+        action: tuple[float, ...],
+        now: float,
+        *,
+        command_id: int,
+        event_type: str,
+        reason: str,
+        reason_code: str,
+        deadline_monotonic: float | None = None,
+        elapsed_s: float | None = None,
+        worst_joint: str | None = None,
+        final_error_rad: float | None = None,
+    ) -> None:
+        self._timeline = None
+        self._trajectory_hold_action = action
+        self._timeline_version += 1
+        self._phase = None
+        self._phase_rate = 0.0
+        self._handoff_anchor = None
+        self._handoff_phase = None
+        self._checkpoint_consumed = False
+        self._trajectory_paused = True
+        self._pause_kind = "hold"
+        self._checkpoint_stable_since = None
+        self._checkpoint_emitted = False
+        self._continuous_checkpoint = False
+        self._heartbeat_t = now
+        self._raw_reference = action
+        self._sent_target = action
+        self._tracking_error_rad = 0.0
+        self._servo_error_rad = 0.0
+        self._arm_clipped = False
+        self._frozen_reason = "hold"
+        self._active_request_id = None
+        self._active_predicted_delay = None
+        self._late_result_policy = "discard"
+        self._actual_delay_steps = 0
+        self._inference_invalid = False
+        self._pending_rtc = None
+        self._trajectory_loaded_monotonic = None
+        self._trajectory_deadline_monotonic = None
+        self._governor.reset()
+        self._last_command_id = command_id
+        self._last_command_status = f"holding fixed position: {reason}"
+        self._emit_event_locked(
+            event_type,
+            now,
+            reason_code=reason_code,
+            deadline_monotonic=deadline_monotonic,
+            elapsed_s=elapsed_s,
+            worst_joint=worst_joint,
+            final_error_rad=final_error_rad,
+            detail=reason,
+        )
+
     def _accept_load_trajectory_locked(self, message: LoadTrajectoryCommand, now: float) -> None:
         require_current_version(message)
         if not message.execute:
@@ -718,16 +811,40 @@ class MarvinBridgeNode(Node):
             raise SafetyError(
                 f"timeline version mismatch: expected {message.expected_timeline_version}, current {self._timeline_version}"
             )
-        timeline = TrajectoryTimeline(message.knots, message.knot_hz, message.checkpoint_horizon)
-        self._validate_trajectory_knots_locked(timeline)
-        if timeline.horizon != RTC_HORIZON:
+        if message.chunk_timeout_s is not None and message.chunk_timeout_s <= 0:
+            raise SafetyError("chunk timeout must be positive")
+        base_timeline = TrajectoryTimeline(message.knots, message.knot_hz, message.checkpoint_horizon)
+        self._validate_trajectory_knots_locked(base_timeline)
+        if base_timeline.horizon != RTC_HORIZON:
             raise SafetyError(f"trajectory mode currently requires horizon {RTC_HORIZON}")
         continuous_checkpoint = bool(getattr(message, "continuous_checkpoint", False))
-        if continuous_checkpoint and timeline.checkpoint_horizon != RTC_EXECUTION_HORIZON:
+        if continuous_checkpoint and base_timeline.checkpoint_horizon != RTC_EXECUTION_HORIZON:
             raise SafetyError(
                 f"continuous checkpoints require execution horizon {RTC_EXECUTION_HORIZON}"
             )
         assert self._joints is not None
+        measured_anchor = self._measured_hold_action_locked()
+        timeline = base_timeline
+        blend_metrics = None
+        if message.c2_handoff:
+            blend_errors = []
+            for blend_knots in (3, 2):
+                try:
+                    candidate = base_timeline.with_c2_handoff(
+                        measured_anchor, blend_knots=blend_knots
+                    )
+                    self._validate_trajectory_knots_locked(candidate)
+                    candidate_metrics = self._validate_rtc_blend_locked(candidate)
+                except (SafetyError, ValueError) as exc:
+                    blend_errors.append(f"{blend_knots}-knot: {exc}")
+                    continue
+                timeline = candidate
+                blend_metrics = (blend_knots, *candidate_metrics)
+                break
+            if blend_metrics is None:
+                raise SafetyError(
+                    "trajectory C2 handoff is infeasible (" + "; ".join(blend_errors) + ")"
+                )
         self._clear_target_locked("trajectory ownership enabled")
         self._trajectory_session_id = message.session_id
         self._trajectory_plan_id = message.plan_id
@@ -735,8 +852,8 @@ class MarvinBridgeNode(Node):
         self._timeline_version += 1
         self._phase = 0.0
         self._phase_rate = 0.0
-        self._handoff_anchor = build_state16(self._joints, self._gripper_l, self._gripper_r)
-        self._handoff_phase = 0.0
+        self._handoff_anchor = None if message.c2_handoff else measured_anchor
+        self._handoff_phase = None if message.c2_handoff else 0.0
         self._checkpoint_consumed = False
         self._trajectory_paused = False
         self._pause_kind = None
@@ -758,10 +875,34 @@ class MarvinBridgeNode(Node):
         self._inference_invalid = False
         self._pending_rtc = None
         self._trajectory_hold_action = None
+        self._trajectory_loaded_monotonic = now
+        self._trajectory_deadline_monotonic = (
+            None if message.chunk_timeout_s is None else now + message.chunk_timeout_s
+        )
         self._governor.reset()
         self._last_command_id = message.command_id
         self._last_command_status = f"loaded trajectory {message.plan_id} version {self._timeline_version}"
-        self._emit_event_locked("trajectory_loaded", now, detail=self._last_command_status)
+        blend_duration_knots = None
+        blend_max_velocity = None
+        blend_max_acceleration = None
+        blend_max_jerk = None
+        if blend_metrics is not None:
+            (
+                blend_duration_knots,
+                blend_max_velocity,
+                blend_max_acceleration,
+                blend_max_jerk,
+            ) = blend_metrics
+        self._emit_event_locked(
+            "trajectory_loaded",
+            now,
+            deadline_monotonic=self._trajectory_deadline_monotonic,
+            blend_duration_knots=blend_duration_knots,
+            blend_max_velocity_rad_s=blend_max_velocity,
+            blend_max_acceleration_rad_s2=blend_max_acceleration,
+            blend_max_jerk_rad_s3=blend_max_jerk,
+            detail=self._last_command_status,
+        )
 
     def _accept_resume_locked(self, message: ResumeTrajectoryCommand, now: float) -> None:
         require_current_version(message)
@@ -1000,25 +1141,40 @@ class MarvinBridgeNode(Node):
             max_joint_step_rad=self.max_joint_step_rad,
             joint_limit_margin_rad=self.joint_limit_margin_rad,
         )
-        self._timeline = None
-        self._trajectory_hold_action = target
-        self._timeline_version += 1
-        self._phase = None
-        self._phase_rate = 0.0
-        self._trajectory_paused = True
-        self._pause_kind = "hold"
-        self._heartbeat_t = now
-        self._raw_reference = target
-        self._sent_target = target
-        self._active_request_id = None
-        self._active_predicted_delay = None
-        self._late_result_policy = "discard"
-        self._actual_delay_steps = 0
-        self._inference_invalid = False
-        self._pending_rtc = None
-        self._last_command_id = message.command_id
-        self._last_command_status = f"holding fixed position: {message.reason}"
-        self._emit_event_locked("holding", now, detail=message.reason)
+        self._enter_hold_locked(
+            target,
+            now,
+            command_id=message.command_id,
+            event_type="holding",
+            reason=message.reason,
+            reason_code="commanded_hold",
+        )
+
+    def _accept_latch_measured_hold_locked(
+        self, message: LatchMeasuredHoldCommand, now: float
+    ) -> None:
+        require_current_version(message)
+        if not message.execute:
+            raise SafetyError("execute flag is false")
+        if message.session_id != self._trajectory_session_id:
+            raise SafetyError("measured hold command does not match trajectory session")
+        if message.expected_timeline_version != self._timeline_version:
+            raise SafetyError("measured hold command timeline version mismatch")
+        ready, reason = self._readiness_gate_locked(now)
+        if not ready:
+            raise SafetyError(reason)
+        old_reference = self._raw_reference
+        target = self._measured_hold_action_locked()
+        old_delta = 0.0 if old_reference is None else self._arm_error(old_reference, self._joints)
+        self._enter_hold_locked(
+            target,
+            now,
+            command_id=message.command_id,
+            event_type="measured_holding",
+            reason=f"{message.reason}; old_reference_delta={old_delta:.6f}rad",
+            reason_code=message.reason_code,
+            final_error_rad=old_delta,
+        )
 
     def accept_command(self, message) -> None:
         now = _now()
@@ -1056,6 +1212,8 @@ class MarvinBridgeNode(Node):
                     self._accept_stage_rtc_locked(message, now)
                 elif isinstance(message, HoldPositionCommand):
                     self._accept_hold_locked(message, now)
+                elif isinstance(message, LatchMeasuredHoldCommand):
+                    self._accept_latch_measured_hold_locked(message, now)
                 elif isinstance(message, ActionCommand):
                     if self._trajectory_session_id is not None:
                         raise SafetyError("legacy action rejected while trajectory session owns the bridge")
@@ -1067,9 +1225,22 @@ class MarvinBridgeNode(Node):
                 self._last_command_status = f"rejected command {command_id}: {exc}"
                 if isinstance(message, ActionCommand) and self._trajectory_session_id is None:
                     self._clear_target_locked(self._last_command_status)
-                if isinstance(
+                rtc_failure_already_emitted = (
+                    isinstance(message, StageRtcChunkCommand)
+                    and self._inference_invalid
+                    and bool(self._events)
+                    and self._events[-1].event_type == "rtc_invalid"
+                    and self._events[-1].request_id == message.request_id
+                )
+                if not rtc_failure_already_emitted and isinstance(
                     message,
-                    (LoadTrajectoryCommand, ResumeTrajectoryCommand, StageRtcChunkCommand, HoldPositionCommand),
+                    (
+                        LoadTrajectoryCommand,
+                        ResumeTrajectoryCommand,
+                        StageRtcChunkCommand,
+                        HoldPositionCommand,
+                        LatchMeasuredHoldCommand,
+                    ),
                 ):
                     rejected_plan_id = getattr(
                         message,
@@ -1088,6 +1259,7 @@ class MarvinBridgeNode(Node):
                         ),
                         checkpoint_id=getattr(message, "checkpoint_id", None),
                         request_id=getattr(message, "request_id", None),
+                        reason_code="command_rejected",
                         detail=str(exc),
                     )
             self._refresh_state_locked(now)
@@ -1144,8 +1316,24 @@ class MarvinBridgeNode(Node):
             request_id=self._active_request_id,
             predicted_delay_steps=self._active_predicted_delay,
             actual_delay_steps=self._actual_delay_steps,
+            reason_code=self._rtc_failure_reason_code(reason),
             detail=reason,
         )
+
+    @staticmethod
+    def _rtc_failure_reason_code(reason: str) -> str:
+        detail = reason.lower()
+        if "missed predicted delay" in detail or "late" in detail:
+            return "rtc_late"
+        if "blend" in detail and ("infeasible" in detail or "exceeds" in detail):
+            return "c2_blend_infeasible"
+        if "clipp" in detail:
+            return "arm_clipping"
+        if "stale" in detail:
+            return "stale_feedback"
+        if "tracking governor" in detail or "froze" in detail or "freeze" in detail:
+            return "tracking_hard_freeze"
+        return "rtc_invalid"
 
     def _update_pause_settle_locked(
         self,
@@ -1184,6 +1372,13 @@ class MarvinBridgeNode(Node):
         stable_monotonic = self._joints_t
         if self._pause_kind == "checkpoint":
             assert self._timeline is not None
+            deadline = self._trajectory_deadline_monotonic
+            elapsed = (
+                None
+                if self._trajectory_loaded_monotonic is None
+                else max(0.0, now - self._trajectory_loaded_monotonic)
+            )
+            final_error, worst_joint = self._tracking_diag_locked()
             self._emit_event_locked(
                 "checkpoint_ready",
                 now,
@@ -1191,7 +1386,13 @@ class MarvinBridgeNode(Node):
                 stable_monotonic=stable_monotonic,
                 observation_seq_at_stable=self._seq,
                 old_remaining_actions_absolute=self._timeline.remaining_after_checkpoint(),
+                reason_code="chunk_clean",
+                deadline_monotonic=deadline,
+                elapsed_s=elapsed,
+                worst_joint=worst_joint,
+                final_error_rad=final_error,
             )
+            self._trajectory_deadline_monotonic = None
         elif self._pause_kind == "rtc_invalid":
             self._emit_event_locked(
                 "fallback_ready",
@@ -1232,6 +1433,7 @@ class MarvinBridgeNode(Node):
                 stable_monotonic=self._joints_t,
                 observation_seq_at_stable=self._seq,
                 old_remaining_actions_absolute=self._timeline.remaining_after_checkpoint(),
+                reason_code="rtc_checkpoint",
                 detail="continuous RTC checkpoint; trajectory remained active",
             )
 
@@ -1302,6 +1504,55 @@ class MarvinBridgeNode(Node):
             self._clear_trajectory_locked("trajectory heartbeat timed out; publication stopped", now)
             return None
         assert self._joints is not None
+        if (
+            self._trajectory_deadline_monotonic is not None
+            and now >= self._trajectory_deadline_monotonic
+            and self._timeline is not None
+            and not self._checkpoint_emitted
+        ):
+            if self._arm_clipped or self._frozen_reason not in (None, "checkpoint"):
+                deadline = self._trajectory_deadline_monotonic
+                loaded = self._trajectory_loaded_monotonic
+                final_error, worst_joint = self._tracking_diag_locked()
+                measured = self._measured_hold_action_locked()
+                reason_code = "arm_clipping" if self._arm_clipped else "tracking_hard_freeze"
+                self._enter_hold_locked(
+                    measured,
+                    now,
+                    command_id=self._last_command_id or -1,
+                    event_type="fatal_holding",
+                    reason=(
+                        "timed chunk reached its deadline after a fatal safety fault: "
+                        f"arm_clipped={self._arm_clipped} frozen={self._frozen_reason!r}"
+                    ),
+                    reason_code=reason_code,
+                    deadline_monotonic=deadline,
+                    elapsed_s=None if loaded is None else max(0.0, now - loaded),
+                    worst_joint=worst_joint,
+                    final_error_rad=final_error,
+                )
+                return measured, self._last_command_id
+            deadline = self._trajectory_deadline_monotonic
+            loaded = self._trajectory_loaded_monotonic
+            final_error, worst_joint = self._tracking_diag_locked()
+            measured = self._measured_hold_action_locked()
+            elapsed = None if loaded is None else max(0.0, now - loaded)
+            self._enter_hold_locked(
+                measured,
+                now,
+                command_id=self._last_command_id or -1,
+                event_type="chunk_timed_out",
+                reason=(
+                    "synchronized chunk missed its controller deadline; "
+                    f"phase={self._phase} final_error={final_error} worst_joint={worst_joint}"
+                ),
+                reason_code="tracking_timeout",
+                deadline_monotonic=deadline,
+                elapsed_s=elapsed,
+                worst_joint=worst_joint,
+                final_error_rad=final_error,
+            )
+            return measured, self._last_command_id
         raw = self._trajectory_reference_locked()
         if raw is None:
             return None
@@ -1345,6 +1596,32 @@ class MarvinBridgeNode(Node):
         self._frozen_reason = self._pause_kind if self._trajectory_paused else decision.frozen_reason
         if decision.hard_frozen:
             self._invalidate_active_rtc_locked(now, decision.frozen_reason or "tracking governor froze")
+            if self._trajectory_deadline_monotonic is not None:
+                deadline = self._trajectory_deadline_monotonic
+                loaded = self._trajectory_loaded_monotonic
+                final_error, worst_joint = self._tracking_diag_locked(raw)
+                measured = self._measured_hold_action_locked()
+                if arm_clipped:
+                    reason_code = "arm_clipping"
+                elif state_stale:
+                    reason_code = "stale_feedback"
+                elif timer_overrun:
+                    reason_code = "timer_overrun"
+                else:
+                    reason_code = "tracking_hard_freeze"
+                self._enter_hold_locked(
+                    measured,
+                    now,
+                    command_id=self._last_command_id or -1,
+                    event_type="fatal_holding",
+                    reason=decision.frozen_reason or "tracking governor froze",
+                    reason_code=reason_code,
+                    deadline_monotonic=deadline,
+                    elapsed_s=None if loaded is None else max(0.0, now - loaded),
+                    worst_joint=worst_joint,
+                    final_error_rad=final_error,
+                )
+                return measured, self._last_command_id
         self._advance_trajectory_locked(now, dt, self._phase_rate)
         self._update_pause_settle_locked(
             now,

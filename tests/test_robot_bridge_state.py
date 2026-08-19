@@ -1,5 +1,6 @@
 from collections import deque
 from contextlib import redirect_stderr
+from dataclasses import replace
 import importlib
 import io
 import sys
@@ -162,6 +163,8 @@ def _bare_node():
     node._trajectory_session_id = None
     node._trajectory_plan_id = None
     node._trajectory_hold_action = None
+    node._trajectory_loaded_monotonic = None
+    node._trajectory_deadline_monotonic = None
     node._timeline_version = 7
     node._phase = None
     node._joints_t = None
@@ -189,6 +192,82 @@ def _bare_node():
     node._gripper_l_motor_temperature = None
     node._gripper_r_motor_temperature = None
     return node
+
+
+def _ready_trajectory_node(clock):
+    node = robot_bridge.MarvinBridgeNode(
+        allow_motion=True,
+        publish_hz=100.0,
+        command_timeout_s=0.25,
+        max_joint_step_rad=0.16,
+        max_state_age_s=0.20,
+        max_status_age_s=0.50,
+        max_observation_lag=8,
+        joint_limit_margin_rad=0.02,
+        trajectory_state_timeout_s=0.05,
+        trajectory_timer_timeout_s=0.05,
+        trajectory_heartbeat_timeout_s=0.25,
+        tracking_run_error_rad=0.02,
+        tracking_resume_error_rad=0.12,
+        tracking_stop_error_rad=0.16,
+        tracking_tolerance_rad=0.01,
+        tracking_settle_seconds=0.20,
+        rtc_blend_max_velocity_rad_s=0.45,
+        rtc_blend_max_acceleration_rad_s2=2.0,
+        rtc_blend_max_jerk_rad_s3=20.0,
+    )
+    node._client_connected = True
+    node._joints = (0.0,) * 14
+    node._joints_t = clock[0]
+    node._gripper_l = node._gripper_r = 0.0
+    node._gripper_l_t = node._gripper_r_t = clock[0]
+    node._input_mode = 3
+    node._input_mode_t = clock[0]
+    node._robot_state = node._arm_state = (3, 3)
+    node._robot_state_t = node._arm_state_t = clock[0]
+    node._latest_observation = robot_bridge.RobotObservation(
+        seq=1,
+        captured_monotonic=clock[0],
+        image=b"jpeg",
+        image_format="jpeg",
+        joints=node._joints,
+        gripper_raw_left=0.0,
+        gripper_raw_right=0.0,
+        input_mode=3,
+        robot_state=(3, 3),
+        arm_state=(3, 3),
+        age_state_s=0.0,
+        age_gripper_left_s=0.0,
+        age_gripper_right_s=0.0,
+        age_input_mode_s=0.0,
+        age_robot_state_s=0.0,
+        age_arm_state_s=0.0,
+        motion_gate_open=True,
+        gate_reason="ready",
+    )
+    return node
+
+
+def _drive_fake_bridge_until(node, clock, event_type, *, newer_than=0, max_ticks=700):
+    for _ in range(max_ticks):
+        clock[0] += 0.01
+        raw = node._trajectory_reference_locked()
+        if raw is not None:
+            node._joints = robot_bridge.action_arms(raw)
+        node._joints_t = clock[0]
+        node._gripper_l_t = node._gripper_r_t = clock[0]
+        node._robot_state_t = node._arm_state_t = clock[0]
+        node._heartbeat_t = clock[0]
+        with node._lock:
+            node._trajectory_target_locked(clock[0])
+        matches = [
+            event
+            for event in node._events
+            if event.event_type == event_type and event.event_seq > newer_than
+        ]
+        if matches:
+            return matches[-1]
+    raise AssertionError(f"fake bridge did not emit {event_type} after {max_ticks} ticks")
 
 
 def test_shutdown_ros_runtime_has_one_ordered_owner(monkeypatch):
@@ -619,6 +698,229 @@ def test_outbound_events_are_reliable_and_image_gets_fair_turn_after_state():
     ) is node._latest_observation
 
 
+def test_measured_hold_atomically_latches_arms_and_preserves_last_gripper_command(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(robot_bridge, "_now", lambda: clock[0])
+    node = _ready_trajectory_node(clock)
+    knots = tuple(_arm_action(index * 0.001) for index in range(robot_bridge.RTC_HORIZON))
+    node.accept_command(
+        robot_bridge.LoadTrajectoryCommand(
+            1, 1, "session", "plan", 0, knots, 5.0, robot_bridge.RTC_HORIZON, True
+        )
+    )
+    node._joints = (0.03,) * 14
+    node._joints_t = clock[0]
+    node._sent_target = (0.1,) * 7 + (0.25,) + (0.1,) * 7 + (0.75,)
+    node._raw_reference = node._sent_target
+    node._pending_rtc = object()
+
+    node.accept_command(
+        robot_bridge.LatchMeasuredHoldCommand(2, "session", 1, True, "stuck", "tracking_timeout")
+    )
+
+    expected = (0.03,) * 7 + (0.25,) + (0.03,) * 7 + (0.75,)
+    assert node._trajectory_hold_action == expected
+    assert node._raw_reference == expected
+    assert node._sent_target == expected
+    assert node._timeline is None
+    assert node._pending_rtc is None
+    assert node._timeline_version == 2
+    assert node._events[-1].event_type == "measured_holding"
+    assert node._events[-1].reason_code == "tracking_timeout"
+    assert abs(node._events[-1].final_error_rad - 0.07) < 1e-12
+
+
+def test_timed_chunk_deadline_latches_measured_hold_with_diagnostics(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(robot_bridge, "_now", lambda: clock[0])
+    node = _ready_trajectory_node(clock)
+    knots = tuple(_arm_action(index * 0.001) for index in range(robot_bridge.RTC_HORIZON))
+    node.accept_command(
+        robot_bridge.LoadTrajectoryCommand(
+            command_id=1,
+            observation_seq=1,
+            session_id="session",
+            plan_id="plan",
+            expected_timeline_version=0,
+            knots=knots,
+            knot_hz=5.0,
+            checkpoint_horizon=robot_bridge.RTC_HORIZON,
+            execute=True,
+            chunk_timeout_s=5.0,
+        )
+    )
+    node._phase = 19.0
+    node._raw_reference = knots[-1]
+    node._sent_target = knots[-1]
+    node._joints = (0.005,) * 14
+    clock[0] = 105.01
+    node._joints_t = node._gripper_l_t = node._gripper_r_t = clock[0]
+    node._robot_state_t = node._arm_state_t = node._heartbeat_t = clock[0]
+
+    with node._lock:
+        target, _ = node._trajectory_target_locked(clock[0])
+
+    assert robot_bridge.action_arms(target) == node._joints
+    assert node._trajectory_hold_action == target
+    timeout = node._events[-1]
+    assert timeout.event_type == "chunk_timed_out"
+    assert timeout.reason_code == "tracking_timeout"
+    assert timeout.deadline_monotonic == 105.0
+    assert abs(timeout.elapsed_s - 5.01) < 1e-12
+    assert timeout.worst_joint == robot_bridge.JOINT_NAMES[0]
+    assert abs(timeout.final_error_rad - 0.014) < 1e-12
+
+
+def test_timed_chunk_clean_at_4_point_9_seconds_beats_deadline(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(robot_bridge, "_now", lambda: clock[0])
+    node = _ready_trajectory_node(clock)
+    knots = tuple(_arm_action(0.0) for _ in range(robot_bridge.RTC_HORIZON))
+    node.accept_command(
+        robot_bridge.LoadTrajectoryCommand(
+            1,
+            1,
+            "session",
+            "plan",
+            0,
+            knots,
+            5.0,
+            robot_bridge.RTC_HORIZON,
+            True,
+            chunk_timeout_s=5.0,
+        )
+    )
+    node._phase = 19.0
+    node._raw_reference = knots[-1]
+    node._sent_target = knots[-1]
+    node._trajectory_paused = True
+    node._pause_kind = "checkpoint"
+    node._checkpoint_stable_since = 104.69
+    clock[0] = 104.9
+    node._last_trajectory_tick = 104.89
+    node._joints_t = node._gripper_l_t = node._gripper_r_t = clock[0]
+    node._robot_state_t = node._arm_state_t = node._heartbeat_t = clock[0]
+
+    with node._lock:
+        node._trajectory_target_locked(clock[0])
+
+    event = node._events[-1]
+    assert event.event_type == "checkpoint_ready"
+    assert event.reason_code == "chunk_clean"
+    assert abs(event.elapsed_s - 4.9) < 1e-12
+    assert all(item.event_type != "chunk_timed_out" for item in node._events)
+
+
+def test_timed_chunk_fatal_freeze_holds_measured_pose_without_replan_event(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(robot_bridge, "_now", lambda: clock[0])
+    node = _ready_trajectory_node(clock)
+    knots = tuple(_arm_action(index * 0.001) for index in range(robot_bridge.RTC_HORIZON))
+    node.accept_command(
+        robot_bridge.LoadTrajectoryCommand(
+            1,
+            1,
+            "session",
+            "plan",
+            0,
+            knots,
+            5.0,
+            robot_bridge.RTC_HORIZON,
+            True,
+            chunk_timeout_s=5.0,
+        )
+    )
+    node._phase = 10.0
+    node._raw_reference = knots[10]
+    node._sent_target = knots[10]
+    node._frozen_reason = "tracking governor hard freeze"
+    clock[0] = 105.01
+    node._joints_t = node._gripper_l_t = node._gripper_r_t = clock[0]
+    node._robot_state_t = node._arm_state_t = node._heartbeat_t = clock[0]
+
+    with node._lock:
+        target, _ = node._trajectory_target_locked(clock[0])
+
+    assert robot_bridge.action_arms(target) == node._joints
+    assert node._events[-1].event_type == "fatal_holding"
+    assert node._events[-1].reason_code == "tracking_hard_freeze"
+    assert all(event.event_type != "chunk_timed_out" for event in node._events)
+
+
+def test_c2_handoff_rejection_is_atomic_and_keeps_existing_hold(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(robot_bridge, "_now", lambda: clock[0])
+    node = _ready_trajectory_node(clock)
+    initial = tuple(_arm_action(0.0) for _ in range(robot_bridge.RTC_HORIZON))
+    node.accept_command(
+        robot_bridge.LoadTrajectoryCommand(
+            1, 1, "session", "plan", 0, initial, 5.0, robot_bridge.RTC_HORIZON, True
+        )
+    )
+    node.accept_command(robot_bridge.LatchMeasuredHoldCommand(2, "session", 1, True))
+    held = node._trajectory_hold_action
+    unsafe = tuple(_arm_action(0.2) for _ in range(robot_bridge.RTC_HORIZON))
+
+    node.accept_command(
+        robot_bridge.LoadTrajectoryCommand(
+            3,
+            1,
+            "session",
+            "unsafe",
+            2,
+            unsafe,
+            5.0,
+            robot_bridge.RTC_HORIZON,
+            True,
+            c2_handoff=True,
+        )
+    )
+
+    assert node._timeline_version == 2
+    assert node._trajectory_plan_id == "plan"
+    assert node._timeline is None
+    assert node._trajectory_hold_action == held
+    assert node._events[-1].event_type == "trajectory_command_rejected"
+    assert "C2 handoff is infeasible" in node._events[-1].detail
+
+
+def test_c2_handoff_falls_back_from_three_knots_to_two(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(robot_bridge, "_now", lambda: clock[0])
+    node = _ready_trajectory_node(clock)
+    attempts = []
+
+    def validate_blend(timeline):
+        attempts.append(timeline.blend.end_phase)
+        if timeline.blend.end_phase == 3.0:
+            raise robot_bridge.SafetyError("synthetic 3-knot rejection")
+        return 0.2, 0.8, 4.0
+
+    monkeypatch.setattr(node, "_validate_rtc_blend_locked", validate_blend)
+    knots = tuple(_arm_action(index * 0.001) for index in range(robot_bridge.RTC_HORIZON))
+
+    node.accept_command(
+        robot_bridge.LoadTrajectoryCommand(
+            1,
+            1,
+            "session",
+            "plan",
+            0,
+            knots,
+            5.0,
+            robot_bridge.RTC_HORIZON,
+            True,
+            c2_handoff=True,
+        )
+    )
+
+    loaded = node._events[-1]
+    assert attempts == [3.0, 2.0]
+    assert loaded.event_type == "trajectory_loaded"
+    assert loaded.blend_duration_knots == 2
+    assert node._timeline.blend.end_phase == 2.0
+
+
 def test_fake_bridge_checkpoint_resume_and_atomic_rtc_merge(monkeypatch):
     clock = [100.0]
     monkeypatch.setattr(robot_bridge, "_now", lambda: clock[0])
@@ -765,3 +1067,185 @@ def test_fake_bridge_checkpoint_resume_and_atomic_rtc_merge(monkeypatch):
     assert merged.blend_max_velocity_rad_s <= 0.45
     assert merged.blend_max_acceleration_rad_s2 <= 2.0
     assert merged.blend_max_jerk_rad_s3 <= 20.0
+
+
+def test_fake_bridge_c2_reject_hold_sync_bootstrap_and_merge(monkeypatch):
+    clock = [200.0]
+    monkeypatch.setattr(robot_bridge, "_now", lambda: clock[0])
+    node = _ready_trajectory_node(clock)
+    old_knots = tuple(
+        _arm_action(index * 0.003) for index in range(robot_bridge.RTC_HORIZON)
+    )
+    node.accept_command(
+        robot_bridge.LoadTrajectoryCommand(
+            1,
+            1,
+            "recovery-session",
+            "old-plan",
+            0,
+            old_knots,
+            5.0,
+            robot_bridge.RTC_EXECUTION_HORIZON,
+            True,
+        )
+    )
+    checkpoint = _drive_fake_bridge_until(node, clock, "checkpoint_ready")
+    assert checkpoint.plan_id == "old-plan"
+    assert checkpoint.timeline_version == 1
+    assert checkpoint.checkpoint_id == 1
+
+    node.accept_command(
+        robot_bridge.ResumeTrajectoryCommand(
+            2,
+            "recovery-session",
+            "old-plan",
+            1,
+            1,
+            "failed-request",
+            2,
+        )
+    )
+    unsafe = tuple(_arm_action(0.2) for _ in range(robot_bridge.RTC_HORIZON))
+    node.accept_command(
+        robot_bridge.StageRtcChunkCommand(
+            3,
+            "recovery-session",
+            "old-plan",
+            "unsafe-plan",
+            1,
+            1,
+            "failed-request",
+            2,
+            robot_bridge.RTC_EXECUTION_HORIZON,
+            unsafe,
+        )
+    )
+    _drive_fake_bridge_until(node, clock, "rtc_invalid")
+    invalid = [event for event in node._events if event.event_type == "rtc_invalid"][-1]
+    assert invalid.request_id == "failed-request"
+    assert invalid.reason_code == "c2_blend_infeasible"
+    assert node._trajectory_plan_id == "old-plan"
+    assert node._timeline_version == 1
+
+    node.accept_command(robot_bridge.LatchMeasuredHoldCommand(4, "recovery-session", 1, True))
+    holding = node._events[-1]
+    assert holding.event_type == "measured_holding"
+    assert holding.timeline_version == 2
+    assert node._active_request_id is None
+    assert node._pending_rtc is None
+    held_action = node._trajectory_hold_action
+
+    node.accept_command(
+        robot_bridge.StageRtcChunkCommand(
+            5,
+            "recovery-session",
+            "old-plan",
+            "late-plan",
+            1,
+            1,
+            "failed-request",
+            2,
+            robot_bridge.RTC_EXECUTION_HORIZON,
+            unsafe,
+        )
+    )
+    late_rejection = node._events[-1]
+    assert late_rejection.event_type == "trajectory_command_rejected"
+    assert node._timeline_version == 2
+    assert node._trajectory_hold_action == held_action
+
+    sync_knots = tuple(held_action for _ in range(robot_bridge.RTC_HORIZON))
+    node._latest_observation = replace(node._latest_observation, seq=2)
+    node.accept_command(
+        robot_bridge.LoadTrajectoryCommand(
+            6,
+            2,
+            "recovery-session",
+            "sync-plan",
+            2,
+            sync_knots,
+            5.0,
+            robot_bridge.RTC_HORIZON,
+            True,
+            chunk_timeout_s=5.0,
+            c2_handoff=True,
+        )
+    )
+    sync_event_seq = node._event_seq
+    sync_checkpoint = _drive_fake_bridge_until(
+        node,
+        clock,
+        "checkpoint_ready",
+        newer_than=sync_event_seq,
+    )
+    assert sync_checkpoint.plan_id == "sync-plan"
+    assert sync_checkpoint.timeline_version == 3
+    assert sync_checkpoint.reason_code == "chunk_clean"
+    assert sync_checkpoint.deadline_monotonic is not None
+
+    bootstrap_knots = tuple(
+        _arm_action(robot_bridge.action_arms(held_action)[0] + index * 0.002)
+        for index in range(robot_bridge.RTC_HORIZON)
+    )
+    node._latest_observation = replace(node._latest_observation, seq=3)
+    node.accept_command(
+        robot_bridge.LoadTrajectoryCommand(
+            7,
+            3,
+            "recovery-session",
+            "bootstrap-plan",
+            3,
+            bootstrap_knots,
+            5.0,
+            robot_bridge.RTC_EXECUTION_HORIZON,
+            True,
+            c2_handoff=True,
+        )
+    )
+    bootstrap_event_seq = node._event_seq
+    bootstrap_checkpoint = _drive_fake_bridge_until(
+        node,
+        clock,
+        "checkpoint_ready",
+        newer_than=bootstrap_event_seq,
+    )
+    assert bootstrap_checkpoint.plan_id == "bootstrap-plan"
+    assert bootstrap_checkpoint.timeline_version == 4
+    assert bootstrap_checkpoint.checkpoint_id == 3
+
+    node.accept_command(
+        robot_bridge.ResumeTrajectoryCommand(
+            8,
+            "recovery-session",
+            "bootstrap-plan",
+            4,
+            3,
+            "recovered-request",
+            2,
+        )
+    )
+    replacement = tuple(
+        _arm_action(bootstrap_knots[10][0] + index * 0.002)
+        for index in range(robot_bridge.RTC_HORIZON)
+    )
+    node.accept_command(
+        robot_bridge.StageRtcChunkCommand(
+            9,
+            "recovery-session",
+            "bootstrap-plan",
+            "recovered-plan",
+            4,
+            3,
+            "recovered-request",
+            2,
+            robot_bridge.RTC_EXECUTION_HORIZON,
+            replacement,
+        )
+    )
+    merged = _drive_fake_bridge_until(node, clock, "rtc_merged")
+    assert merged.request_id == "recovered-request"
+    assert merged.plan_id == "recovered-plan"
+    assert merged.timeline_version == 5
+    assert merged.actual_delay_steps == 1
+    assert node._trajectory_session_id == "recovery-session"
+    assert node._trajectory_plan_id == "recovered-plan"

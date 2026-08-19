@@ -140,7 +140,7 @@ uv run python -m marvinpro_deploy.rollout_client \
 默认没有 `--execute`，客户端不会向 bridge 发送任何 action。检查日志应满足：
 
 - policy 输出恒为 `(20, 16)` 且 finite；
-- `wall` 通常约为此前实测的 90-120 ms；
+- 当前远程 H20 服务的 20 次持久请求 wall p50/p95 约为 `343/390 ms`，单次请求必须小于默认 2 秒 timeout；
 - 相机、关节和左右夹爪 age 没有超限，日志显示 `gripper_state_source=measured_feedback`；
 - 能持续完成 inference，没有图像裁剪或连接错误。
 
@@ -209,14 +209,14 @@ hold，不会重复执行过时的预测动作。
 
 bridge 使用 pickle 传输 JPEG 和数据结构，只能暴露在可信的机器人私有网络，不应映射到公网。
 
-## 跟踪感知时间轴与 RTC（protocol v9）
+## 跟踪感知时间轴与 RTC（protocol v10）
 
-`tracking` 和 `rtc` 使用 bridge 本地 100 Hz trajectory owner。控制 timer 只对连续 phase 求值，不会按
+`synchronized`、`tracking` 和 `rtc` 使用 bridge 本地 100 Hz trajectory owner。控制 timer 只对连续 phase 求值，不会按
 100 Hz 自动消费模型动作；机器人跟踪误差增大时，phase 会减速或冻结。RTC A9 checkpoint 只有在全部14个
 臂关节误差不超过 `0.01 rad`，并且由持续更新的 joint source timestamp 证明连续稳定 `0.20 s` 后才成立。
 因此“客户端已经发出 A9，但反馈仍在 A8”不会触发新观测。
 
-`tracking` 和 `rtc` 固定使用 `--model-hz 15 --playback-time-scale 3`，名义 knot rate 为 `5 Hz`；其他倍率
+三种 trajectory schedule 固定使用 `--model-hz 15 --playback-time-scale 3`，名义 knot rate 为 `5 Hz`；其他倍率
 会被客户端拒绝。tracking error 在 `<=0.02 rad` 时 phase rate 为 1，在 `0.02..0.16 rad` 内按
 `(0.16-error)/0.14` 线性降低，在 `>=0.16 rad` 时硬冻结。由 tracking error 触发硬冻结后，误差降到
 `<=0.12 rad` 才解除锁存；joint state stale、timer overrun 和 arm clipping 仍直接硬冻结。臂关节 safety
@@ -228,12 +228,12 @@ bridge 在物理 `d_actual == d_pred` 边界使迟到 epoch 无效，结果不�
 停顿、边界跳变和恢复率。fallback 会重置 estimator epoch，但 bridge 的 `d_actual` 始终按实际 phase 跨过的
 knot 计数，不使用 `wall_time * nominal_rate`。
 
-protocol v9 必须同时更新控制器上的 `MarvinPro_deploy` 和本机客户端。夹爪状态使用归一化实测 feedback，
+protocol v10 必须同时更新控制器上的 `MarvinPro_deploy` 和本机客户端。夹爪状态使用归一化实测 feedback，
 原始 `q/dq/tau/温度` 写入 telemetry；RTC 的 tracking governor 仍只使用 14 个机械臂关节误差，夹爪不参与
 机械臂到位判定。
 trajectory session 每 `100 ms`
 发送 heartbeat；bridge 超过 `250 ms` 未收到会清空 trajectory 并停止发布。旧的 discrete、prefetch、
-synchronized 和诊断客户端仍使用 legacy `ActionCommand` 路径。
+legacy discrete/prefetch 仍使用 `ActionCommand`；synchronized 已统一到 bridge-owned timed chunk。
 
 先只验证 bridge governor，不启用 RTC merge：
 
@@ -262,7 +262,7 @@ uv run python -m marvinpro_deploy.rollout_client \
   --control-hz 100 \
   --model-hz 15 \
   --playback-time-scale 3 \
-  --execute-steps 10 \
+  --execute-steps 20 \
   --log-level DEBUG \
   --console-log-level WARNING \
   --log-file "$RUN_DIR/rollout.log"
@@ -291,7 +291,7 @@ scripts/plot_rollout_joints.py \
 远程 OpenPI 必须先完成
 `/home/jh/OpenPI_UR/openpi/REMOTE_RTC_TESTS.md`。之后第一轮只运行 shadow：新观测在
 物理 A9 checkpoint 后采集，推理期间 bridge 继续执行 A10/A11 等旧节点，客户端等待实际 `d_pred` 边界并
-记录 `d_actual`，但不合并 RTC 输出；随后本 episode 固定降级 synchronized。
+记录 `d_actual`，但不合并 RTC 输出；shadow 随后固定降级 synchronized，不自动重进 RTC。
 
 ```bash
 export RUN_DIR="$(cat /tmp/marvinpro_tracking_run_dir)"
@@ -308,7 +308,7 @@ uv run python -m marvinpro_deploy.rollout_client \
   --control-hz 100 \
   --model-hz 15 \
   --playback-time-scale 3 \
-  --execute-steps 10 \
+  --execute-steps 20 \
   --log-level DEBUG \
   --console-log-level WARNING \
   --log-file "$RUN_DIR/rtc-shadow.log"
@@ -317,8 +317,10 @@ uv run python -m marvinpro_deploy.rollout_client \
 shadow、单 chunk governor 和 synchronized 回归全部通过后，删除 `--rtc-shadow` 才允许实际 merge；首轮实际
 测试必须加 `--max-rtc-merges 1`，达到一次成功 replacement merge 后，客户端会等待当前 RTC 段到达下一个 checkpoint，再锁存 hold。RTC
 只在下一个整数 knot 边界替换 future，并由 bridge 重新计算 `d_actual`。clipping、hard freeze、反馈过期、
-heartbeat 超时、ID/version 不匹配、迟到结果或 `d_actual > d_pred` 都会拒绝结果；任一次失败后，本 episode 不再重试
-RTC，而是固定 hold、重新确认跟踪和新图像，然后使用 bridge-owned synchronized 执行。
+heartbeat 超时、ID/version 不匹配、迟到结果或 `d_actual > d_pred` 都会拒绝结果。late/discard、瞬时 transport、
+可重采样 observation lag 和 C2 merge 不可行属于可恢复故障：bridge 原子锁存实测臂位置并保留夹爪命令，
+至少完成一个 clean timed synchronized chunk 后，用新 H20 推理重建 estimator epoch 和 RTC 初始计划。每轮最多
+恢复 3 次；安全、事务和协议故障只进入 fixed hold，不自动重进 RTC。
 
 每次 RTC 请求日志分别记录 observation preparation、request build/serialization、transport round trip、
 估算的 network round trip、server deserialize/queue/infer、RTC preprocess/denoise/postprocess、response decode
@@ -389,9 +391,9 @@ uv run python -m marvinpro_deploy.rollout_client \
 -> 等待一帧新的图像/关节观测 -> 远程推理 -> 执行下一chunk
 ```
 
-同步等待和远程推理期间，客户端持续发送上一chunk的末目标。它不会用不断变化的测量姿态覆盖末目标，
-因此机器人可以继续跟踪到位。到episode时限后不会启动新chunk，但已经启动的chunk仍会完整执行、到位
-并完成重观测，所以实际结束时间可能超过 `--episode-seconds`。
+每个 H20 synchronized chunk 从 controller 的 `trajectory_loaded` 起有 `4 s + 1 s` deadline。5 秒内到位并基于
+真实 source timestamp 稳定 `0.20 s` 才算 clean；健康超时时 bridge 会原子锁存当前实测臂位置，再从新图像
+推理。连续两次卡住后结束运动。episode 剩余不足 5 秒时不再启动新 chunk。
 
 先在 Apex 保持 Input Mode 为 None，启动100 Hz bridge：
 
@@ -407,7 +409,7 @@ printf '%s\n' "$RUN_DIR" | tee /tmp/marvinpro_synchronized_run_dir
   --publish-hz 100
 ```
 
-另一个终端运行首轮6秒、2倍时间尺度测试：
+另一个终端运行首轮10秒、3倍时间尺度测试：
 
 ```bash
 cd /home/jh/OpenPI_UR/openpi
@@ -417,21 +419,20 @@ uv run python -m marvinpro_deploy.rollout_client \
   --robot-host 6.6.7.100 \
   --policy-host 192.168.50.73 \
   --execute \
-  --episode-seconds 6 \
+  --episode-seconds 10 \
   --rollout-schedule synchronized \
   --playback-mode interpolated \
   --control-hz 100 \
   --model-hz 15 \
-  --playback-time-scale 2 \
-  --execute-steps 10 \
+  --playback-time-scale 3 \
+  --execute-steps 20 \
   --log-level DEBUG \
   --console-log-level WARNING \
   --log-file "$RUN_DIR/rollout.log"
 ```
 
-默认到位条件是所有臂关节误差不超过 `0.01 rad` 并连续保持 `0.20 s`，随后再稳定保持 `0.20 s`，每个
-阶段最长等待 `5 s`。夹爪不参与到位判断。终端会逐chunk显示推理时间、首节点边界差、到位耗时和最终
-误差；episode结束后按提示将 Input Mode 切回 None。
+默认到位条件是所有臂关节误差不超过 `0.01 rad` 并连续保持 `0.20 s`。夹爪不参与到位判断。结构化日志会记录
+chunk deadline、phase、最差关节、最终误差和 stuck replan 计数；episode结束后按提示将 Input Mode 切回 None。
 
 结束等待阶段同样只锁存一次当前测量姿态。固定目标会一直保持到 Input Mode 离开 Custom，不会把残余
 运动中的后续反馈再次变成新目标，从而避免结束阶段的单向漂移。该修复已通过短时2.0x真机回归确认。

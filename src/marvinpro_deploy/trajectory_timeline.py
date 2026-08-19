@@ -214,3 +214,32 @@ class TrajectoryTimeline:
             timeline,
             float(phase),
         )
+
+    def with_c2_handoff(self, anchor, *, blend_knots: int) -> "TrajectoryTimeline":
+        """Start this timeline from a stationary measured anchor with a C2 blend."""
+        if blend_knots not in (2, 3):
+            raise ValueError("trajectory handoff blend must span 2 or 3 knots")
+        anchor = _finite_vector(anchor, width=16, label="trajectory handoff anchor")
+        knots = list(self.knots)
+        knots[0] = anchor
+        timeline = TrajectoryTimeline(tuple(knots), self.knot_hz, self.checkpoint_horizon)
+        end_phase = float(blend_knots)
+        if end_phase > timeline.checkpoint_phase or end_phase >= timeline.final_phase:
+            raise ValueError("trajectory handoff blend does not fit before the checkpoint")
+        end_position, end_velocity, end_acceleration, _ = timeline.phase_kinematics(
+            end_phase, side="right"
+        )
+        zeros = (0.0,) * 16
+        blend = QuinticBlend.create(
+            start_phase=0.0,
+            end_phase=end_phase,
+            start_position=anchor,
+            start_velocity=zeros,
+            start_acceleration=zeros,
+            end_position=end_position,
+            end_velocity=end_velocity,
+            end_acceleration=end_acceleration,
+        )
+        return TrajectoryTimeline(
+            tuple(knots), self.knot_hz, self.checkpoint_horizon, blend=blend
+        )

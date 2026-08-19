@@ -46,6 +46,7 @@ from .protocol import (
     ActionCommand,
     BridgeHello,
     HoldPositionCommand,
+    LatchMeasuredHoldCommand,
     LoadTrajectoryCommand,
     ProtocolError,
     RobotObservation,
@@ -389,7 +390,9 @@ class RobotConnection:
                                 "sent_target=%s boundary_old_velocity=%s boundary_new_velocity=%s "
                                 "boundary_velocity_jump_rad=%s boundary_acceleration_jump_rad=%s "
                                 "blend_duration_knots=%s blend_max_velocity_rad_s=%s "
-                                "blend_max_acceleration_rad_s2=%s blend_max_jerk_rad_s3=%s detail=%r",
+                                "blend_max_acceleration_rad_s2=%s blend_max_jerk_rad_s3=%s "
+                                "reason_code=%s deadline=%s elapsed_s=%s worst_joint=%s "
+                                "final_error_rad=%s detail=%r",
                                 message.event_type,
                                 message.event_seq,
                                 message.session_id,
@@ -418,6 +421,11 @@ class RobotConnection:
                                 getattr(message, "blend_max_velocity_rad_s", None),
                                 getattr(message, "blend_max_acceleration_rad_s2", None),
                                 getattr(message, "blend_max_jerk_rad_s3", None),
+                                getattr(message, "reason_code", None),
+                                getattr(message, "deadline_monotonic", None),
+                                getattr(message, "elapsed_s", None),
+                                getattr(message, "worst_joint", None),
+                                getattr(message, "final_error_rad", None),
                                 message.detail,
                             )
                     else:
@@ -1139,6 +1147,30 @@ def _wait_for_none_after_rollout(
                 raise
 
 
+def _wait_for_none_after_trajectory(connection: RobotConnection, timeout_s: float) -> None:
+    print("\nROLLOUT COMPLETE")
+    print("  Motion commands are finished; the bridge is holding one measured fixed target.")
+    print("  Change Apex Input Mode to None now; the client will then exit.", flush=True)
+    deadline = time.monotonic() + timeout_s
+    last_seq = -1
+    while True:
+        observation = connection.latest()
+        if observation.input_mode != 3:
+            LOGGER.warning("rollout_exit_mode_confirmed input_mode=%s", observation.input_mode)
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RolloutError(
+                f"Input Mode stayed Custom for {timeout_s:.1f}s after rollout; disconnecting via watchdog"
+            )
+        try:
+            observation = connection.wait_for_observation(timeout_s=min(1.0, remaining), newer_than=last_seq)
+            last_seq = observation.seq
+        except RolloutError as exc:
+            if "timed out waiting" not in str(exc):
+                raise
+
+
 def _wait_for_plan_threshold(
     plan: ActionPlan,
     publisher: ActionPublisher,
@@ -1502,6 +1534,8 @@ def _load_bridge_trajectory(
     checkpoint_horizon: int,
     timeout_s: float,
     continuous_checkpoint: bool = False,
+    chunk_timeout_s: float | None = None,
+    c2_handoff: bool = False,
 ) -> TrajectoryEvent:
     connection.send(
         LoadTrajectoryCommand(
@@ -1515,6 +1549,8 @@ def _load_bridge_trajectory(
             checkpoint_horizon=checkpoint_horizon,
             execute=True,
             continuous_checkpoint=continuous_checkpoint,
+            chunk_timeout_s=chunk_timeout_s,
+            c2_handoff=c2_handoff,
         )
     )
     event = connection.wait_for_event(
@@ -1653,6 +1689,45 @@ def _hold_bridge_position(
     return event
 
 
+def _latch_measured_bridge_position(
+    connection: RobotConnection,
+    command_ids: _CommandIds,
+    *,
+    session_id: str,
+    reason: str,
+    reason_code: str,
+    timeout_s: float,
+) -> TrajectoryEvent:
+    """Ask the controller to atomically replace an unreachable target with feedback."""
+    state = connection.latest_state(max_local_age_s=0.50)
+    connection.send(
+        LatchMeasuredHoldCommand(
+            command_id=command_ids.next(),
+            session_id=session_id,
+            expected_timeline_version=state.timeline_version,
+            execute=True,
+            reason=reason,
+            reason_code=reason_code,
+        )
+    )
+    event = connection.wait_for_event(
+        timeout_s=timeout_s,
+        event_types=("measured_holding", "trajectory_command_rejected", "trajectory_stopped"),
+    )
+    if event.event_type != "measured_holding":
+        raise RolloutError(f"bridge could not latch measured hold: {event.detail}")
+    LOGGER.warning(
+        "measured_hold_latched session=%s version=%d old_target_delta_rad=%s measured_target=%s "
+        "reason_code=%s",
+        session_id,
+        event.timeline_version,
+        event.final_error_rad,
+        event.raw_reference,
+        event.reason_code,
+    )
+    return event
+
+
 def _fresh_observation_after_source_time(
     connection: RobotConnection,
     source_time: float,
@@ -1681,6 +1756,15 @@ def _fresh_observation_after_source_time(
     )
 
 
+@dataclass(frozen=True)
+class TimedSynchronizedResult:
+    inference_count: int
+    observation: RobotObservation
+    clean_chunks: int
+    stuck_replans: int
+    exhausted: bool
+
+
 def _run_bridge_synchronized(
     args: argparse.Namespace,
     connection: RobotConnection,
@@ -1692,18 +1776,43 @@ def _run_bridge_synchronized(
     initial_observation: RobotObservation,
     initial_actions: np.ndarray | None,
     episode_deadline: float,
-) -> int:
+    required_clean_chunks: int | None = None,
+) -> TimedSynchronizedResult:
     inference_count = 0
     observation = initial_observation
     actions = initial_actions
     effective_knot_hz = args.model_hz / args.playback_time_scale
+    nominal_chunk_s = RTC_HORIZON / effective_knot_hz
+    chunk_timeout_s = nominal_chunk_s + args.sync_chunk_timeout_grace
+    stuck_replans = 0
+    clean_chunks = 0
     while time.monotonic() < episode_deadline:
         if heartbeat.error is not None:
             raise RolloutError(f"trajectory heartbeat failed: {heartbeat.error}")
+        if episode_deadline - time.monotonic() < chunk_timeout_s:
+            LOGGER.info(
+                "timed_sync_episode_tail remaining_s=%.3f chunk_timeout_s=%.3f; entering hold",
+                max(0.0, episode_deadline - time.monotonic()),
+                chunk_timeout_s,
+            )
+            break
         if actions is None:
             actions, timing = infer_actions(policy, observation, args.prompt)
             inference_count += 1
-            LOGGER.info("synchronized fallback inference wall_ms=%.1f", timing["wall_ms"])
+            LOGGER.info(
+                "timed_sync_inference wall_ms=%.1f stuck_replans=%d clean_chunks=%d",
+                timing["wall_ms"],
+                stuck_replans,
+                clean_chunks,
+            )
+        if episode_deadline - time.monotonic() < chunk_timeout_s:
+            LOGGER.info(
+                "timed_sync_inference_reached_episode_tail remaining_s=%.3f "
+                "chunk_timeout_s=%.3f; keeping measured hold",
+                max(0.0, episode_deadline - time.monotonic()),
+                chunk_timeout_s,
+            )
+            break
         state = connection.latest_state(max_local_age_s=0.50)
         plan_id = f"sync-{uuid.uuid4().hex}"
         try:
@@ -1718,6 +1827,8 @@ def _run_bridge_synchronized(
                 knot_hz=effective_knot_hz,
                 checkpoint_horizon=RTC_HORIZON,
                 timeout_s=args.tracking_timeout,
+                chunk_timeout_s=chunk_timeout_s,
+                c2_handoff=True,
             )
         except RolloutError as exc:
             if not _is_observation_lag_rejection(exc):
@@ -1737,11 +1848,65 @@ def _run_bridge_synchronized(
             continue
         heartbeat.update_version(loaded.timeline_version)
         event = connection.wait_for_event(
-            timeout_s=args.tracking_timeout + RTC_HORIZON / effective_knot_hz,
-            event_types=("checkpoint_ready", "trajectory_stopped", "trajectory_command_rejected"),
+            timeout_s=chunk_timeout_s + args.tracking_timeout,
+            event_types=(
+                "checkpoint_ready",
+                "chunk_timed_out",
+                "fatal_holding",
+                "trajectory_stopped",
+                "trajectory_command_rejected",
+            ),
         )
+        if event.event_type == "chunk_timed_out":
+            heartbeat.update_version(event.timeline_version)
+            state = connection.latest_state(max_local_age_s=0.50)
+            if not state.motion_gate_open or state.arm_clipped or state.frozen_reason not in ("hold", None):
+                raise SafetyError(
+                    "timed synchronized chunk timed out with an unhealthy bridge state: "
+                    f"gate={state.gate_reason!r} arm_clipped={state.arm_clipped} "
+                    f"frozen={state.frozen_reason!r}"
+                )
+            stuck_replans += 1
+            LOGGER.warning(
+                "timed_sync_chunk_timeout plan=%s event_seq=%d phase=%s elapsed_s=%s "
+                "deadline=%s worst_joint=%s final_error_rad=%s stuck_replans=%d/%d",
+                event.plan_id,
+                event.event_seq,
+                event.phase,
+                event.elapsed_s,
+                event.deadline_monotonic,
+                event.worst_joint,
+                event.final_error_rad,
+                stuck_replans,
+                args.max_stuck_replans,
+            )
+            if stuck_replans >= args.max_stuck_replans:
+                return TimedSynchronizedResult(
+                    inference_count, observation, clean_chunks, stuck_replans, True
+                )
+            _, stable_source_time = _wait_bridge_tracking(
+                connection,
+                tolerance_rad=args.tracking_tolerance_rad,
+                settle_seconds=args.tracking_settle_seconds,
+                timeout_s=args.tracking_timeout,
+            )
+            observation = _fresh_observation_after_source_time(
+                connection,
+                stable_source_time,
+                timeout_s=args.tracking_timeout,
+                max_source_age_s=args.max_source_age,
+                max_state_image_skew_s=args.max_state_image_skew,
+            )
+            actions = None
+            continue
         if event.event_type != "checkpoint_ready":
+            if event.event_type == "fatal_holding":
+                raise SafetyError(
+                    f"synchronized bridge entered fatal hold ({event.reason_code}): {event.detail}"
+                )
             raise RolloutError(f"synchronized bridge trajectory failed: {event.detail}")
+        clean_chunks += 1
+        stuck_replans = 0
         if time.monotonic() >= episode_deadline:
             break
         observation = _wait_checkpoint_observation(
@@ -1751,8 +1916,12 @@ def _run_bridge_synchronized(
             max_source_age_s=args.max_source_age,
             max_state_image_skew_s=args.max_state_image_skew,
         )
+        if required_clean_chunks is not None and clean_chunks >= required_clean_chunks:
+            return TimedSynchronizedResult(
+                inference_count, observation, clean_chunks, stuck_replans, False
+            )
         actions = None
-    return inference_count
+    return TimedSynchronizedResult(inference_count, observation, clean_chunks, stuck_replans, False)
 
 
 def _record_rtc_delay_sample(
@@ -1794,6 +1963,92 @@ def _timing_ms(values: object, key: str) -> float | None:
     return float(value)
 
 
+@dataclass(frozen=True)
+class RtcFailure:
+    reason_code: str
+    detail: str
+    recoverable: bool
+
+
+_RECOVERABLE_RTC_CODES = {
+    "rtc_late",
+    "rtc_shadow",
+    "transport_timeout",
+    "observation_lag",
+    "c2_blend_infeasible",
+}
+
+
+def _classify_rtc_failure(exc: BaseException, event: TrajectoryEvent | None = None) -> RtcFailure:
+    detail = str(exc)
+    if event is not None and event.reason_code:
+        code = event.reason_code
+    elif (
+        isinstance(exc, TimeoutError)
+        or "transport failed" in detail.lower()
+        or "link fault" in detail.lower()
+        or ("latency" in detail.lower() and "horizon" in detail.lower())
+    ):
+        code = "transport_timeout"
+    elif _is_observation_lag_rejection(exc):
+        code = "observation_lag"
+    elif "blend" in detail.lower() and ("infeasible" in detail.lower() or "exceeds" in detail.lower()):
+        code = "c2_blend_infeasible"
+    elif "late result" in detail.lower() or "predicted delay" in detail.lower():
+        code = "rtc_late"
+    elif "shadow result discarded" in detail.lower():
+        code = "rtc_shadow"
+    elif "clipp" in detail.lower():
+        code = "arm_clipping"
+    elif "stale" in detail.lower():
+        code = "stale_feedback"
+    elif "heartbeat" in detail.lower() or "timer" in detail.lower():
+        code = "heartbeat_or_timer"
+    elif "mismatch" in detail.lower() or "protocol" in detail.lower():
+        code = "transaction_mismatch"
+    else:
+        code = "rtc_fatal"
+    return RtcFailure(code, detail, code in _RECOVERABLE_RTC_CODES)
+
+
+def _validate_rtc_policy_metadata(metadata: object) -> None:
+    rtc_metadata = metadata.get("rtc", {}) if isinstance(metadata, dict) else {}
+    expected = {
+        "protocol": "rtc_v1",
+        "action_horizon": RTC_HORIZON,
+        "native_action_dim": len(_ACTION_NAMES),
+        "model_action_dim": 32,
+        "execution_horizon": RTC_EXECUTION_HORIZON,
+        "max_predicted_delay": RTC_MAX_DELAY,
+        "prefix_attention_schedule": "exp",
+    }
+    mismatches = {
+        key: (expected_value, rtc_metadata.get(key))
+        for key, expected_value in expected.items()
+        if rtc_metadata.get(key) != expected_value
+    }
+    if mismatches:
+        raise RolloutError(f"policy server RTC metadata mismatch: {mismatches}")
+
+
+def _reconnect_policy(policy, *, attempts: int = 3, retry_delay_s: float = 1.0) -> tuple[int, object]:
+    last_error: BaseException | None = None
+    for generation in range(1, attempts + 1):
+        try:
+            metadata = policy.reconnect()
+            _validate_rtc_policy_metadata(metadata)
+            LOGGER.warning("policy_reconnected connection_generation=%d metadata=%s", generation, metadata)
+            return generation, metadata
+        except (ConnectionError, OSError, RuntimeError, TimeoutError) as exc:
+            last_error = exc
+            LOGGER.warning(
+                "policy_reconnect_failed attempt=%d/%d detail=%r", generation, attempts, str(exc)
+            )
+            if generation < attempts:
+                time.sleep(retry_delay_s)
+    raise RolloutError(f"policy reconnect failed after {attempts} attempts: {last_error}")
+
+
 def _run_trajectory_schedule(
     args: argparse.Namespace,
     connection: RobotConnection,
@@ -1810,7 +2065,7 @@ def _run_trajectory_schedule(
     for latency_ms in warmup_latencies_ms:
         _record_rtc_delay_sample(estimator, latency_ms, effective_knot_hz, source="warmup")
     inference_count = 0
-    fallback = args.rollout_schedule == "tracking"
+    fallback = args.rollout_schedule in ("tracking", "synchronized")
 
     actions, timing = infer_actions(policy, observation, args.prompt)
     inference_count += 1
@@ -1825,6 +2080,46 @@ def _run_trajectory_schedule(
         timing["policy_timing"],
         timing["server_timing"],
     )
+    episode_deadline = time.monotonic() + args.episode_seconds
+    if fallback:
+        heartbeat.start()
+        try:
+            result = _run_bridge_synchronized(
+                args,
+                connection,
+                policy,
+                command_ids,
+                heartbeat,
+                session_id=session_id,
+                initial_observation=observation,
+                initial_actions=actions,
+                episode_deadline=episode_deadline,
+            )
+            inference_count += result.inference_count
+            if result.exhausted:
+                LOGGER.error(
+                    "timed_sync_completion status=stuck_exhausted stuck_replans=%d clean_chunks=%d",
+                    result.stuck_replans,
+                    result.clean_chunks,
+                )
+            else:
+                LOGGER.info("timed_sync_completion status=clean clean_chunks=%d", result.clean_chunks)
+            holding = _hold_bridge_position(
+                connection,
+                command_ids,
+                session_id=session_id,
+                reason="timed synchronized rollout complete",
+                timeout_s=args.tracking_timeout,
+            )
+            heartbeat.update_version(holding.timeline_version)
+            print("\nTrajectory rollout complete; timed synchronized runner is holding the target.")
+            print("Change Apex Input Mode to None now; the client will then exit.", flush=True)
+            _wait_for_none_after_trajectory(connection, args.exit_mode_timeout)
+            return inference_count
+        finally:
+            heartbeat_stop.set()
+            heartbeat.join()
+
     first_plan_id = f"plan-{uuid.uuid4().hex}"
     loaded = _load_bridge_trajectory(
         connection,
@@ -1835,7 +2130,7 @@ def _run_trajectory_schedule(
         observation_seq=observation.seq,
         actions=actions,
         knot_hz=effective_knot_hz,
-        checkpoint_horizon=RTC_HORIZON if fallback else RTC_EXECUTION_HORIZON,
+        checkpoint_horizon=RTC_EXECUTION_HORIZON,
         timeout_s=args.tracking_timeout,
         continuous_checkpoint=args.rtc_continuous,
     )
@@ -1849,36 +2144,12 @@ def _run_trajectory_schedule(
     )
     heartbeat.update_version(loaded.timeline_version)
     heartbeat.start()
-    episode_deadline = time.monotonic() + args.episode_seconds
     rtc_merge_count = 0
+    rtc_recovery_count = 0
+    policy_connection_generation = 1
+    rtc_final_status = "clean_completion"
 
     try:
-        if fallback:
-            first_checkpoint = connection.wait_for_event(
-                timeout_s=args.tracking_timeout + RTC_HORIZON / effective_knot_hz,
-                event_types=("checkpoint_ready", "trajectory_stopped", "trajectory_command_rejected"),
-            )
-            if first_checkpoint.event_type != "checkpoint_ready":
-                raise RolloutError(f"tracking trajectory failed: {first_checkpoint.detail}")
-            observation = _wait_checkpoint_observation(
-                connection,
-                first_checkpoint,
-                timeout_s=args.tracking_timeout,
-                max_source_age_s=args.max_source_age,
-                max_state_image_skew_s=args.max_state_image_skew,
-            )
-            inference_count += _run_bridge_synchronized(
-                args,
-                connection,
-                policy,
-                command_ids,
-                heartbeat,
-                session_id=session_id,
-                initial_observation=observation,
-                initial_actions=None,
-                episode_deadline=episode_deadline,
-            )
-
         while (
             time.monotonic() < episode_deadline
             or (args.max_rtc_merges is not None and rtc_merge_count >= args.max_rtc_merges)
@@ -1922,6 +2193,7 @@ def _run_trajectory_schedule(
                 max_source_age_s=args.max_source_age,
                 max_state_image_skew_s=args.max_state_image_skew,
             )
+            failure_event: TrajectoryEvent | None = None
             try:
                 predicted_delay = estimator.predicted_steps(effective_knot_hz)
                 observation_preparation_started = time.monotonic()
@@ -1977,6 +2249,7 @@ def _run_trajectory_schedule(
                                 f"bridge deadline event belongs to another request: {event.request_id}"
                             )
                         deadline_event = event
+                        failure_event = event
                         LOGGER.warning(
                             "RTC request %s bridge event while inference is active: type=%s "
                             "d_actual=%s d_pred=%d detail=%r",
@@ -1986,6 +2259,16 @@ def _run_trajectory_schedule(
                             predicted_delay,
                             event.detail,
                         )
+                        if (
+                            event.event_type != "rtc_waiting_at_deadline"
+                            or args.rtc_late_result_policy == "discard"
+                        ):
+                            policy.close()
+                            worker.join(timeout=1.0)
+                            raise RtcError(
+                                f"RTC late result discarded after bridge event {event.event_type} "
+                                f"at d_actual={event.actual_delay_steps}"
+                            )
                 if deadline_event is None:
                     deadline_event = connection.poll_event(
                         event_types=("rtc_waiting_at_deadline", "rtc_invalid", "trajectory_stopped")
@@ -2099,6 +2382,7 @@ def _run_trajectory_schedule(
                     ),
                 )
                 if merged.event_type != "rtc_merged" or merged.request_id != request_id:
+                    failure_event = merged
                     raise RtcError(f"bridge rejected RTC merge: {merged.detail or merged.event_type}")
                 stage_merge_ms = (time.monotonic() - stage_started) * 1000.0
                 LOGGER.info(
@@ -2121,18 +2405,54 @@ def _run_trajectory_schedule(
                 heartbeat.update_version(merged.timeline_version)
                 rtc_merge_count += 1
                 LOGGER.info("RTC merge count=%d limit=%s", rtc_merge_count, args.max_rtc_merges)
-            except Exception as exc:
-                LOGGER.warning("RTC disabled for the rest of this episode: %s", exc)
+            except (
+                RtcError,
+                RolloutError,
+                SafetyError,
+                ProtocolError,
+                TimeoutError,
+                ConnectionError,
+                OSError,
+            ) as exc:
+                failure = _classify_rtc_failure(exc, failure_event)
+                old_epoch = estimator.epoch
                 new_epoch = estimator.reset_epoch()
-                LOGGER.warning("rtc_delay_estimator_reset new_epoch=%d reason=%r", new_epoch, str(exc))
-                holding = _hold_bridge_position(
-                    connection,
-                    command_ids,
-                    session_id=session_id,
-                    reason=f"RTC fallback: {exc}",
-                    timeout_s=args.tracking_timeout,
+                LOGGER.warning(
+                    "rtc_failure code=%s recoverable=%s detail=%r old_epoch=%d new_epoch=%d "
+                    "connection_generation=%d merges=%d recoveries=%d",
+                    failure.reason_code,
+                    failure.recoverable,
+                    failure.detail,
+                    old_epoch,
+                    new_epoch,
+                    policy_connection_generation,
+                    rtc_merge_count,
+                    rtc_recovery_count,
                 )
-                heartbeat.update_version(holding.timeline_version)
+                try:
+                    holding = _latch_measured_bridge_position(
+                        connection,
+                        command_ids,
+                        session_id=session_id,
+                        reason=f"RTC failure: {failure.detail}",
+                        reason_code=failure.reason_code,
+                        timeout_s=args.tracking_timeout,
+                    )
+                    heartbeat.update_version(holding.timeline_version)
+                except (RolloutError, SafetyError) as hold_exc:
+                    rtc_final_status = "fatal_safety_hold"
+                    LOGGER.error(
+                        "rtc_final_status=fatal_safety_hold code=%s hold_error=%r",
+                        failure.reason_code,
+                        str(hold_exc),
+                    )
+                    break
+
+                if not failure.recoverable:
+                    rtc_final_status = "fatal_safety_hold"
+                    LOGGER.error("rtc_final_status=fatal_safety_hold code=%s", failure.reason_code)
+                    break
+
                 _, stable_source_time = _wait_bridge_tracking(
                     connection,
                     tolerance_rad=args.tracking_tolerance_rad,
@@ -2146,19 +2466,283 @@ def _run_trajectory_schedule(
                     max_source_age_s=args.max_source_age,
                     max_state_image_skew_s=args.max_state_image_skew,
                 )
-                inference_count += _run_bridge_synchronized(
-                    args,
-                    connection,
-                    policy,
-                    command_ids,
-                    heartbeat,
-                    session_id=session_id,
-                    initial_observation=observation,
-                    initial_actions=None,
-                    episode_deadline=episode_deadline,
-                )
-                break
 
+                recovery_succeeded = False
+                fallback_finished = False
+                while True:
+                    rtc_recovery_count += 1
+                    recover_rtc = (
+                        not args.rtc_shadow and rtc_recovery_count <= args.max_rtc_recoveries
+                    )
+                    if args.rtc_shadow:
+                        LOGGER.info("rtc_shadow_fallback auto_recovery=false")
+                    policy.close()
+                    try:
+                        _, metadata = _reconnect_policy(policy)
+                        policy_connection_generation += 1
+                        LOGGER.info(
+                            "rtc_recovery_connection recovery_id=%d generation=%d metadata=%s",
+                            rtc_recovery_count,
+                            policy_connection_generation,
+                            metadata,
+                        )
+                    except RolloutError as reconnect_exc:
+                        rtc_final_status = "recovery_exhausted"
+                        LOGGER.error(
+                            "rtc_final_status=recovery_exhausted recovery_id=%d reconnect_error=%r",
+                            rtc_recovery_count,
+                            str(reconnect_exc),
+                        )
+                        fallback_finished = True
+                        break
+
+                    try:
+                        sync_result = _run_bridge_synchronized(
+                            args,
+                            connection,
+                            policy,
+                            command_ids,
+                            heartbeat,
+                            session_id=session_id,
+                            initial_observation=observation,
+                            initial_actions=None,
+                            episode_deadline=episode_deadline,
+                            required_clean_chunks=1 if recover_rtc else None,
+                        )
+                    except (
+                        RolloutError,
+                        SafetyError,
+                        ProtocolError,
+                        TimeoutError,
+                        ConnectionError,
+                        OSError,
+                    ) as fallback_exc:
+                        fallback_failure = _classify_rtc_failure(fallback_exc)
+                        LOGGER.warning(
+                            "rtc_recovery_sync_failed recovery_id=%d code=%s recoverable=%s "
+                            "detail=%r",
+                            rtc_recovery_count,
+                            fallback_failure.reason_code,
+                            fallback_failure.recoverable,
+                            str(fallback_exc),
+                        )
+                        if (
+                            fallback_failure.recoverable
+                            and recover_rtc
+                            and rtc_recovery_count < args.max_rtc_recoveries
+                        ):
+                            old_epoch = estimator.epoch
+                            new_epoch = estimator.reset_epoch()
+                            LOGGER.warning(
+                                "rtc_recovery_sync_retry recovery_id=%d old_epoch=%d new_epoch=%d",
+                                rtc_recovery_count,
+                                old_epoch,
+                                new_epoch,
+                            )
+                            try:
+                                holding = _latch_measured_bridge_position(
+                                    connection,
+                                    command_ids,
+                                    session_id=session_id,
+                                    reason=f"RTC synchronized recovery failure: {fallback_exc}",
+                                    reason_code=fallback_failure.reason_code,
+                                    timeout_s=args.tracking_timeout,
+                                )
+                                heartbeat.update_version(holding.timeline_version)
+                                _, stable_source_time = _wait_bridge_tracking(
+                                    connection,
+                                    tolerance_rad=args.tracking_tolerance_rad,
+                                    settle_seconds=args.tracking_settle_seconds,
+                                    timeout_s=args.tracking_timeout,
+                                )
+                                observation = _fresh_observation_after_source_time(
+                                    connection,
+                                    stable_source_time,
+                                    timeout_s=args.tracking_timeout,
+                                    max_source_age_s=args.max_source_age,
+                                    max_state_image_skew_s=args.max_state_image_skew,
+                                )
+                            except (RolloutError, SafetyError) as hold_exc:
+                                rtc_final_status = "fatal_safety_hold"
+                                LOGGER.error(
+                                    "rtc_final_status=fatal_safety_hold recovery_id=%d "
+                                    "hold_error=%r",
+                                    rtc_recovery_count,
+                                    str(hold_exc),
+                                )
+                                fallback_finished = True
+                                break
+                            continue
+                        rtc_final_status = (
+                            "recovery_exhausted"
+                            if fallback_failure.recoverable
+                            else "fatal_safety_hold"
+                        )
+                        LOGGER.error(
+                            "rtc_final_status=%s recovery_id=%d fallback_error=%r",
+                            rtc_final_status,
+                            rtc_recovery_count,
+                            str(fallback_exc),
+                        )
+                        fallback_finished = True
+                        break
+                    inference_count += sync_result.inference_count
+                    observation = sync_result.observation
+                    if sync_result.exhausted:
+                        rtc_final_status = "stuck_exhausted"
+                        LOGGER.error(
+                            "rtc_final_status=stuck_exhausted recovery_id=%d stuck_replans=%d",
+                            rtc_recovery_count,
+                            sync_result.stuck_replans,
+                        )
+                        fallback_finished = True
+                        break
+                    if not recover_rtc:
+                        rtc_final_status = (
+                            "clean_completion" if args.rtc_shadow else "recovery_exhausted"
+                        )
+                        LOGGER.warning(
+                            "rtc_final_status=recovery_exhausted recoveries=%d max=%d; "
+                            "timed synchronized fallback completed",
+                            rtc_recovery_count,
+                            args.max_rtc_recoveries,
+                        )
+                        fallback_finished = True
+                        break
+                    if sync_result.clean_chunks < 1:
+                        LOGGER.info("rtc_recovery_skipped_no_time recovery_id=%d", rtc_recovery_count)
+                        fallback_finished = True
+                        break
+
+                    try:
+                        bootstrap_actions, bootstrap_timing = infer_actions(
+                            policy, observation, args.prompt
+                        )
+                        inference_count += 1
+                        sample = _record_rtc_delay_sample(
+                            estimator,
+                            bootstrap_timing["wall_ms"],
+                            effective_knot_hz,
+                            source=f"recovery_bootstrap:{rtc_recovery_count}",
+                        )
+                        if not sample.accepted:
+                            raise RtcError(
+                                f"RTC bootstrap latency rejected by delay estimator: {sample.reason}"
+                            )
+                        bootstrap_plan_id = f"recovery-{rtc_recovery_count}-{uuid.uuid4().hex}"
+                        bootstrapped = _load_bridge_trajectory(
+                            connection,
+                            command_ids,
+                            session_id=session_id,
+                            plan_id=bootstrap_plan_id,
+                            expected_timeline_version=connection.latest_state(
+                                max_local_age_s=0.50
+                            ).timeline_version,
+                            observation_seq=observation.seq,
+                            actions=bootstrap_actions,
+                            knot_hz=effective_knot_hz,
+                            checkpoint_horizon=RTC_EXECUTION_HORIZON,
+                            timeout_s=args.tracking_timeout,
+                            continuous_checkpoint=args.rtc_continuous,
+                            c2_handoff=True,
+                        )
+                    except (
+                        RtcError,
+                        RolloutError,
+                        SafetyError,
+                        ProtocolError,
+                        TimeoutError,
+                        ConnectionError,
+                        OSError,
+                    ) as bootstrap_exc:
+                        bootstrap_failure = _classify_rtc_failure(bootstrap_exc)
+                        LOGGER.error(
+                            "rtc_recovery_bootstrap_failed recovery_id=%d code=%s "
+                            "recoverable=%s detail=%r",
+                            rtc_recovery_count,
+                            bootstrap_failure.reason_code,
+                            bootstrap_failure.recoverable,
+                            str(bootstrap_exc),
+                        )
+                        if (
+                            not bootstrap_failure.recoverable
+                            or rtc_recovery_count >= args.max_rtc_recoveries
+                        ):
+                            rtc_final_status = (
+                                "recovery_exhausted"
+                                if bootstrap_failure.recoverable
+                                else "fatal_safety_hold"
+                            )
+                            fallback_finished = True
+                            break
+                        old_epoch = estimator.epoch
+                        new_epoch = estimator.reset_epoch()
+                        LOGGER.warning(
+                            "rtc_recovery_bootstrap_epoch_reset recovery_id=%d old_epoch=%d "
+                            "new_epoch=%d",
+                            rtc_recovery_count,
+                            old_epoch,
+                            new_epoch,
+                        )
+                        try:
+                            holding = _latch_measured_bridge_position(
+                                connection,
+                                command_ids,
+                                session_id=session_id,
+                                reason=f"RTC bootstrap failure: {bootstrap_exc}",
+                                reason_code=bootstrap_failure.reason_code,
+                                timeout_s=args.tracking_timeout,
+                            )
+                            heartbeat.update_version(holding.timeline_version)
+                            _, stable_source_time = _wait_bridge_tracking(
+                                connection,
+                                tolerance_rad=args.tracking_tolerance_rad,
+                                settle_seconds=args.tracking_settle_seconds,
+                                timeout_s=args.tracking_timeout,
+                            )
+                            observation = _fresh_observation_after_source_time(
+                                connection,
+                                stable_source_time,
+                                timeout_s=args.tracking_timeout,
+                                max_source_age_s=args.max_source_age,
+                                max_state_image_skew_s=args.max_state_image_skew,
+                            )
+                        except (RolloutError, SafetyError) as hold_exc:
+                            rtc_final_status = "fatal_safety_hold"
+                            LOGGER.error(
+                                "rtc_final_status=fatal_safety_hold recovery_id=%d hold_error=%r",
+                                rtc_recovery_count,
+                                str(hold_exc),
+                            )
+                            fallback_finished = True
+                            break
+                        continue
+                    heartbeat.update_version(bootstrapped.timeline_version)
+                    LOGGER.warning(
+                        "rtc_recovery_succeeded recovery_id=%d epoch=%d generation=%d "
+                        "bootstrap_latency_ms=%.1f merges=%d",
+                        rtc_recovery_count,
+                        estimator.epoch,
+                        policy_connection_generation,
+                        bootstrap_timing["wall_ms"],
+                        rtc_merge_count,
+                    )
+                    recovery_succeeded = True
+                    break
+                if recovery_succeeded:
+                    continue
+                if fallback_finished:
+                    break
+
+        LOGGER.warning(
+            "rtc_final_status=%s merges=%d recoveries=%d estimator_epoch=%d "
+            "connection_generation=%d",
+            rtc_final_status,
+            rtc_merge_count,
+            rtc_recovery_count,
+            estimator.epoch,
+            policy_connection_generation,
+        )
         holding = _hold_bridge_position(
             connection,
             command_ids,
@@ -2186,6 +2770,7 @@ def _run_trajectory_schedule(
 
 def run(args: argparse.Namespace) -> int:
     connection: RobotConnection | None = None
+    policy = None
     telemetry: JointTelemetryRecorder | None = None
     stop = threading.Event()
     publisher: ActionPublisher | None = None
@@ -2255,7 +2840,12 @@ def run(args: argparse.Namespace) -> int:
         if args.log_level != "DEBUG":
             root_logger.setLevel(logging.WARNING)
         try:
-            policy = websocket_client_policy.WebsocketClientPolicy(args.policy_host, args.policy_port)
+            policy = websocket_client_policy.WebsocketClientPolicy(
+                args.policy_host,
+                args.policy_port,
+                connect_timeout_s=args.policy_connect_timeout,
+                request_timeout_s=args.policy_request_timeout,
+            )
         finally:
             root_logger.setLevel(previous_root_level)
         LOGGER.info("policy_metadata=%s", policy.get_server_metadata())
@@ -2275,15 +2865,7 @@ def run(args: argparse.Namespace) -> int:
             )
 
         if args.rollout_schedule == "rtc":
-            metadata = policy.get_server_metadata()
-            rtc_metadata = metadata.get("rtc", {}) if isinstance(metadata, dict) else {}
-            if rtc_metadata.get("protocol") != "rtc_v1":
-                raise RolloutError("policy server does not advertise rtc_v1 support")
-            if rtc_metadata.get("execution_horizon") != RTC_EXECUTION_HORIZON:
-                raise RolloutError(
-                    "policy server RTC execution horizon mismatch: "
-                    f"expected {RTC_EXECUTION_HORIZON}, got {rtc_metadata.get('execution_horizon')!r}"
-                )
+            _validate_rtc_policy_metadata(policy.get_server_metadata())
             observation = connection.latest(args.max_observation_age)
             policy_observation = build_policy_observation(observation, args.prompt)
             current = build_state16(
@@ -2320,7 +2902,7 @@ def run(args: argparse.Namespace) -> int:
         else:
             print("\nDRY RUN: policy inference and safety filtering only; no actions will be sent.")
 
-        if args.rollout_schedule in ("tracking", "rtc"):
+        if args.rollout_schedule in ("synchronized", "tracking", "rtc"):
             inference_count = _run_trajectory_schedule(
                 args,
                 connection,
@@ -2537,6 +3119,8 @@ def run(args: argparse.Namespace) -> int:
         if publisher is not None:
             publisher.plan.clear()
             publisher.join(timeout=1.0)
+        if policy is not None:
+            policy.close()
         if connection is not None:
             connection.close(reason)
         if telemetry is not None:
@@ -2620,6 +3204,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=5.0,
         help="synchronized mode: maximum time for either tracking or stable hold",
     )
+    parser.add_argument(
+        "--sync-chunk-timeout-grace",
+        type=float,
+        default=1.0,
+        help="seconds added to the nominal synchronized H20 chunk duration",
+    )
+    parser.add_argument("--max-stuck-replans", type=int, default=2)
+    parser.add_argument("--max-rtc-recoveries", type=int, default=3)
+    parser.add_argument("--policy-connect-timeout", type=float, default=5.0)
+    parser.add_argument("--policy-request-timeout", type=float, default=2.0)
     parser.add_argument("--warmup-inferences", type=int, default=1)
     parser.add_argument("--rtc-shadow", action="store_true", help="run one RTC request, discard it, then use sync fallback")
     parser.add_argument(
@@ -2684,6 +3278,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         or args.tracking_settle_seconds < 0
         or args.post_track_hold_seconds < 0
         or args.tracking_timeout <= 0
+        or args.sync_chunk_timeout_grace < 0
+        or args.max_stuck_replans < 1
+        or args.max_rtc_recoveries < 1
+        or args.policy_connect_timeout <= 0
+        or args.policy_request_timeout <= 0
         or args.exit_mode_timeout <= 0
     ):
         parser.error("episode duration and control rate must be positive")
@@ -2709,7 +3308,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             parser.error("--rollout-schedule synchronized requires --playback-mode interpolated")
         if not args.execute:
             parser.error("--rollout-schedule synchronized requires --execute")
-    if args.rollout_schedule in ("tracking", "rtc"):
+    if args.rollout_schedule in ("synchronized", "tracking", "rtc"):
         if not args.execute:
             parser.error(f"--rollout-schedule {args.rollout_schedule} requires --execute")
         if args.playback_mode != "interpolated":
@@ -2720,11 +3319,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             or args.playback_time_scale != _TRACKING_PLAYBACK_TIME_SCALE
         ):
             parser.error(
-                "tracking/rtc requires --control-hz 100 --model-hz 15 "
+                "synchronized/tracking/rtc requires --control-hz 100 --model-hz 15 "
                 "--playback-time-scale 3 (fixed 5 Hz knot rate)"
             )
         if args.execute_steps != RTC_HORIZON:
-            parser.error(f"tracking/rtc requires --execute-steps {RTC_HORIZON}")
+            parser.error(f"synchronized/tracking/rtc requires --execute-steps {RTC_HORIZON}")
     if args.rtc_shadow and args.rollout_schedule != "rtc":
         parser.error("--rtc-shadow requires --rollout-schedule rtc")
     if args.rtc_continuous and args.rollout_schedule != "rtc":

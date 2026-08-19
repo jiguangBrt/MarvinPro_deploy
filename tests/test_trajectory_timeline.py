@@ -90,6 +90,27 @@ class TrajectoryTimelineTest(unittest.TestCase):
                 start_acceleration=knot(0),
             )
 
+    def test_c2_handoff_starts_stationary_at_measured_anchor(self):
+        timeline = TrajectoryTimeline(tuple(knot(0.2 + index * 0.01) for index in range(20)), 5.0, 20)
+
+        handoff = timeline.with_c2_handoff(knot(0.1), blend_knots=3)
+
+        start = handoff.phase_kinematics(0.0)
+        end = handoff.phase_kinematics(3.0)
+        self.assertEqual(start[0], knot(0.1))
+        self.assertEqual(start[1], knot(0.0))
+        self.assertEqual(start[2], knot(0.0))
+        for actual, expected in zip(end[0], timeline.knots[3]):
+            self.assertAlmostEqual(actual, expected)
+        for actual, expected in zip(end[1], knot(0.01)):
+            self.assertAlmostEqual(actual, expected)
+
+    def test_c2_handoff_rejects_blend_past_checkpoint(self):
+        timeline = TrajectoryTimeline(tuple(knot(index) for index in range(20)), 5.0, 3)
+
+        with self.assertRaisesRegex(ValueError, "does not fit"):
+            timeline.with_c2_handoff(knot(0), blend_knots=3)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,32 +1,51 @@
 # MarvinPro Tracking-Aware RTC Robot Test Checklist
 
-本清单记录当前机器因网络/代理条件未执行的测试。不要让自动化脚本切换 Apex Input Mode、Robot Ready、
+本清单记录当前因真机未连接而不能执行的测试。不要让自动化脚本切换 Apex Input Mode、Robot Ready、
 Impedance Mode、Home 或清故障；这些步骤必须由现场人员确认。远程推理端还必须先通过
 `/home/jh/OpenPI_UR/openpi/REMOTE_RTC_TESTS.md`。
 
 ## 已离线验证
 
-- protocol v9 序列化、版本拒绝、高频 state/image/event 分流、乱序 event 丢弃和发送公平性；
+- protocol v10 序列化、旧版本拒绝、高频 state/image/event 分流、乱序 event 丢弃和发送公平性；
 - feedback source timestamp 不会被 100 Hz timer 伪装成新反馈；
 - 慢速一阶机器人会令 phase 减速/冻结，不按控制 tick 消费动作；
 - H20/s10 下 A9 feedback 仍在 A8 时不产生 checkpoint，stale feedback 不能累计 `0.20 s` settle；
 - fake bridge 完整执行 `Load -> A9 checkpoint -> Resume -> Stage -> integer-boundary merge`；
 - merge 使用真实 `d_actual`，并将当前旧 reference 放到 `C[k-1]` 作为 anchor；
 - merge 保留硬位置锚点，并以 2～3 knot C2 blend 衔接速度和加速度；不安全的 blend 原子拒绝；
-- RTC 失败后客户端进入固定 hold，再使用 bridge-owned synchronized。
+- timed H20 chunk 在 5 秒 controller deadline 内 clean 完成；健康超时原子锁存实测臂位置且保留夹爪命令；
+- RTC 失败使用结构化 reason code；可恢复故障经过一个 clean synchronized chunk 后重建 epoch，安全故障只 hold。
+- fake bridge 已跑通 `RTC C2 reject -> measured hold -> sync clean -> bootstrap -> RTC merge`，并拒绝旧
+  request/timeline；4.9 秒 clean checkpoint 不会被 5 秒 deadline 误报为 timeout。
 
 离线测试不能证明控制器 ROS topic 频率、网络背压、真实关节响应或远程推理延迟满足要求。
+
+### 2026-08-19 protocol v10 无真机现态结果
+
+本轮没有连接 `6.6.7.100`、没有启动 controller bridge、没有切换 Apex 模式，也没有发送真机 action。
+
+- deploy 全套：`100 passed`；OpenPI WebSocket client 定向测试：`7 passed`；两个仓库相关 Ruff 全部通过。
+- `192.168.50.73:8000` TCP 直连和 `scripts/marvinpro_rtc_smoke.py` 通过；metadata 为 `rtc_v1`、H20/s10、
+  native/model action dim 16/32、`d_max=4`、`schedule=exp`，普通/RTC 输出均为有限 `(20,16)`。
+- 同一持久连接完成 20 次 RTC 请求，`d_pred=1..4` 各 5 次，0 timeout；wall latency
+  min/p50/p95/max 为 `302.834/342.882/389.927/393.233 ms`，server infer 为
+  `170.622/179.795/184.632/187.170 ms`。5 Hz 加 50 ms guard 后 p95 对应 `d_pred=3`，未超过 `d_max=4`。
+- 用 `request_timeout_s=0.001` 强制触发超时后，旧 socket 被关闭；重新连接能再次校验 metadata，并在
+  2 秒默认请求时限内返回有限 `(20,16)`。
+- 当前仍未验证 protocol v10 controller 握手、真实 H264 observation、topic freshness、实机 5 秒 deadline、
+  measured hold 是否无跳变，以及 fallback 后的真实 RTC merge；这些只按文末“最小三组测试”执行。
 
 当前 `tmp` 分支真机接口：关节、输入模式、robot/arm state、夹爪和动作 topic 均在 `/tj` 命名空间；
 相机仍为 `/quad_tile/compressed`，消息格式为 `h264`。客户端必须保留连续 H264 解码状态，不能用
 Pillow 直接把单个 H264 包当 JPEG 解码。
 
-夹爪反馈处理（2026-08-19）：已确认 `/tj/info/gripper_feedback_L/R` 可以收到左右夹爪五维信息。protocol v9
+夹爪反馈处理（2026-08-19）：已确认 `/tj/info/gripper_feedback_L/R` 可以收到左右夹爪五维信息。protocol v10
 中 policy state、action state 和 RTC handoff anchor 使用实测 `q` 按训练标定 `0.0..1.25` 归一化后的值；
 telemetry 同时记录原始/归一化位置、速度、力矩、温度、命令和位置误差。任一侧 feedback 缺失或过期会关闭
 运动门。RTC tracking governor 仍只基于 14 个机械臂关节，不使用夹爪误差推进或冻结 phase。
 
-2026-08-19 protocol v9 motion-disabled 验证已通过：5 秒 doctor 中左右 feedback 均为 `334.5 Hz`；全链路
+2026-08-19 protocol v9 motion-disabled 历史验证已通过：5 秒 doctor 中左右 feedback 均为 `334.5 Hz`；protocol
+v10 必须重新执行下述 motion-disabled dry-run。历史全链路
 dry-run 中客户端收到的左右 feedback age 为 `1.197/1.061 ms`，日志为
 `gripper_state_source=measured_feedback`，远程 H20 policy 完成 19 次推理，未发送任何 action。
 
@@ -66,7 +85,7 @@ cd /home/jh/TianJi_data_collector/MarvinPro_deploy
 记录所有 topic 频率和最新值。`/tj/joint_states` 应足以支持 50 ms stale 门限；相机、左右夹爪、input mode、
 robot state 和 arm state 均必须有消息。doctor 不通过时停止，不得通过放宽 timeout 继续。
 
-## 3. protocol v9 dry-run
+## 3. protocol v10 dry-run
 
 控制器启动不允许动作的 bridge：
 
@@ -162,7 +181,7 @@ uv run python -m marvinpro_deploy.rollout_client \
 
 ## 5. synchronized 回归
 
-使用 README 中已验证的 synchronized 参数运行至少两个 chunk。protocol v9 更新后，边界误差、跟踪时间、
+使用 README 中的 timed synchronized 参数运行至少两个 chunk。protocol v10 更新后，边界误差、跟踪时间、
 clipping 和固定 hold 行为不得劣于旧基线。回归失败时不进入 RTC shadow。
 
 Terminal A 在 Apex Input Mode 为 None 时启动 bridge，并记录本轮目录：
@@ -229,7 +248,7 @@ uv run python -m marvinpro_deploy.rollout_client \
 ```
 
 RTC 输出不会 merge。确认日志证明：物理 A9 checkpoint 后才采图；推理期间继续旧 A10/A11；bridge 在整数
-knot 边界记录 `d_actual`；shadow 丢弃后，本 episode 只运行 synchronized，不重试 RTC。
+knot 边界记录 `d_actual`；shadow 丢弃后，本 episode 只运行 timed synchronized，不自动重试 RTC。
 
 ## 7. 两 chunk RTC
 
@@ -273,9 +292,9 @@ settled RTC 通过后，才允许用 `--rtc-continuous` 验证无停车观测。
 每次启动 motion-enabled 客户端后，都要等客户端出现确认提示，再由现场人员把 Apex 切到 Custom；确认页
 显示运动门已打开后输入单个大写 `E`。动作结束后把 Apex 切回 None，等待客户端正常退出，再停止 bridge。
 
-### 测试 1：H20 基础控制与 synchronized 基线
+### 测试 1：protocol v10 motion-disabled dry-run
 
-先完成只读 doctor、远程 H20 smoke 和 motion-disabled protocol v9 dry-run。这三步不会发送机器人动作：
+先完成只读 doctor、远程 H20 smoke 和 motion-disabled protocol v10 dry-run。这三步不会发送机器人动作：
 
 ```bash
 cd /home/jh/TianJi_data_collector/MarvinPro_deploy
@@ -294,7 +313,7 @@ cd /home/jh/TianJi_data_collector/MarvinPro_deploy
 ./scripts/run_bridge_on_controller.sh --publish-hz 100
 ```
 
-Terminal B 运行 dry-run；确认 protocol v9、H20 policy 输出、相机、joint state 和夹爪 feedback 均正常后停止两端：
+Terminal B 运行 dry-run；确认 protocol v10、H20 policy 输出、相机、joint state 和夹爪 feedback 均正常后停止两端：
 
 ```bash
 cd /home/jh/OpenPI_UR/openpi
@@ -303,6 +322,10 @@ uv run python -m marvinpro_deploy.rollout_client \
   --robot-host 6.6.7.100 --policy-host 192.168.50.73 \
   --episode-seconds 10 --log-level DEBUG
 ```
+
+通过条件：hello/event/command 均为 v10，旧版本明确拒绝；policy 普通 H20 推理成功；没有发送 action。通过后再做测试2。
+
+### 测试 2：安全空间内两个 timed synchronized chunk
 
 建立本组日志并重新启动 motion-enabled bridge：
 
@@ -315,7 +338,7 @@ printf '%s\n' "$RUN_DIR" | tee /tmp/marvinpro_h20_baseline_run_dir
   --local-log "$RUN_DIR/bridge.log" --allow-motion --publish-hz 100
 ```
 
-Terminal B 先执行一个完整 H20 tracking chunk，并按上述顺序人工切 Custom、确认运动门、输入 `E`：
+Terminal B 执行两个完整 timed H20 synchronized chunk，并按上述顺序人工切 Custom、确认运动门、输入 `E`：
 
 ```bash
 cd /home/jh/OpenPI_UR/openpi
@@ -323,101 +346,52 @@ export RUN_DIR="$(cat /tmp/marvinpro_h20_baseline_run_dir)"
 PYTHONPATH=/home/jh/TianJi_data_collector/MarvinPro_deploy/src \
 uv run python -m marvinpro_deploy.rollout_client \
   --robot-host 6.6.7.100 --policy-host 192.168.50.73 --execute \
-  --episode-seconds 5 --rollout-schedule tracking \
-  --playback-mode interpolated --control-hz 100 --model-hz 15 \
-  --playback-time-scale 3 --execute-steps 20 \
-  --log-level DEBUG --console-log-level WARNING \
-  --log-file "$RUN_DIR/tracking.log"
-```
-
-tracking 结束后切回 None。确认无异常，再用同一 bridge 执行至少两个 synchronized chunk；再次按提示切
-Custom 并输入 `E`：
-
-```bash
-PYTHONPATH=/home/jh/TianJi_data_collector/MarvinPro_deploy/src \
-uv run python -m marvinpro_deploy.rollout_client \
-  --robot-host 6.6.7.100 --policy-host 192.168.50.73 --execute \
   --episode-seconds 10 --rollout-schedule synchronized \
   --playback-mode interpolated --control-hz 100 --model-hz 15 \
   --playback-time-scale 3 --execute-steps 20 \
   --log-level DEBUG --console-log-level WARNING \
+  --sync-chunk-timeout-grace 1 --max-stuck-replans 2 \
   --log-file "$RUN_DIR/synchronized.log"
 ```
 
-通过条件：tracking 完整执行 A0～A19，synchronized 至少完成两个 chunk；全程无 arm clipping、hard freeze、
-stale、timer overrun、heartbeat/motion-gate drop 或 command rejection；tracking error 和 phase-rate 分布可接受，
-现场无异常冲击。synchronized 的 chunk 间 settle/infer 停顿是已知基线，不用于评价 RTC 连续性。
+通过条件：至少两个 `checkpoint_ready reason_code=chunk_clean`；每段 deadline 为 load 后 5 秒且没有误报
+`chunk_timed_out`；全程无 clipping、hard freeze、stale、timer/heartbeat/motion-gate drop 或 command rejection；
+现场无异常冲击。测试时禁止碰桌或人为阻挡制造 timeout。
 
-### 测试 2：continuous RTC shadow
+### 测试 3：短 RTC fallback/recovery/merge
 
-重启 bridge 并建立新日志目录，然后运行只生成但不 merge 的 continuous shadow：
+重启 bridge 并建立新日志目录，然后运行短 normal RTC episode。不要使用 `--rtc-shadow`，因为 shadow 按设计
+不会自动重进 RTC：
 
 ```bash
 # Terminal A
 cd /home/jh/TianJi_data_collector/MarvinPro_deploy
-export RUN_DIR="$PWD/logs/h20_rtc_shadow_$(date +%Y%m%d_%H%M%S)"
+export RUN_DIR="$PWD/logs/h20_rtc_recovery_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$RUN_DIR"
-printf '%s\n' "$RUN_DIR" | tee /tmp/marvinpro_h20_shadow_run_dir
+printf '%s\n' "$RUN_DIR" | tee /tmp/marvinpro_h20_recovery_run_dir
 ./scripts/run_bridge_on_controller.sh \
   --local-log "$RUN_DIR/bridge.log" --allow-motion --publish-hz 100
 
 # Terminal B
 cd /home/jh/OpenPI_UR/openpi
-export RUN_DIR="$(cat /tmp/marvinpro_h20_shadow_run_dir)"
+export RUN_DIR="$(cat /tmp/marvinpro_h20_recovery_run_dir)"
 PYTHONPATH=/home/jh/TianJi_data_collector/MarvinPro_deploy/src \
 uv run python -m marvinpro_deploy.rollout_client \
   --robot-host 6.6.7.100 --policy-host 192.168.50.73 --execute \
-  --episode-seconds 8 --rollout-schedule rtc \
-  --rtc-continuous --rtc-shadow --rtc-late-result-policy discard \
+  --episode-seconds 20 --rollout-schedule rtc \
+  --rtc-continuous --rtc-late-result-policy discard --max-rtc-merges 2 \
   --playback-mode interpolated --control-hz 100 --model-hz 15 \
   --playback-time-scale 3 --execute-steps 20 \
   --log-level DEBUG --console-log-level WARNING \
-  --log-file "$RUN_DIR/rtc-shadow.log"
+  --max-rtc-recoveries 3 --max-stuck-replans 2 \
+  --policy-connect-timeout 5 --policy-request-timeout 2 \
+  --log-file "$RUN_DIR/rtc-recovery.log"
 ```
 
-通过条件：A9 continuous checkpoint 前后 phase 单调且没有 `frozen=checkpoint`；checkpoint 后的新图像与
-state 满足 `<=50 ms` skew；拿图期间跨过的 knot 正确计入 `d_actual`；本轮没有 `rtc_merged`，shadow 丢弃
-后进入 hold/synchronized fallback 属于预期；全程无 clipping、hard freeze、stale、timer overrun 或事务 ID
-错误。shadow 失败时不得进入测试 3。
-
-### 测试 3：实际 RTC merge，先 1 次再 2 次
-
-第一轮只允许一次实际 merge。重启 bridge、使用新日志，并在客户端移除 `--rtc-shadow`：
-
-```bash
-# Terminal A
-cd /home/jh/TianJi_data_collector/MarvinPro_deploy
-export RUN_DIR="$PWD/logs/h20_rtc_merge_$(date +%Y%m%d_%H%M%S)"
-mkdir -p "$RUN_DIR"
-printf '%s\n' "$RUN_DIR" | tee /tmp/marvinpro_h20_merge_run_dir
-./scripts/run_bridge_on_controller.sh \
-  --local-log "$RUN_DIR/bridge.log" --allow-motion --publish-hz 100
-
-# Terminal B：第一次只做 1 个 merge
-cd /home/jh/OpenPI_UR/openpi
-export RUN_DIR="$(cat /tmp/marvinpro_h20_merge_run_dir)"
-PYTHONPATH=/home/jh/TianJi_data_collector/MarvinPro_deploy/src \
-uv run python -m marvinpro_deploy.rollout_client \
-  --robot-host 6.6.7.100 --policy-host 192.168.50.73 --execute \
-  --episode-seconds 8 --rollout-schedule rtc \
-  --rtc-continuous --rtc-late-result-policy discard --max-rtc-merges 1 \
-  --playback-mode interpolated --control-hz 100 --model-hz 15 \
-  --playback-time-scale 3 --execute-steps 20 \
-  --log-level DEBUG --console-log-level WARNING \
-  --log-file "$RUN_DIR/rtc-merge1.log"
-```
-
-只有在 `rtc-merge1.log` 和 bridge 日志均满足下列条件后，才新开一个 episode，把参数改成
-`--episode-seconds 12 --max-rtc-merges 2`，日志改为 `rtc-merge2.log`：
-
-- 恰好出现预期数量的 `rtc_merged`，所有 request/plan/timeline/checkpoint ID 匹配；
-- `1 <= d_actual <= d_pred <= 4`，没有 deadline discard、fallback 或 old-prefix underrun；
-- hard anchor 的 position jump 为 0，C2 blend 使用 2～3 knot 且没有 unsafe/infeasible rejection；
-- 无 arm clipping、hard freeze、stale、timer overrun 或 motion-gate drop；
-- 100 Hz reference/sent target/真实 feedback 图中没有异常追赶，现场无可感知停顿、抽动或回弹。
-
-任一项失败都立即结束本轮，切回 None，保存两端完整日志，不继续两次 merge。当前“synchronized fallback
-稳定一次后重新进入 RTC”尚未实现，因此本组若进入 fallback，只记录现有 latched 行为，不测试自动重进 RTC。
+通过条件：至少一次真实 `rtc_merged`。若本轮自然发生可恢复 late/C2/transport/observation-lag，还必须看到
+`measured_holding -> 一个 chunk_clean -> recovery bootstrap -> rtc_merged`，且旧 request/timeline 无法 merge；
+若全程没有自然故障，不要碰桌或阻挡来强造 timeout，保留成功日志并把 recovery 真机项标为“尚未触发”。
+全程不得有 clipping、stale、hard freeze、事务错位或可感知冲击。
 
 ## 9. H20 下提升有效 knot rate 与扩大 `d_max`（待实施）
 

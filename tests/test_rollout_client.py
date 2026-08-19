@@ -15,15 +15,18 @@ from unittest.mock import patch
 import numpy as np
 
 from marvinpro_deploy.protocol import BridgeHello, RobotStateUpdate, TrajectoryEvent, send_message
-from marvinpro_deploy.rtc import RTC_HORIZON
+from marvinpro_deploy.rtc import RTC_HORIZON, RtcError
 from marvinpro_deploy.rollout_client import (
     _TrajectoryHeartbeat,
     _actions_tuple,
     _confirm_execution,
     _confirm_and_refresh_execution_observation,
+    _classify_rtc_failure,
     _configure_logging,
     _is_observation_lag_rejection,
+    _run_bridge_synchronized,
     _state_log_interval_s,
+    _validate_rtc_policy_metadata,
     ActionPlan,
     ActionPublisher,
     JointTelemetryRecorder,
@@ -206,6 +209,194 @@ class RobotConnectionTest(unittest.TestCase):
             bridge_socket.close()
             listener.close()
             accept_thread.join(timeout=1.0)
+
+    def test_rtc_failure_classification_prefers_structured_bridge_reason(self):
+        event = TrajectoryEvent(
+            1,
+            "rtc_invalid",
+            1.0,
+            "session",
+            "plan",
+            2,
+            3.0,
+            reason_code="c2_blend_infeasible",
+        )
+
+        failure = _classify_rtc_failure(RtcError("unstructured detail"), event)
+
+        self.assertEqual(failure.reason_code, "c2_blend_infeasible")
+        self.assertTrue(failure.recoverable)
+
+    def test_rtc_failure_classification_keeps_safety_faults_fatal(self):
+        clipping = _classify_rtc_failure(RtcError("bridge arm clipping detected"))
+        mismatch = _classify_rtc_failure(RtcError("response request ID mismatch"))
+
+        self.assertEqual(clipping.reason_code, "arm_clipping")
+        self.assertFalse(clipping.recoverable)
+        self.assertEqual(mismatch.reason_code, "transaction_mismatch")
+        self.assertFalse(mismatch.recoverable)
+
+    def test_shadow_discard_uses_fallback_without_reentering_rtc(self):
+        failure = _classify_rtc_failure(RtcError("RTC shadow result discarded at d_actual=2"))
+
+        self.assertEqual(failure.reason_code, "rtc_shadow")
+        self.assertTrue(failure.recoverable)
+
+    def test_rtc_metadata_validation_checks_the_complete_contract(self):
+        metadata = {
+            "rtc": {
+                "protocol": "rtc_v1",
+                "action_horizon": 20,
+                "native_action_dim": 16,
+                "model_action_dim": 32,
+                "execution_horizon": 10,
+                "max_predicted_delay": 4,
+                "prefix_attention_schedule": "exp",
+            }
+        }
+        _validate_rtc_policy_metadata(metadata)
+
+        metadata["rtc"]["prefix_attention_schedule"] = "linear"
+        with self.assertRaisesRegex(RolloutError, "metadata mismatch"):
+            _validate_rtc_policy_metadata(metadata)
+
+
+class TimedSynchronizedRunnerTest(unittest.TestCase):
+    @staticmethod
+    def _args():
+        return SimpleNamespace(
+            model_hz=15.0,
+            playback_time_scale=3.0,
+            sync_chunk_timeout_grace=1.0,
+            tracking_timeout=1.0,
+            max_stuck_replans=2,
+            tracking_tolerance_rad=0.01,
+            tracking_settle_seconds=0.20,
+            max_source_age=0.20,
+            max_state_image_skew=0.05,
+            prompt="test",
+        )
+
+    def test_two_consecutive_healthy_timeouts_exhaust_replans(self):
+        observation = SimpleNamespace(seq=1)
+        state = SimpleNamespace(
+            timeline_version=2,
+            motion_gate_open=True,
+            gate_reason="ready",
+            arm_clipped=False,
+            frozen_reason="hold",
+        )
+        events = [
+            TrajectoryEvent(2, "chunk_timed_out", 5.0, "s", "p1", 2, 10.0),
+            TrajectoryEvent(4, "chunk_timed_out", 10.0, "s", "p2", 4, 11.0),
+        ]
+        connection = SimpleNamespace(
+            latest_state=lambda max_local_age_s=None: state,
+            wait_for_event=lambda **kwargs: events.pop(0),
+        )
+        heartbeat = SimpleNamespace(error=None, update_version=lambda version: None)
+        actions = np.zeros((RTC_HORIZON, 16))
+        loaded_versions = iter((1, 3))
+
+        with (
+            patch(
+                "marvinpro_deploy.rollout_client._load_bridge_trajectory",
+                side_effect=lambda *args, **kwargs: TrajectoryEvent(
+                    1, "trajectory_loaded", 0.0, "s", "p", next(loaded_versions), 0.0
+                ),
+            ),
+            patch(
+                "marvinpro_deploy.rollout_client._wait_bridge_tracking",
+                return_value=(state, 1.0),
+            ),
+            patch(
+                "marvinpro_deploy.rollout_client._fresh_observation_after_source_time",
+                return_value=SimpleNamespace(seq=2),
+            ),
+            patch(
+                "marvinpro_deploy.rollout_client.infer_actions",
+                return_value=(actions, {"wall_ms": 100.0}),
+            ),
+        ):
+            result = _run_bridge_synchronized(
+                self._args(),
+                connection,
+                object(),
+                SimpleNamespace(),
+                heartbeat,
+                session_id="s",
+                initial_observation=observation,
+                initial_actions=actions,
+                episode_deadline=time.monotonic() + 30.0,
+            )
+
+        self.assertTrue(result.exhausted)
+        self.assertEqual(result.stuck_replans, 2)
+        self.assertEqual(result.inference_count, 1)
+
+    def test_clean_chunk_resets_stuck_counter_before_rtc_bootstrap(self):
+        observation = SimpleNamespace(seq=1)
+        fresh = SimpleNamespace(seq=3)
+        state = SimpleNamespace(
+            timeline_version=2,
+            motion_gate_open=True,
+            gate_reason="ready",
+            arm_clipped=False,
+            frozen_reason="hold",
+        )
+        events = [
+            TrajectoryEvent(2, "chunk_timed_out", 5.0, "s", "p1", 2, 10.0),
+            TrajectoryEvent(4, "checkpoint_ready", 9.0, "s", "p2", 3, 19.0),
+        ]
+        connection = SimpleNamespace(
+            latest_state=lambda max_local_age_s=None: state,
+            wait_for_event=lambda **kwargs: events.pop(0),
+        )
+        heartbeat = SimpleNamespace(error=None, update_version=lambda version: None)
+        actions = np.zeros((RTC_HORIZON, 16))
+
+        with (
+            patch(
+                "marvinpro_deploy.rollout_client._load_bridge_trajectory",
+                side_effect=(
+                    TrajectoryEvent(1, "trajectory_loaded", 0.0, "s", "p1", 1, 0.0),
+                    TrajectoryEvent(3, "trajectory_loaded", 6.0, "s", "p2", 3, 0.0),
+                ),
+            ),
+            patch(
+                "marvinpro_deploy.rollout_client._wait_bridge_tracking",
+                return_value=(state, 1.0),
+            ),
+            patch(
+                "marvinpro_deploy.rollout_client._fresh_observation_after_source_time",
+                return_value=SimpleNamespace(seq=2),
+            ),
+            patch(
+                "marvinpro_deploy.rollout_client._wait_checkpoint_observation",
+                return_value=fresh,
+            ),
+            patch(
+                "marvinpro_deploy.rollout_client.infer_actions",
+                return_value=(actions, {"wall_ms": 100.0}),
+            ),
+        ):
+            result = _run_bridge_synchronized(
+                self._args(),
+                connection,
+                object(),
+                SimpleNamespace(),
+                heartbeat,
+                session_id="s",
+                initial_observation=observation,
+                initial_actions=actions,
+                episode_deadline=time.monotonic() + 30.0,
+                required_clean_chunks=1,
+            )
+
+        self.assertFalse(result.exhausted)
+        self.assertEqual(result.clean_chunks, 1)
+        self.assertEqual(result.stuck_replans, 0)
+        self.assertIs(result.observation, fresh)
 
 
     def test_execution_confirmation_forces_a_new_observation(self):
@@ -468,7 +659,7 @@ class RolloutArgumentTest(unittest.TestCase):
                 "--model-hz",
                 "15",
                 "--playback-time-scale",
-                "2",
+                "3",
                 "--execute-steps",
                 str(RTC_HORIZON),
             ]
@@ -479,6 +670,11 @@ class RolloutArgumentTest(unittest.TestCase):
         self.assertEqual(args.tracking_settle_seconds, 0.20)
         self.assertEqual(args.post_track_hold_seconds, 0.20)
         self.assertEqual(args.tracking_timeout, 5.0)
+        self.assertEqual(args.sync_chunk_timeout_grace, 1.0)
+        self.assertEqual(args.max_stuck_replans, 2)
+        self.assertEqual(args.max_rtc_recoveries, 3)
+        self.assertEqual(args.policy_connect_timeout, 5.0)
+        self.assertEqual(args.policy_request_timeout, 2.0)
 
     def test_synchronized_schedule_requires_execution_and_interpolation(self):
         invalid_argv = (

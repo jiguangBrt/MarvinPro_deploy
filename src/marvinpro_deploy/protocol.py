@@ -144,6 +144,11 @@ class TrajectoryEvent:
     blend_max_velocity_rad_s: float | None = None
     blend_max_acceleration_rad_s2: float | None = None
     blend_max_jerk_rad_s3: float | None = None
+    reason_code: str | None = None
+    deadline_monotonic: float | None = None
+    elapsed_s: float | None = None
+    worst_joint: str | None = None
+    final_error_rad: float | None = None
 
 
 @dataclass(frozen=True)
@@ -167,6 +172,8 @@ class LoadTrajectoryCommand:
     checkpoint_horizon: int
     execute: bool
     continuous_checkpoint: bool = False
+    chunk_timeout_s: float | None = None
+    c2_handoff: bool = False
     version: int = PROTOCOL_VERSION
 
 
@@ -213,6 +220,17 @@ class HoldPositionCommand:
     action: tuple[float, ...]
     execute: bool
     reason: str = "client requested hold"
+    version: int = PROTOCOL_VERSION
+
+
+@dataclass(frozen=True)
+class LatchMeasuredHoldCommand:
+    command_id: int
+    session_id: str
+    expected_timeline_version: int
+    execute: bool
+    reason: str = "client requested measured hold"
+    reason_code: str = "measured_hold"
     version: int = PROTOCOL_VERSION
 
 

@@ -6,6 +6,7 @@ import unittest
 from marvinpro_deploy.protocol import (
     ActionCommand,
     BridgeHello,
+    LatchMeasuredHoldCommand,
     LoadTrajectoryCommand,
     ProtocolError,
     RobotStateUpdate,
@@ -78,7 +79,10 @@ class ProtocolTest(unittest.TestCase):
                 checkpoint_horizon=RTC_EXECUTION_HORIZON,
                 execute=True,
                 continuous_checkpoint=True,
+                chunk_timeout_s=5.0,
+                c2_handoff=True,
             ),
+            LatchMeasuredHoldCommand(4, "session", 2, True, reason_code="tracking_timeout"),
         )
         left, right = socket.socketpair()
         try:
