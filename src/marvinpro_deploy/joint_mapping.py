@@ -48,24 +48,24 @@ def normalize_gripper(
     return max(0.0, min(1.0, (raw - open_raw) / span))
 
 
-def gripper_command_proxy(value: float) -> float:
-    """Validate and clamp a 0=open, 1=closed command used as state proxy."""
+def clamp_gripper_position(value: float) -> float:
+    """Validate and clamp a normalized 0=open, 1=closed measured position."""
     value = float(value)
     if not math.isfinite(value):
-        raise ValueError("gripper command proxy must be finite")
+        raise ValueError("normalized gripper position must be finite")
     return max(0.0, min(1.0, value))
 
 
 def build_state16(
     joints: tuple[float, ...],
-    gripper_proxy_left: float,
-    gripper_proxy_right: float,
+    gripper_position_left: float,
+    gripper_position_right: float,
 ) -> tuple[float, ...]:
     if len(joints) != 14 or not all(math.isfinite(value) for value in joints):
         raise ValueError("canonical joint state must have 14 finite values")
     return (
         *joints[:7],
-        gripper_command_proxy(gripper_proxy_left),
+        clamp_gripper_position(gripper_position_left),
         *joints[7:],
-        gripper_command_proxy(gripper_proxy_right),
+        clamp_gripper_position(gripper_position_right),
     )

@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Marvin Pro OpenPI rollout client and bidirectional ROS 2 bridge"
 requires-python = ">=3.10"
 dependencies = [
+    "av>=14.0; python_version >= '3.11'",
     "numpy>=1.23",
     "opencv-python>=4.10",
     "pillow>=9.0",
@@ -13,6 +14,7 @@ dependencies = [
 marvinpro-rollout = "marvinpro_deploy.rollout_client:main"
 marvinpro-bridge = "marvinpro_deploy.robot_bridge:main"
 marvinpro-gripper = "marvinpro_deploy.gripper_control:main"
+marvinpro-gripper-feedback = "marvinpro_deploy.gripper_feedback_recorder:main"
 marvinpro-hold-test = "marvinpro_deploy.hold_test_client:main"
 marvinpro-trajectory-test = "marvinpro_deploy.trajectory_test_client:main"
 marvinpro-frozen-chunk-test = "marvinpro_deploy.frozen_chunk_test_client:main"

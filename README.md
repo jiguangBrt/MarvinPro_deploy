@@ -10,19 +10,24 @@ ROS topics <-> 双向 bridge:7332 <-> rollout client <-> WebSocket policy:8000
 rollout 客户端应运行在当前电脑，不运行在机器人控制器。机器人端只运行轻量 ROS bridge；GPU
 服务器只运行 OpenPI policy server。
 
+当前 `tmp` 分支现场接口：机器人控制与状态 topic 使用 `/tj` 命名空间；四宫格相机仍使用根路径
+`/quad_tile/compressed`，其 `CompressedImage.format` 为 `h264`。rollout 客户端用有状态 PyAV
+解码连续 H264 包，再按训练布局切分图像。
+
 ## 已按当前设备固定的接口
 
 - 观测/动作顺序：`[左臂7, 左夹爪, 右臂7, 右夹爪]`。
 - 关节单位：rad；policy server 输出已经过 `AbsoluteActions`，是绝对关节目标。
-- 夹爪：模型使用 `0=open, 1=closed`；命令直接向 `/control/gripperValueL/R` 发布 `0..1`。当前控制器
-  的 DM 反馈回传冻结，因此 policy state 临时使用 bridge 最近实际发布的命令作为代理，启动时默认
-  `0=open`。每次启动 bridge 前必须先把两侧夹爪实际打开，使物理状态与初始代理一致。
-- `/info/gripper_feedback_L/R` 的字段布局虽然是
-  `[q_position_rad, dq_velocity_rad_s, tau_torque, temp_mos, temp_motor]`，但 2026-08-11 动态开合验证中
-  23,452 条右侧消息完全相同。它只作“不可信缓存”诊断，不参与运动门、policy state 或遥测实测列。
+- 夹爪：模型使用 `0=open, 1=closed`；命令直接向 `/tj/control/gripperValueL/R` 发布 `0..1`。policy state
+  使用 `/tj/info/gripper_feedback_L/R` 的实测 `q`，按训练数据相同的 `open_raw=0.0`、`closed_raw=1.25`
+  归一化并裁剪到 `0..1`。
+- `/tj/info/gripper_feedback_L/R` 的字段布局虽然是
+  `[q_position_rad, dq_velocity_rad_s, tau_torque, temp_mos, temp_motor]`。2026-08-19 已重新确认左右 topic 有动态
+  信息；右夹爪实测“打开→夹持→打开”时 `q` 约为 `-0.0185→1.0234→-0.0185`，稳定 `tau` 约为
+  `0.047→1.683→0.046`。feedback 现在参与 policy state、RTC anchor、运动门和实测 telemetry。
 - 相机：四宫格左上=`cam_high`，左下=`cam_left_wrist`，右下=`cam_right_wrist`，右上忽略；底部
   时间戳区域不进入模型。
-- 双臂目标：`/control/user/joint_cmd_A/B`，消息类型
+- 双臂目标：`/tj/control/user/joint_cmd_A/B`，消息类型
   `marvin_msgs/msg/JointcmdArm`，A=左、B=右。
 - 硬限位：来自控制器当前 `APEX_ROBOT_MODEL=new_m6_696` 的左右臂 URDF。
 
@@ -49,10 +54,26 @@ cd /home/jh/TianJi_data_collector/MarvinPro_deploy
 ./scripts/control_gripper_on_controller.sh 1 --side right
 ```
 
-脚本将 `0` 或 `1` 短时连续发布到 `/control/gripperValueL/R`，不会调用 Home、切换 Apex Input Mode
-或发送机械臂关节命令。脚本打印的 `/info/gripper_feedback_L/R` 当前是冻结缓存，不能解释为实际位置
-或实际力矩；应以肉眼确认物理开合是否完成。
+脚本将 `0` 或 `1` 短时连续发布到 `/tj/control/gripperValueL/R`，不会调用 Home、切换 Apex Input Mode
+或发送机械臂关节命令。脚本会同时打印最新 `/tj/info/gripper_feedback_L/R` 的 `q/dq/tau/温度`；现场仍需
+肉眼确认操作安全和物体是否夹稳。
 若检测到 rollout bridge 仍在运行，脚本会拒绝发布，避免两个外部命令源互相覆盖。
+
+## 夹爪 feedback 实测记录
+
+要验证 feedback 是否会随“打开→闭合夹住物体→打开”变化，先开一个终端运行只读记录器，再用另一个终端
+执行上面的控制命令。记录器不会发布任何夹爪或机械臂命令，默认一直运行到 `Ctrl+C`，并把 CSV 保存到本机
+`logs/`：
+
+```bash
+cd /home/jh/TianJi_data_collector/MarvinPro_deploy
+./scripts/record_gripper_feedback_on_controller.sh
+```
+
+记录器完成 ROS discovery 并显示 `READY` 后，你可以在另一个终端按下面顺序操作，不需要等待其他提示：先确认两侧打开；
+发布 `0` 保持打开 3 秒；放入物体并发布 `1` 保持闭合 3～5 秒；取出物体后再发布 `0` 保持打开 3 秒；
+最后回到记录器终端按 `Ctrl+C`。记录器结束后重点看最终摘要：`changed`、`distinct`、`span` 和 `max_step`，
+CSV 还包含命令时间标记，可用于对齐打开、闭合和夹持阶段。
 
 ## 1. GPU 服务器启动 policy
 
@@ -85,13 +106,14 @@ cd /home/jh/TianJi_data_collector/MarvinPro_deploy
 
 预检不会创建动作 publisher，也不会发指令。以下输入必须都有消息：
 
-- `/joint_states`
+- `/tj/joint_states`
 - `/quad_tile/compressed`
-- `/control/input_mode`
-- `/info/robot_state`、`/info/arm_state`
+- `/tj/control/input_mode`
+- `/tj/info/robot_state`、`/tj/info/arm_state`
+- `/tj/info/gripper_feedback_L/R`
 
-doctor 会把 `/info/gripper_feedback_L/R` 标为 `UNTRUSTED frozen cache` 并打印其字段，仅用于后续修复
-诊断；该 topic 缺失或高频重复不会阻止 rollout 运动门。
+doctor 会打印 `/tj/info/gripper_feedback_L/R` 的五维字段；任一侧缺失或在 rollout 中超过 state stale
+阈值都会关闭运动门。
 相机没有消息时，先在 Apex 启动 Camera。执行前还必须看到 `input_mode=3`、两个状态数组均为
 `(3, 3)`；这台控制器用状态 `3` 表示关节阻抗模式。dry-run 阶段可以仍为 None/`0`。
 
@@ -117,9 +139,9 @@ uv run python -m marvinpro_deploy.rollout_client \
 
 默认没有 `--execute`，客户端不会向 bridge 发送任何 action。检查日志应满足：
 
-- policy 输出恒为 `(10, 16)` 且 finite；
+- policy 输出恒为 `(20, 16)` 且 finite；
 - `wall` 通常约为此前实测的 90-120 ms；
-- 相机和关节 age 没有超限，日志显示 `gripper_state_source=command_proxy`；
+- 相机、关节和左右夹爪 age 没有超限，日志显示 `gripper_state_source=measured_feedback`；
 - 能持续完成 inference，没有图像裁剪或连接错误。
 
 ## 4. 首次真机执行
@@ -137,7 +159,7 @@ cd /home/jh/TianJi_data_collector/MarvinPro_deploy
 在 Apex 将 Input Mode 切到 **Custom**。确认：
 
 ```bash
-ssh nvidia@6.6.7.100 'source /etc/apex/apex_ros_env.sh; ros2 topic echo /control/input_mode --once; ros2 topic echo /info/robot_state --once; ros2 topic echo /info/arm_state --once'
+ssh nvidia@6.6.7.100 'source /etc/apex/apex_ros_env.sh; ros2 topic echo /tj/control/input_mode --once; ros2 topic echo /tj/info/robot_state --once; ros2 topic echo /tj/info/arm_state --once'
 ```
 
 预期分别是 `3`、`[3,3]`、`[3,3]`。然后终端 B 先做一个很短的 rollout：
@@ -165,8 +187,8 @@ uv run python -m marvinpro_deploy.rollout_client \
 1. bridge 使用 `--allow-motion` 启动；
 2. rollout 使用 `--execute` 并人工输入单个大写 `E`；
 3. `input_mode == 3`；
-4. `/info/robot_state == [3,3]` 且 `/info/arm_state == [3,3]`（关节阻抗模式）；
-5. 关节反馈新鲜，夹爪命令代理在 `[0,1]`，policy action 为 finite `(16,)`；
+4. `/tj/info/robot_state == [3,3]` 且 `/tj/info/arm_state == [3,3]`（关节阻抗模式）；
+5. 关节和左右夹爪 feedback 新鲜，归一化夹爪实测值在 `[0,1]`，policy action 为 finite `(16,)`；
 6. 客户端和 bridge 的臂关节目标相对最新反馈最多 `0.16 rad`；
 7. 目标位于当前 M6-696 URDF 硬限位内并保留 `0.02 rad` 边界；
 8. bridge 收到的 action 不超过 `0.25 s`，且对应观测不超过 8 帧。
@@ -187,12 +209,12 @@ hold，不会重复执行过时的预测动作。
 
 bridge 使用 pickle 传输 JPEG 和数据结构，只能暴露在可信的机器人私有网络，不应映射到公网。
 
-## 跟踪感知时间轴与 RTC（protocol v7）
+## 跟踪感知时间轴与 RTC（protocol v9）
 
 `tracking` 和 `rtc` 使用 bridge 本地 100 Hz trajectory owner。控制 timer 只对连续 phase 求值，不会按
-100 Hz 自动消费模型动作；机器人跟踪误差增大时，phase 会减速或冻结。RTC A5 checkpoint 只有在全部14个
+100 Hz 自动消费模型动作；机器人跟踪误差增大时，phase 会减速或冻结。RTC A9 checkpoint 只有在全部14个
 臂关节误差不超过 `0.01 rad`，并且由持续更新的 joint source timestamp 证明连续稳定 `0.20 s` 后才成立。
-因此“客户端已经发出 A5，但反馈仍在 A4”不会触发新观测。
+因此“客户端已经发出 A9，但反馈仍在 A8”不会触发新观测。
 
 `tracking` 和 `rtc` 固定使用 `--model-hz 15 --playback-time-scale 3`，名义 knot rate 为 `5 Hz`；其他倍率
 会被客户端拒绝。tracking error 在 `<=0.02 rad` 时 phase rate 为 1，在 `0.02..0.16 rad` 内按
@@ -206,10 +228,9 @@ bridge 在物理 `d_actual == d_pred` 边界使迟到 epoch 无效，结果不�
 停顿、边界跳变和恢复率。fallback 会重置 estimator epoch，但 bridge 的 `d_actual` 始终按实际 phase 跨过的
 knot 计数，不使用 `wall_time * nominal_rate`。
 
-protocol v7 必须同时更新控制器上的 `MarvinPro_deploy` 和本机客户端；本次版本提升用于让 bridge 强制执行
-迟到结果策略，避免客户端事件接收竞态。当前临时运行契约将 bridge 最后发布
-的夹爪命令作为状态代理；RTC 的 tracking governor 仍只使用 14 个机械臂关节误差。不可信的 DM
-`q/dq/tau/温度` 不写成实测 telemetry，也不能用于判断闭合、接触或打滑。
+protocol v9 必须同时更新控制器上的 `MarvinPro_deploy` 和本机客户端。夹爪状态使用归一化实测 feedback，
+原始 `q/dq/tau/温度` 写入 telemetry；RTC 的 tracking governor 仍只使用 14 个机械臂关节误差，夹爪不参与
+机械臂到位判定。
 trajectory session 每 `100 ms`
 发送 heartbeat；bridge 超过 `250 ms` 未收到会清空 trajectory 并停止发布。旧的 discrete、prefetch、
 synchronized 和诊断客户端仍使用 legacy `ActionCommand` 路径。
@@ -252,12 +273,12 @@ uv run python -m marvinpro_deploy.rollout_client \
 None，再安全退出。
 
 指定 `--log-file "$RUN_DIR/rollout.log"` 还会自动生成
-`$RUN_DIR/rollout.telemetry.csv`。它逐条保存 bridge 实测 14 个关节、夹爪命令代理、bridge 插帧后的
-最终命令，以及
+`$RUN_DIR/rollout.telemetry.csv`。它逐条保存 bridge 实测 14 个关节、夹爪原始/归一化 feedback、夹爪命令、
+bridge 插帧后的最终命令，以及
 prefetch/legacy 客户端插帧生成的请求目标和实际发送命令；`client_reference_*` 是插帧值，
 `client_command_*` 是 safety-filter 后的发送值，`record_type` 字段区分 `bridge_state` 和
 `client_command`。
-测试后可生成关节角与夹爪命令代理对照图：
+测试后可生成关节角以及夹爪命令/实测 feedback 对照图：
 
 ```bash
 PYTHONPATH=/home/jh/TianJi_data_collector/MarvinPro_deploy/src \
@@ -269,7 +290,7 @@ scripts/plot_rollout_joints.py \
 
 远程 OpenPI 必须先完成
 `/home/jh/OpenPI_UR/openpi/REMOTE_RTC_TESTS.md`。之后第一轮只运行 shadow：新观测在
-物理 A5 checkpoint 后采集，推理期间 bridge 继续执行 A6/A7 等旧节点，客户端等待实际 `d_pred` 边界并
+物理 A9 checkpoint 后采集，推理期间 bridge 继续执行 A10/A11 等旧节点，客户端等待实际 `d_pred` 边界并
 记录 `d_actual`，但不合并 RTC 输出；随后本 episode 固定降级 synchronized。
 
 ```bash

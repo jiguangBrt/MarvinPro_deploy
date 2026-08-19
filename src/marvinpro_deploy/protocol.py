@@ -41,7 +41,7 @@ class RobotObservation:
     image: bytes
     image_format: str
     joints: tuple[float, ...]
-    # Legacy wire name: these are 0..1 command proxies, not DM position feedback.
+    # Legacy wire name: these are normalized 0..1 measured positions.
     gripper_raw_left: float
     gripper_raw_right: float
     input_mode: int | None
@@ -67,6 +67,8 @@ class RobotObservation:
     gripper_mos_temperature_right: float | None = None
     gripper_motor_temperature_left: float | None = None
     gripper_motor_temperature_right: float | None = None
+    gripper_position_raw_left: float | None = None
+    gripper_position_raw_right: float | None = None
 
 
 @dataclass(frozen=True)
@@ -74,7 +76,7 @@ class RobotStateUpdate:
     state_seq: int
     sampled_monotonic: float
     joints: tuple[float, ...]
-    # Legacy wire name: these are 0..1 command proxies, not DM position feedback.
+    # Legacy wire name: these are normalized 0..1 measured positions.
     gripper_raw_left: float
     gripper_raw_right: float
     motion_gate_open: bool
@@ -102,6 +104,8 @@ class RobotStateUpdate:
     gripper_mos_temperature_right: float | None = None
     gripper_motor_temperature_left: float | None = None
     gripper_motor_temperature_right: float | None = None
+    gripper_position_raw_left: float | None = None
+    gripper_position_raw_right: float | None = None
     version: int = PROTOCOL_VERSION
 
 

@@ -30,6 +30,7 @@ from marvinpro_deploy.rollout_client import (
     RobotConnection,
     RolloutError,
     parse_args,
+    validate_observation,
 )
 
 
@@ -216,13 +217,13 @@ class RobotConnectionTest(unittest.TestCase):
             joints=(0.0,) * 14,
             image=b"jpeg",
             age_state_s=0.001,
-            age_gripper_left_s=None,
-            age_gripper_right_s=None,
+            age_gripper_left_s=0.002,
+            age_gripper_right_s=0.003,
             gripper_raw_left=0.4,
             gripper_raw_right=0.6,
             gripper_torque_left=0.1,
             gripper_torque_right=0.2,
-            extra={"gripper_state_source": "command_proxy"},
+            extra={"gripper_state_source": "measured_feedback"},
         )
 
         class FakeConnection:
@@ -274,7 +275,7 @@ class RobotConnectionTest(unittest.TestCase):
 
 
 class JointTelemetryRecorderTest(unittest.TestCase):
-    def test_records_arm_and_gripper_proxy_without_false_measured_feedback(self):
+    def test_records_measured_gripper_feedback_and_command(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "rollout.telemetry.csv"
             recorder = JointTelemetryRecorder(path)
@@ -296,6 +297,12 @@ class JointTelemetryRecorderTest(unittest.TestCase):
                 gripper_velocity_right=0.02,
                 gripper_torque_left=0.11,
                 gripper_torque_right=0.12,
+                gripper_mos_temperature_left=31.0,
+                gripper_mos_temperature_right=32.0,
+                gripper_motor_temperature_left=29.0,
+                gripper_motor_temperature_right=30.0,
+                gripper_position_raw_left=0.25,
+                gripper_position_raw_right=0.375,
             )
             recorder.record_state(state, 20.0)
             observation = SimpleNamespace(
@@ -319,16 +326,41 @@ class JointTelemetryRecorderTest(unittest.TestCase):
                 rows = list(csv.DictReader(stream))
             self.assertEqual([row["record_type"] for row in rows], ["bridge_state", "client_command"])
             self.assertEqual(float(rows[0]["measured_Joint1_L"]), 0.1)
-            self.assertEqual(float(rows[0]["gripper_command_proxy_L"]), 0.2)
-            self.assertEqual(rows[0]["measured_gripper_position_raw_L"], "")
-            self.assertEqual(rows[0]["measured_gripper_position_L"], "")
-            self.assertEqual(rows[0]["measured_gripper_torque_L"], "")
+            self.assertEqual(float(rows[0]["gripper_command_L"]), 2.0)
+            self.assertEqual(float(rows[0]["measured_gripper_position_raw_L"]), 0.25)
+            self.assertEqual(float(rows[0]["measured_gripper_position_L"]), 0.2)
+            self.assertEqual(float(rows[0]["measured_gripper_velocity_L"]), 0.01)
+            self.assertEqual(float(rows[0]["measured_gripper_torque_L"]), 0.11)
+            self.assertEqual(float(rows[0]["gripper_position_error_L"]), 1.8)
+            self.assertEqual(float(rows[0]["measured_gripper_mos_temperature_L"]), 31.0)
+            self.assertEqual(float(rows[0]["measured_gripper_motor_temperature_L"]), 29.0)
             self.assertEqual(float(rows[0]["bridge_command_Joint1_L"]), 2.0)
             self.assertEqual(float(rows[1]["client_reference_Joint1_L"]), 3.0)
             self.assertEqual(float(rows[1]["client_command_Joint1_L"]), 2.9)
 
 
 class RolloutArgumentTest(unittest.TestCase):
+    def test_observation_validation_requires_fresh_normalized_gripper_feedback(self):
+        observation = SimpleNamespace(
+            joints=(0.0,) * 14,
+            image=b"image",
+            gripper_raw_left=0.2,
+            gripper_raw_right=0.8,
+            age_state_s=0.01,
+            age_gripper_left_s=0.01,
+            age_gripper_right_s=0.01,
+        )
+        validate_observation(observation, 0.05)
+
+        observation.age_gripper_right_s = 0.06
+        with self.assertRaisesRegex(RolloutError, "right gripper feedback is stale"):
+            validate_observation(observation, 0.05)
+
+        observation.age_gripper_right_s = 0.01
+        observation.gripper_raw_right = 1.1
+        with self.assertRaisesRegex(RolloutError, "invalid normalized gripper feedback"):
+            validate_observation(observation, 0.05)
+
     def test_observation_lag_rejection_is_retryable_but_other_rejections_are_not(self):
         self.assertTrue(_is_observation_lag_rejection(RolloutError("bridge rejected trajectory: action observation lag is 17 frames (limit 8)")))
         self.assertFalse(_is_observation_lag_rejection(RolloutError("bridge rejected trajectory: robot_state=(3, 12)")))

@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import logging
 import math
 from pathlib import Path
@@ -30,7 +30,7 @@ from .config import (
     DEFAULT_PROMPT,
     JOINT_NAMES,
 )
-from .image_processing import ImageError, decode_and_split
+from .image_processing import H264FramePending, ImageError, decode_and_split, decode_rgb, split_quad_rgb
 from .joint_mapping import build_state16
 from .motion_profile import FrozenLinearPlan
 from .rtc import (
@@ -70,7 +70,7 @@ _TRACKING_PLAYBACK_TIME_SCALE = 3.0
 
 
 class JointTelemetryRecorder:
-    """Write arm feedback, gripper command proxies, and outgoing commands."""
+    """Write measured robot feedback and outgoing commands."""
 
     def __init__(self, path: Path) -> None:
         path = path.expanduser().resolve()
@@ -107,8 +107,8 @@ class JointTelemetryRecorder:
         columns.extend(f"measured_{name}" for name in JOINT_NAMES)
         columns.extend(
             (
-                "gripper_command_proxy_L",
-                "gripper_command_proxy_R",
+                "gripper_command_L",
+                "gripper_command_R",
                 "measured_gripper_position_raw_L",
                 "measured_gripper_position_raw_R",
                 "measured_gripper_position_L",
@@ -141,14 +141,34 @@ class JointTelemetryRecorder:
 
     @staticmethod
     def _gripper_values(message, target: tuple[float, ...] | None) -> list[float | str]:
-        del target
+        command_left = "" if target is None else target[7]
+        command_right = "" if target is None else target[15]
+        measured_left = message.gripper_raw_left
+        measured_right = message.gripper_raw_right
+        error_left = "" if target is None else command_left - measured_left
+        error_right = "" if target is None else command_right - measured_right
+
+        def optional(name: str) -> float | str:
+            value = getattr(message, name, None)
+            return "" if value is None else value
+
         return [
-            message.gripper_raw_left,
-            message.gripper_raw_right,
-            "", "", "", "",
-            "", "", "", "",
-            "", "", "", "",
-            "", "",
+            command_left,
+            command_right,
+            optional("gripper_position_raw_left"),
+            optional("gripper_position_raw_right"),
+            measured_left,
+            measured_right,
+            optional("gripper_velocity_left"),
+            optional("gripper_velocity_right"),
+            optional("gripper_torque_left"),
+            optional("gripper_torque_right"),
+            error_left,
+            error_right,
+            optional("gripper_mos_temperature_left"),
+            optional("gripper_mos_temperature_right"),
+            optional("gripper_motor_temperature_left"),
+            optional("gripper_motor_temperature_right"),
         ]
 
     def record_state(self, message: RobotStateUpdate, received_monotonic: float) -> None:
@@ -290,8 +310,18 @@ class RobotConnection:
                 if message is None:
                     raise ConnectionError("robot bridge closed the connection")
                 require_current_version(message)
+                received = time.monotonic()
+                if isinstance(message, RobotObservation) and "h264" in (message.image_format or "").lower():
+                    try:
+                        decoded_rgb = decode_rgb(message.image, message.image_format)
+                    except H264FramePending:
+                        # The bridge may connect between H264 keyframes.
+                        # Keep feeding packets until the next keyframe.
+                        continue
+                    extra = dict(message.extra)
+                    extra["_decoded_rgb"] = decoded_rgb
+                    message = replace(message, extra=extra)
                 with self._condition:
-                    received = time.monotonic()
                     if isinstance(message, RobotObservation):
                         if self._latest_observation is None or message.seq > self._latest_observation.seq:
                             self._latest_observation = message
@@ -883,9 +913,16 @@ class ActionPublisher:
 def validate_observation(observation: RobotObservation, max_source_age_s: float) -> None:
     if len(observation.joints) != 14 or not all(math_isfinite(value) for value in observation.joints):
         raise RolloutError("robot observation has invalid joint state")
+    grippers = (observation.gripper_raw_left, observation.gripper_raw_right)
+    if not all(math_isfinite(value) and 0.0 <= float(value) <= 1.0 for value in grippers):
+        raise RolloutError(f"robot observation has invalid normalized gripper feedback: {grippers}")
     if not observation.image:
         raise RolloutError("robot observation has no camera image")
-    ages = {"joint state": observation.age_state_s}
+    ages = {
+        "joint state": observation.age_state_s,
+        "left gripper feedback": observation.age_gripper_left_s,
+        "right gripper feedback": observation.age_gripper_right_s,
+    }
     for label, age in ages.items():
         if age is None or age > max_source_age_s:
             raise RolloutError(f"{label} is stale: age={age}")
@@ -920,7 +957,11 @@ def build_policy_observation(observation: RobotObservation, prompt: str) -> dict
         ),
         dtype=np.float32,
     )
-    images_640 = decode_and_split(observation.image)
+    decoded_rgb = observation.extra.get("_decoded_rgb")
+    if isinstance(decoded_rgb, np.ndarray):
+        images_640 = split_quad_rgb(decoded_rgb)
+    else:
+        images_640 = decode_and_split(observation.image, observation.image_format)
     images_224 = {
         name: image_tools.convert_to_uint8(image_tools.resize_with_pad(image, 224, 224))
         for name, image in images_640.items()
@@ -1042,11 +1083,13 @@ def _confirm_and_refresh_execution_observation(
     validate_observation(fresh, args.max_source_age)
     LOGGER.warning(
         "post_confirmation_observation baseline_seq=%d fresh_seq=%d captured=%.6f "
-        "joint_age_ms=%.3f gripper_proxy=(%.3f,%.3f) source=%s",
+        "joint_age_ms=%.3f gripper_age_ms=(%.3f,%.3f) gripper_measured=(%.3f,%.3f) source=%s",
         latest_after_confirmation.seq,
         fresh.seq,
         fresh.captured_monotonic,
         float(fresh.age_state_s) * 1000.0,
+        float(fresh.age_gripper_left_s) * 1000.0,
+        float(fresh.age_gripper_right_s) * 1000.0,
         fresh.gripper_raw_left,
         fresh.gripper_raw_right,
         getattr(fresh, "extra", {}).get("gripper_state_source", "unknown"),
@@ -1519,7 +1562,8 @@ def _wait_checkpoint_observation(
         LOGGER.info(
             "checkpoint_observation event_seq=%d checkpoint=%s image_seq=%d "
             "stable=%.6f captured=%.6f after_stable_ms=%.3f state_sampled=%.6f "
-            "state_image_skew_ms=%.3f joint_age_ms=%.3f gripper_proxy=(%.3f,%.3f)",
+            "state_image_skew_ms=%.3f joint_age_ms=%.3f gripper_age_ms=(%.3f,%.3f) "
+            "gripper_measured=(%.3f,%.3f)",
             event.event_seq,
             event.checkpoint_id,
             observation.seq,
@@ -1529,6 +1573,8 @@ def _wait_checkpoint_observation(
             float(sampled),
             abs(observation.captured_monotonic - float(sampled)) * 1000.0,
             float(observation.age_state_s) * 1000.0,
+            float(observation.age_gripper_left_s) * 1000.0,
+            float(observation.age_gripper_right_s) * 1000.0,
             observation.gripper_raw_left,
             observation.gripper_raw_right,
         )
@@ -2173,7 +2219,8 @@ def run(args: argparse.Namespace) -> int:
         validate_observation(observation, args.max_source_age)
         LOGGER.info(
             "robot_observation_ready seq=%d captured=%.6f input_mode=%s robot_state=%s arm_state=%s "
-            "gate=%s reason=%r joint_age_ms=%.3f gripper_proxy=(%.3f,%.3f) source=%s",
+            "gate=%s reason=%r joint_age_ms=%.3f gripper_age_ms=(%.3f,%.3f) "
+            "gripper_measured=(%.3f,%.3f) source=%s",
             observation.seq,
             observation.captured_monotonic,
             observation.input_mode,
@@ -2182,6 +2229,8 @@ def run(args: argparse.Namespace) -> int:
             observation.motion_gate_open,
             observation.gate_reason,
             float(observation.age_state_s) * 1000.0,
+            float(observation.age_gripper_left_s) * 1000.0,
+            float(observation.age_gripper_right_s) * 1000.0,
             observation.gripper_raw_left,
             observation.gripper_raw_right,
             getattr(observation, "extra", {}).get("gripper_state_source", "unknown"),

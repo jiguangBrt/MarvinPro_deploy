@@ -171,7 +171,7 @@ def _run(command: str, side: str, duration_s: float) -> int:
                         f"{label}={value:.4f}" for label, value in zip(labels, values)
                     ) + "}"
                 )
-            print("Latest UNTRUSTED gripper feedback cache: " + ", ".join(readings) + ".")
+            print("Latest gripper feedback: " + ", ".join(readings) + ".")
         else:
             print("No gripper feedback cache was received during the command.", file=sys.stderr)
         return 0

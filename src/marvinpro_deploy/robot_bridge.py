@@ -48,7 +48,7 @@ from .config import (
     TOPIC_USER_CMD_L,
     TOPIC_USER_CMD_R,
 )
-from .joint_mapping import JointMap, JointMapError, build_state16
+from .joint_mapping import JointMap, JointMapError, build_state16, normalize_gripper
 from .protocol import (
     ActionCommand,
     BridgeHello,
@@ -161,11 +161,11 @@ class MarvinBridgeNode(Node):
         self._joint_map: JointMap | None = None
         self._joints: tuple[float, ...] | None = None
         self._joints_t: float | None = None
-        # The controller currently republishes a frozen DM feedback cache. Until
-        # its return path is repaired, policy state tracks our last 0..1 command.
-        self._gripper_l = 0.0
-        self._gripper_r = 0.0
-        self._gripper_proxy_source = "assumed_open_at_bridge_start"
+        # Policy state uses normalized measured q from the DM feedback topics.
+        self._gripper_l: float | None = None
+        self._gripper_r: float | None = None
+        self._gripper_command_l: float | None = None
+        self._gripper_command_r: float | None = None
         self._gripper_feedback_l_position: float | None = None
         self._gripper_feedback_r_position: float | None = None
         self._gripper_l_t: float | None = None
@@ -254,9 +254,7 @@ class MarvinBridgeNode(Node):
 
         mode = "MOTION ENABLED" if allow_motion else "dry-run (motion disabled)"
         self.get_logger().info(f"bridge initialized at {publish_hz:.1f}Hz, {mode}")
-        self.get_logger().info(
-            "gripper policy state uses a last-command proxy; DM feedback is an untrusted frozen cache"
-        )
+        self.get_logger().info("gripper policy state uses normalized measured DM feedback")
 
     def _on_joint_state(self, msg: JointState) -> None:
         now = _now()
@@ -264,7 +262,7 @@ class MarvinBridgeNode(Node):
             if self._joint_map is None:
                 try:
                     self._joint_map = JointMap.from_names(list(msg.name))
-                    self.get_logger().info("canonical /joint_states mapping established")
+                    self.get_logger().info("canonical /tj/joint_states mapping established")
                 except JointMapError as exc:
                     self.get_logger().error(str(exc))
                     return
@@ -279,7 +277,10 @@ class MarvinBridgeNode(Node):
     def _gripper_feedback_values(msg: Float32MultiArray) -> tuple[float, ...] | None:
         if len(msg.data) < 3:
             return None
-        values = tuple(float(value) for value in msg.data[:5])
+        try:
+            values = tuple(float(value) for value in msg.data[:5])
+        except (TypeError, ValueError):
+            return None
         if not all(math.isfinite(value) for value in values):
             return None
         return values
@@ -288,21 +289,25 @@ class MarvinBridgeNode(Node):
         values = self._gripper_feedback_values(msg)
         if values is None:
             return
+        now = _now()
         with self._lock:
             self._gripper_feedback_l_position, self._gripper_l_velocity, self._gripper_l_torque = values[:3]
+            self._gripper_l = normalize_gripper(self._gripper_feedback_l_position)
             self._gripper_l_mos_temperature = values[3] if len(values) > 3 else None
             self._gripper_l_motor_temperature = values[4] if len(values) > 4 else None
-            self._gripper_l_t = _now()
+            self._gripper_l_t = now
 
     def _on_gripper_r(self, msg: Float32MultiArray) -> None:
         values = self._gripper_feedback_values(msg)
         if values is None:
             return
+        now = _now()
         with self._lock:
             self._gripper_feedback_r_position, self._gripper_r_velocity, self._gripper_r_torque = values[:3]
+            self._gripper_r = normalize_gripper(self._gripper_feedback_r_position)
             self._gripper_r_mos_temperature = values[3] if len(values) > 3 else None
             self._gripper_r_motor_temperature = values[4] if len(values) > 4 else None
-            self._gripper_r_t = _now()
+            self._gripper_r_t = now
 
     def _on_input_mode(self, msg: Int32) -> None:
         with self._lock:
@@ -328,6 +333,14 @@ class MarvinBridgeNode(Node):
             return False, "no joint state"
         if _age(now, self._joints_t) > self.max_state_age_s:
             return False, "joint state is stale"
+        if self._gripper_l is None or _age(now, self._gripper_l_t) is None:
+            return False, "no left gripper feedback"
+        if self._gripper_r is None or _age(now, self._gripper_r_t) is None:
+            return False, "no right gripper feedback"
+        if _age(now, self._gripper_l_t) > self.max_state_age_s:
+            return False, "left gripper feedback is stale"
+        if _age(now, self._gripper_r_t) > self.max_state_age_s:
+            return False, "right gripper feedback is stale"
         if self._input_mode != CUSTOM_INPUT_MODE:
             return False, f"input_mode={self._input_mode}, expected {CUSTOM_INPUT_MODE} (Custom)"
         if self._robot_state != READY_STATE:
@@ -348,7 +361,7 @@ class MarvinBridgeNode(Node):
         return "trajectory"
 
     def _refresh_state_locked(self, now: float) -> None:
-        if self._joints is None:
+        if self._joints is None or self._gripper_l is None or self._gripper_r is None:
             return
         assert self._joints_t is not None
         ready, reason = self._readiness_gate_locked(now)
@@ -378,15 +391,16 @@ class MarvinBridgeNode(Node):
             arm_clipped=self._arm_clipped,
             frozen_reason=self._frozen_reason,
             active_request_id=self._active_request_id,
-            # Do not serialize the frozen DM cache as measured telemetry.
-            gripper_velocity_left=None,
-            gripper_velocity_right=None,
-            gripper_torque_left=None,
-            gripper_torque_right=None,
-            gripper_mos_temperature_left=None,
-            gripper_mos_temperature_right=None,
-            gripper_motor_temperature_left=None,
-            gripper_motor_temperature_right=None,
+            gripper_velocity_left=self._gripper_l_velocity,
+            gripper_velocity_right=self._gripper_r_velocity,
+            gripper_torque_left=self._gripper_l_torque,
+            gripper_torque_right=self._gripper_r_torque,
+            gripper_mos_temperature_left=self._gripper_l_mos_temperature,
+            gripper_mos_temperature_right=self._gripper_r_mos_temperature,
+            gripper_motor_temperature_left=self._gripper_l_motor_temperature,
+            gripper_motor_temperature_right=self._gripper_r_motor_temperature,
+            gripper_position_raw_left=self._gripper_feedback_l_position,
+            gripper_position_raw_right=self._gripper_feedback_r_position,
         )
         self._outbound_ready.notify_all()
 
@@ -548,7 +562,7 @@ class MarvinBridgeNode(Node):
     def _on_image(self, msg: CompressedImage) -> None:
         now = _now()
         with self._observation_ready:
-            if self._joints is None:
+            if self._joints is None or self._gripper_l is None or self._gripper_r is None:
                 return
             ready, reason = self._readiness_gate_locked(now)
             self._seq += 1
@@ -564,8 +578,8 @@ class MarvinBridgeNode(Node):
                 robot_state=self._robot_state,
                 arm_state=self._arm_state,
                 age_state_s=_age(now, self._joints_t),
-                age_gripper_left_s=None,
-                age_gripper_right_s=None,
+                age_gripper_left_s=_age(now, self._gripper_l_t),
+                age_gripper_right_s=_age(now, self._gripper_r_t),
                 age_input_mode_s=_age(now, self._input_mode_t),
                 age_robot_state_s=_age(now, self._robot_state_t),
                 age_arm_state_s=_age(now, self._arm_state_t),
@@ -573,26 +587,22 @@ class MarvinBridgeNode(Node):
                 gate_reason=reason,
                 last_command_id=self._last_command_id,
                 last_command_status=self._last_command_status,
+                gripper_velocity_left=self._gripper_l_velocity,
+                gripper_velocity_right=self._gripper_r_velocity,
+                gripper_torque_left=self._gripper_l_torque,
+                gripper_torque_right=self._gripper_r_torque,
+                gripper_mos_temperature_left=self._gripper_l_mos_temperature,
+                gripper_mos_temperature_right=self._gripper_r_mos_temperature,
+                gripper_motor_temperature_left=self._gripper_l_motor_temperature,
+                gripper_motor_temperature_right=self._gripper_r_motor_temperature,
+                gripper_position_raw_left=self._gripper_feedback_l_position,
+                gripper_position_raw_right=self._gripper_feedback_r_position,
                 extra={
                     "state_seq": self._state_seq,
                     "state_sampled_monotonic": self._joints_t,
-                    "gripper_state_source": "command_proxy",
-                    "gripper_proxy_source": self._gripper_proxy_source,
-                    "gripper_feedback_untrusted": True,
-                    "gripper_feedback_left": (
-                        self._gripper_feedback_l_position,
-                        self._gripper_l_velocity,
-                        self._gripper_l_torque,
-                        self._gripper_l_mos_temperature,
-                        self._gripper_l_motor_temperature,
-                    ),
-                    "gripper_feedback_right": (
-                        self._gripper_feedback_r_position,
-                        self._gripper_r_velocity,
-                        self._gripper_r_torque,
-                        self._gripper_r_mos_temperature,
-                        self._gripper_r_motor_temperature,
-                    ),
+                    "gripper_state_source": "measured_feedback",
+                    "gripper_command_left": self._gripper_command_l,
+                    "gripper_command_right": self._gripper_command_r,
                 },
             )
             self._observation_ready.notify_all()
@@ -1400,9 +1410,8 @@ class MarvinBridgeNode(Node):
         self._pub_gripper_l.publish(gripper_l)
         self._pub_gripper_r.publish(gripper_r)
         with self._lock:
-            self._gripper_l = float(target[7])
-            self._gripper_r = float(target[15])
-            self._gripper_proxy_source = "bridge_command"
+            self._gripper_command_l = float(target[7])
+            self._gripper_command_r = float(target[15])
             self._last_command_status = f"published command {command_id}"
 
     def publish_timing_summary(self) -> None:
@@ -1481,10 +1490,10 @@ def doctor(duration_s: float) -> int:
     failed = False
     for topic, count in node.counts.items():
         value = node.latest.get(topic)
-        diagnostic = topic in (TOPIC_GRIPPER_FEEDBACK_L, TOPIC_GRIPPER_FEEDBACK_R)
-        label = " (UNTRUSTED frozen cache: [q, dq, tau, T_mos, T_motor])" if diagnostic else ""
+        gripper_feedback = topic in (TOPIC_GRIPPER_FEEDBACK_L, TOPIC_GRIPPER_FEEDBACK_R)
+        label = " ([q, dq, tau, T_mos, T_motor])" if gripper_feedback else ""
         print(f"  {topic}{label}: {count} msgs, {count / elapsed:.1f}Hz, latest={value}")
-        if count == 0 and not diagnostic:
+        if count == 0:
             failed = True
     joint_value = node.latest.get(TOPIC_JOINT_STATES)
     if joint_value is not None:
