@@ -7,6 +7,13 @@ def knot(value):
     return (float(value),) * 16
 
 
+def gripper_knot(arm_value, left, right):
+    values = [float(arm_value)] * 16
+    values[7] = float(left)
+    values[15] = float(right)
+    return tuple(values)
+
+
 class TrajectoryTimelineTest(unittest.TestCase):
     def test_phase_and_checkpoint_indexing(self):
         timeline = TrajectoryTimeline(tuple(knot(i) for i in range(10)), 7.5, 4)
@@ -66,14 +73,14 @@ class TrajectoryTimelineTest(unittest.TestCase):
         self.assertEqual(replacement.value(phase), knot(0.1))
         start = replacement.phase_kinematics(phase)
         end = replacement.phase_kinematics(phase + 3.0)
-        for actual, expected in zip(start[1], knot(0.01)):
-            self.assertAlmostEqual(actual, expected)
+        for index, actual in enumerate(start[1]):
+            self.assertAlmostEqual(actual, 0.0 if index in (7, 15) else 0.01)
         for actual in start[2]:
             self.assertAlmostEqual(actual, 0.0)
         for actual, expected in zip(end[0], actions[4]):
             self.assertAlmostEqual(actual, expected)
-        for actual, expected in zip(end[1], knot(0.02)):
-            self.assertAlmostEqual(actual, expected)
+        for index, actual in enumerate(end[1]):
+            self.assertAlmostEqual(actual, 0.0 if index in (7, 15) else 0.02)
         for actual in end[2]:
             self.assertAlmostEqual(actual, 0.0)
 
@@ -102,8 +109,29 @@ class TrajectoryTimelineTest(unittest.TestCase):
         self.assertEqual(start[2], knot(0.0))
         for actual, expected in zip(end[0], timeline.knots[3]):
             self.assertAlmostEqual(actual, expected)
-        for actual, expected in zip(end[1], knot(0.01)):
-            self.assertAlmostEqual(actual, expected)
+        for index, actual in enumerate(end[1]):
+            self.assertAlmostEqual(actual, 0.0 if index in (7, 15) else 0.01)
+
+    def test_c2_handoff_does_not_overshoot_gripper_bounds(self):
+        knots = [gripper_knot(0.0, 0.0, 0.0) for _ in range(20)]
+        # A positive derivative immediately after the blend used to make the
+        # quintic anticipate motion by dipping below zero before phase 3.
+        knots[4] = gripper_knot(0.0, 0.02, 0.01)
+        timeline = TrajectoryTimeline(tuple(knots), 5.0, 20)
+
+        handoff = timeline.with_c2_handoff(
+            gripper_knot(0.0, 0.0, 0.0), blend_knots=3
+        )
+
+        for sample in range(61):
+            position = handoff.value(3.0 * sample / 60.0)
+            self.assertGreaterEqual(position[7], 0.0)
+            self.assertLessEqual(position[7], 1.0)
+            self.assertGreaterEqual(position[15], 0.0)
+            self.assertLessEqual(position[15], 1.0)
+        end = handoff.phase_kinematics(3.0)
+        self.assertAlmostEqual(end[1][7], 0.0)
+        self.assertAlmostEqual(end[1][15], 0.0)
 
     def test_c2_handoff_rejects_blend_past_checkpoint(self):
         timeline = TrajectoryTimeline(tuple(knot(index) for index in range(20)), 5.0, 3)

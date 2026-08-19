@@ -6,6 +6,9 @@ from dataclasses import dataclass
 import math
 
 
+_GRIPPER_INDICES = (7, 15)
+
+
 def _finite_knots(knots) -> tuple[tuple[float, ...], ...]:
     values = tuple(tuple(float(value) for value in knot) for knot in knots)
     if not values:
@@ -25,6 +28,14 @@ def _finite_vector(values, *, width: int, label: str) -> tuple[float, ...]:
     if not all(math.isfinite(value) for value in result):
         raise ValueError(f"{label} must be finite")
     return result
+
+
+def _stationary_gripper_derivatives(values) -> tuple[float, ...]:
+    """Keep arm C2 boundaries while treating grippers as bounded position commands."""
+    result = list(_finite_vector(values, width=16, label="blend derivative"))
+    for index in _GRIPPER_INDICES:
+        result[index] = 0.0
+    return tuple(result)
 
 
 @dataclass(frozen=True)
@@ -201,11 +212,11 @@ class TrajectoryTimeline:
                 start_phase=float(phase),
                 end_phase=end_phase,
                 start_position=anchor,
-                start_velocity=start_velocity,
-                start_acceleration=start_acceleration,
+                start_velocity=_stationary_gripper_derivatives(start_velocity),
+                start_acceleration=_stationary_gripper_derivatives(start_acceleration),
                 end_position=end_position,
-                end_velocity=end_velocity,
-                end_acceleration=end_acceleration,
+                end_velocity=_stationary_gripper_derivatives(end_velocity),
+                end_acceleration=_stationary_gripper_derivatives(end_acceleration),
             )
             timeline = TrajectoryTimeline(
                 tuple(replacement), self.knot_hz, self.checkpoint_horizon, blend=blend
@@ -216,7 +227,7 @@ class TrajectoryTimeline:
         )
 
     def with_c2_handoff(self, anchor, *, blend_knots: int) -> "TrajectoryTimeline":
-        """Start this timeline from a stationary measured anchor with a C2 blend."""
+        """Start arms C2-stationary; transition bounded gripper position commands smoothly."""
         if blend_knots not in (2, 3):
             raise ValueError("trajectory handoff blend must span 2 or 3 knots")
         anchor = _finite_vector(anchor, width=16, label="trajectory handoff anchor")
@@ -237,8 +248,8 @@ class TrajectoryTimeline:
             start_velocity=zeros,
             start_acceleration=zeros,
             end_position=end_position,
-            end_velocity=end_velocity,
-            end_acceleration=end_acceleration,
+            end_velocity=_stationary_gripper_derivatives(end_velocity),
+            end_acceleration=_stationary_gripper_derivatives(end_acceleration),
         )
         return TrajectoryTimeline(
             tuple(knots), self.knot_hz, self.checkpoint_horizon, blend=blend

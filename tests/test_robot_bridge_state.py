@@ -921,6 +921,38 @@ def test_c2_handoff_falls_back_from_three_knots_to_two(monkeypatch):
     assert node._timeline.blend.end_phase == 2.0
 
 
+def test_c2_handoff_accepts_zero_boundary_grippers_without_overshoot(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(robot_bridge, "_now", lambda: clock[0])
+    node = _ready_trajectory_node(clock)
+    knots = [list(_arm_action(0.0)) for _ in range(robot_bridge.RTC_HORIZON)]
+    knots[4][7] = 0.02
+    knots[4][15] = 0.01
+
+    node.accept_command(
+        robot_bridge.LoadTrajectoryCommand(
+            1,
+            1,
+            "session",
+            "plan",
+            0,
+            tuple(tuple(knot) for knot in knots),
+            5.0,
+            robot_bridge.RTC_HORIZON,
+            True,
+            c2_handoff=True,
+        )
+    )
+
+    loaded = node._events[-1]
+    assert loaded.event_type == "trajectory_loaded"
+    assert loaded.blend_duration_knots == 3
+    for sample in range(61):
+        action = node._timeline.value(3.0 * sample / 60.0)
+        assert 0.0 <= action[7] <= 1.0
+        assert 0.0 <= action[15] <= 1.0
+
+
 def test_fake_bridge_checkpoint_resume_and_atomic_rtc_merge(monkeypatch):
     clock = [100.0]
     monkeypatch.setattr(robot_bridge, "_now", lambda: clock[0])
