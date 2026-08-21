@@ -69,7 +69,7 @@ from .protocol import (
     send_message,
 )
 from .rtc import RTC_EXECUTION_HORIZON, RTC_HORIZON
-from .safety import SafetyError, action_arms, filter_action, validate_action
+from .safety import C2BlendError, SafetyError, action_arms, filter_action, validate_action
 from .tracking import TrackingGovernor
 from .trajectory_timeline import TrajectoryTimeline
 
@@ -842,7 +842,7 @@ class MarvinBridgeNode(Node):
                 blend_metrics = (blend_knots, *candidate_metrics)
                 break
             if blend_metrics is None:
-                raise SafetyError(
+                raise C2BlendError(
                     "trajectory C2 handoff is infeasible (" + "; ".join(blend_errors) + ")"
                 )
         self._clear_target_locked("trajectory ownership enabled")
@@ -1247,6 +1247,11 @@ class MarvinBridgeNode(Node):
                         "plan_id",
                         getattr(message, "base_plan_id", self._trajectory_plan_id),
                     )
+                    reason_code = (
+                        "c2_blend_infeasible"
+                        if isinstance(exc, C2BlendError)
+                        else "command_rejected"
+                    )
                     self._emit_event_locked(
                         "trajectory_command_rejected",
                         now,
@@ -1259,7 +1264,7 @@ class MarvinBridgeNode(Node):
                         ),
                         checkpoint_id=getattr(message, "checkpoint_id", None),
                         request_id=getattr(message, "request_id", None),
-                        reason_code="command_rejected",
+                        reason_code=reason_code,
                         detail=str(exc),
                     )
             self._refresh_state_locked(now)
@@ -1948,7 +1953,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--tracking-settle-seconds", type=float, default=0.20)
     parser.add_argument("--rtc-blend-max-velocity-rad-s", type=float, default=0.45)
     parser.add_argument("--rtc-blend-max-acceleration-rad-s2", type=float, default=2.0)
-    parser.add_argument("--rtc-blend-max-jerk-rad-s3", type=float, default=20.0)
+    parser.add_argument("--rtc-blend-max-jerk-rad-s3", type=float, default=40.0)
     args = parser.parse_args(argv)
     if args.publish_hz <= 0 or args.command_timeout <= 0 or args.duration <= 0:
         parser.error("rates, timeouts, and duration must be positive")

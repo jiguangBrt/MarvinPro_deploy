@@ -133,6 +133,20 @@ class TrajectoryTimelineTest(unittest.TestCase):
         self.assertAlmostEqual(end[1][7], 0.0)
         self.assertAlmostEqual(end[1][15], 0.0)
 
+    def test_c2_handoff_clamps_endpoint_cancellation_to_zero(self):
+        knots = [gripper_knot(0.0, 0.7, 0.0) for _ in range(20)]
+        timeline = TrajectoryTimeline(tuple(knots), 5.0, 20)
+
+        handoff = timeline.with_c2_handoff(
+            gripper_knot(0.0, 0.66, 0.004153844784080983), blend_knots=3
+        )
+
+        for sample in range(61):
+            right = handoff.value(3.0 * sample / 60.0)[15]
+            self.assertGreaterEqual(right, 0.0)
+            self.assertLessEqual(right, 1.0)
+        self.assertEqual(handoff.value(3.0)[15], 0.0)
+
     def test_c2_handoff_rejects_blend_past_checkpoint(self):
         timeline = TrajectoryTimeline(tuple(knot(index) for index in range(20)), 5.0, 3)
 

@@ -101,8 +101,13 @@ class QuinticBlend:
         velocities = []
         accelerations = []
         jerks = []
-        for c0, c1, c2, c3, c4, c5 in self.coefficients:
-            positions.append(c0 + c1 * u + c2 * u**2 + c3 * u**3 + c4 * u**4 + c5 * u**5)
+        for index, (c0, c1, c2, c3, c4, c5) in enumerate(self.coefficients):
+            position = c0 + c1 * u + c2 * u**2 + c3 * u**3 + c4 * u**4 + c5 * u**5
+            if index in _GRIPPER_INDICES:
+                # A bounded zero-derivative smoothstep is monotone analytically, but
+                # endpoint cancellation can still produce values such as -3e-18.
+                position = max(0.0, min(1.0, position))
+            positions.append(position)
             velocities.append((c1 + 2.0 * c2 * u + 3.0 * c3 * u**2 + 4.0 * c4 * u**3 + 5.0 * c5 * u**4) / duration)
             accelerations.append((2.0 * c2 + 6.0 * c3 * u + 12.0 * c4 * u**2 + 20.0 * c5 * u**3) / duration**2)
             jerks.append((6.0 * c3 + 24.0 * c4 * u + 60.0 * c5 * u**2) / duration**3)

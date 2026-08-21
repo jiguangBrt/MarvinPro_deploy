@@ -102,7 +102,7 @@ def test_bridge_cli_uses_current_governor_and_safety_envelope_defaults():
     assert args.tracking_stop_error_rad == 0.16
     assert args.rtc_blend_max_velocity_rad_s == 0.45
     assert args.rtc_blend_max_acceleration_rad_s2 == 2.0
-    assert args.rtc_blend_max_jerk_rad_s3 == 20.0
+    assert args.rtc_blend_max_jerk_rad_s3 == 40.0
 
 
 def test_bridge_cli_rejects_validation_envelope_below_trajectory_clipping_envelope():
@@ -881,6 +881,7 @@ def test_c2_handoff_rejection_is_atomic_and_keeps_existing_hold(monkeypatch):
     assert node._timeline is None
     assert node._trajectory_hold_action == held
     assert node._events[-1].event_type == "trajectory_command_rejected"
+    assert node._events[-1].reason_code == "c2_blend_infeasible"
     assert "C2 handoff is infeasible" in node._events[-1].detail
 
 

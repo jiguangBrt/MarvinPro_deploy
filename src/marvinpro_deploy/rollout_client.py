@@ -264,6 +264,13 @@ class RolloutError(RuntimeError):
     pass
 
 
+class BridgeCommandRejected(RolloutError):
+    def __init__(self, message: str, event: TrajectoryEvent) -> None:
+        super().__init__(message)
+        self.event = event
+        self.reason_code = event.reason_code
+
+
 def _state_log_interval_s(trajectory_mode: str) -> float:
     if trajectory_mode == "hold":
         return _HOLD_STATE_LOG_INTERVAL_S
@@ -1558,7 +1565,9 @@ def _load_bridge_trajectory(
         event_types=("trajectory_loaded", "trajectory_command_rejected", "trajectory_stopped"),
     )
     if event.event_type != "trajectory_loaded" or event.plan_id != plan_id:
-        raise RolloutError(f"bridge rejected trajectory {plan_id}: {event.detail}")
+        raise BridgeCommandRejected(
+            f"bridge rejected trajectory {plan_id}: {event.detail}", event
+        )
     return event
 
 
@@ -1777,6 +1786,7 @@ def _run_bridge_synchronized(
     initial_actions: np.ndarray | None,
     episode_deadline: float,
     required_clean_chunks: int | None = None,
+    retry_c2_handoff_rejections: bool = False,
 ) -> TimedSynchronizedResult:
     inference_count = 0
     observation = initial_observation
@@ -1831,19 +1841,52 @@ def _run_bridge_synchronized(
                 c2_handoff=True,
             )
         except RolloutError as exc:
-            if not _is_observation_lag_rejection(exc):
+            failure = _classify_rtc_failure(exc)
+            if _is_observation_lag_rejection(exc):
+                latest = connection.latest(max_local_age_s=0.50)
+                LOGGER.warning(
+                    "discarding synchronized fallback inference because source observation is stale: "
+                    "source_seq=%d latest_seq=%d lag=%d; re-observing and retrying",
+                    observation.seq,
+                    latest.seq,
+                    latest.seq - observation.seq,
+                )
+                # The action was conditioned on an observation that the bridge rejected.
+                # Keep the bridge's fixed hold and infer again from a fresh image.
+                observation = latest
+                actions = None
+                continue
+            if not (
+                retry_c2_handoff_rejections
+                and failure.reason_code == "c2_blend_infeasible"
+            ):
                 raise
-            latest = connection.latest(max_local_age_s=0.50)
+            stuck_replans += 1
             LOGGER.warning(
-                "discarding synchronized fallback inference because source observation is stale: "
-                "source_seq=%d latest_seq=%d lag=%d; re-observing and retrying",
+                "timed_sync_c2_handoff_replan source_seq=%d stuck_replans=%d/%d; "
+                "keeping measured hold, re-observing and retrying: %s",
                 observation.seq,
-                latest.seq,
-                latest.seq - observation.seq,
+                stuck_replans,
+                args.max_stuck_replans,
+                exc,
             )
-            # The action was conditioned on an observation that the bridge rejected.
-            # Keep the bridge's fixed hold and infer again from a fresh image.
-            observation = latest
+            if stuck_replans >= args.max_stuck_replans:
+                return TimedSynchronizedResult(
+                    inference_count, observation, clean_chunks, stuck_replans, True
+                )
+            _, stable_source_time = _wait_bridge_tracking(
+                connection,
+                tolerance_rad=args.tracking_tolerance_rad,
+                settle_seconds=args.tracking_settle_seconds,
+                timeout_s=args.tracking_timeout,
+            )
+            observation = _fresh_observation_after_source_time(
+                connection,
+                stable_source_time,
+                timeout_s=args.tracking_timeout,
+                max_source_age_s=args.max_source_age,
+                max_state_image_skew_s=args.max_state_image_skew,
+            )
             actions = None
             continue
         heartbeat.update_version(loaded.timeline_version)
@@ -1981,6 +2024,8 @@ _RECOVERABLE_RTC_CODES = {
 
 def _classify_rtc_failure(exc: BaseException, event: TrajectoryEvent | None = None) -> RtcFailure:
     detail = str(exc)
+    if event is None and isinstance(exc, BridgeCommandRejected):
+        event = exc.event
     if event is not None and event.reason_code:
         code = event.reason_code
     elif (
@@ -1992,7 +2037,9 @@ def _classify_rtc_failure(exc: BaseException, event: TrajectoryEvent | None = No
         code = "transport_timeout"
     elif _is_observation_lag_rejection(exc):
         code = "observation_lag"
-    elif "blend" in detail.lower() and ("infeasible" in detail.lower() or "exceeds" in detail.lower()):
+    elif (
+        "blend" in detail.lower() or "c2 handoff" in detail.lower()
+    ) and ("infeasible" in detail.lower() or "exceeds" in detail.lower()):
         code = "c2_blend_infeasible"
     elif "late result" in detail.lower() or "predicted delay" in detail.lower():
         code = "rtc_late"
@@ -2508,6 +2555,7 @@ def _run_trajectory_schedule(
                             initial_actions=None,
                             episode_deadline=episode_deadline,
                             required_clean_chunks=1 if recover_rtc else None,
+                            retry_c2_handoff_rejections=not recover_rtc,
                         )
                     except (
                         RolloutError,
@@ -2572,6 +2620,57 @@ def _run_trajectory_schedule(
                                 )
                                 fallback_finished = True
                                 break
+                            continue
+                        if fallback_failure.recoverable and recover_rtc:
+                            # The RTC recovery budget is exhausted. Keep the measured
+                            # hold, then let the next loop iteration run synchronized
+                            # fallback with C2 replan handling instead of starting RTC
+                            # recovery number max+1.
+                            LOGGER.warning(
+                                "rtc_recovery_exhausted; switching to timed synchronized "
+                                "fallback recovery_id=%d max=%d",
+                                rtc_recovery_count,
+                                args.max_rtc_recoveries,
+                            )
+                            try:
+                                holding = _latch_measured_bridge_position(
+                                    connection,
+                                    command_ids,
+                                    session_id=session_id,
+                                    reason=(
+                                        "RTC recovery budget exhausted; switching to "
+                                        f"synchronized fallback: {fallback_exc}"
+                                    ),
+                                    reason_code=fallback_failure.reason_code,
+                                    timeout_s=args.tracking_timeout,
+                                )
+                                heartbeat.update_version(holding.timeline_version)
+                                _, stable_source_time = _wait_bridge_tracking(
+                                    connection,
+                                    tolerance_rad=args.tracking_tolerance_rad,
+                                    settle_seconds=args.tracking_settle_seconds,
+                                    timeout_s=args.tracking_timeout,
+                                )
+                                observation = _fresh_observation_after_source_time(
+                                    connection,
+                                    stable_source_time,
+                                    timeout_s=args.tracking_timeout,
+                                    max_source_age_s=args.max_source_age,
+                                    max_state_image_skew_s=args.max_state_image_skew,
+                                )
+                            except (RolloutError, SafetyError) as hold_exc:
+                                rtc_final_status = "fatal_safety_hold"
+                                LOGGER.error(
+                                    "rtc_final_status=fatal_safety_hold recovery_id=%d "
+                                    "fallback_transition_error=%r",
+                                    rtc_recovery_count,
+                                    str(hold_exc),
+                                )
+                                fallback_finished = True
+                                break
+                            # The next iteration increments the diagnostic recovery
+                            # id, but recover_rtc becomes false and no RTC bootstrap is
+                            # attempted. It runs timed synchronized fallback instead.
                             continue
                         rtc_final_status = (
                             "recovery_exhausted"
@@ -2664,17 +2763,54 @@ def _run_trajectory_schedule(
                             bootstrap_failure.recoverable,
                             str(bootstrap_exc),
                         )
-                        if (
-                            not bootstrap_failure.recoverable
-                            or rtc_recovery_count >= args.max_rtc_recoveries
-                        ):
-                            rtc_final_status = (
-                                "recovery_exhausted"
-                                if bootstrap_failure.recoverable
-                                else "fatal_safety_hold"
-                            )
+                        if not bootstrap_failure.recoverable:
+                            rtc_final_status = "fatal_safety_hold"
                             fallback_finished = True
                             break
+                        if rtc_recovery_count >= args.max_rtc_recoveries:
+                            LOGGER.warning(
+                                "rtc_recovery_exhausted; switching to timed synchronized "
+                                "fallback after bootstrap failure recovery_id=%d max=%d",
+                                rtc_recovery_count,
+                                args.max_rtc_recoveries,
+                            )
+                            try:
+                                holding = _latch_measured_bridge_position(
+                                    connection,
+                                    command_ids,
+                                    session_id=session_id,
+                                    reason=(
+                                        "RTC bootstrap recovery budget exhausted; switching "
+                                        f"to synchronized fallback: {bootstrap_exc}"
+                                    ),
+                                    reason_code=bootstrap_failure.reason_code,
+                                    timeout_s=args.tracking_timeout,
+                                )
+                                heartbeat.update_version(holding.timeline_version)
+                                _, stable_source_time = _wait_bridge_tracking(
+                                    connection,
+                                    tolerance_rad=args.tracking_tolerance_rad,
+                                    settle_seconds=args.tracking_settle_seconds,
+                                    timeout_s=args.tracking_timeout,
+                                )
+                                observation = _fresh_observation_after_source_time(
+                                    connection,
+                                    stable_source_time,
+                                    timeout_s=args.tracking_timeout,
+                                    max_source_age_s=args.max_source_age,
+                                    max_state_image_skew_s=args.max_state_image_skew,
+                                )
+                            except (RolloutError, SafetyError) as hold_exc:
+                                rtc_final_status = "fatal_safety_hold"
+                                LOGGER.error(
+                                    "rtc_final_status=fatal_safety_hold recovery_id=%d "
+                                    "fallback_transition_error=%r",
+                                    rtc_recovery_count,
+                                    str(hold_exc),
+                                )
+                                fallback_finished = True
+                                break
+                            continue
                         old_epoch = estimator.epoch
                         new_epoch = estimator.reset_epoch()
                         LOGGER.warning(

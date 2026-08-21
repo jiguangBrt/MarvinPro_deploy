@@ -17,6 +17,7 @@ import numpy as np
 from marvinpro_deploy.protocol import BridgeHello, RobotStateUpdate, TrajectoryEvent, send_message
 from marvinpro_deploy.rtc import RTC_HORIZON, RtcError
 from marvinpro_deploy.rollout_client import (
+    BridgeCommandRejected,
     _TrajectoryHeartbeat,
     _actions_tuple,
     _confirm_execution,
@@ -25,6 +26,7 @@ from marvinpro_deploy.rollout_client import (
     _configure_logging,
     _is_observation_lag_rejection,
     _run_bridge_synchronized,
+    _run_trajectory_schedule,
     _state_log_interval_s,
     _validate_rtc_policy_metadata,
     ActionPlan,
@@ -32,6 +34,7 @@ from marvinpro_deploy.rollout_client import (
     JointTelemetryRecorder,
     RobotConnection,
     RolloutError,
+    TimedSynchronizedResult,
     parse_args,
     validate_observation,
 )
@@ -227,6 +230,26 @@ class RobotConnectionTest(unittest.TestCase):
         self.assertEqual(failure.reason_code, "c2_blend_infeasible")
         self.assertTrue(failure.recoverable)
 
+    def test_bridge_command_rejection_preserves_structured_c2_reason(self):
+        event = TrajectoryEvent(
+            1,
+            "trajectory_command_rejected",
+            1.0,
+            "session",
+            "plan",
+            2,
+            0.0,
+            reason_code="c2_blend_infeasible",
+            detail="trajectory C2 handoff is infeasible",
+        )
+
+        failure = _classify_rtc_failure(
+            BridgeCommandRejected("bridge rejected trajectory", event)
+        )
+
+        self.assertEqual(failure.reason_code, "c2_blend_infeasible")
+        self.assertTrue(failure.recoverable)
+
     def test_rtc_failure_classification_keeps_safety_faults_fatal(self):
         clipping = _classify_rtc_failure(RtcError("bridge arm clipping detected"))
         mismatch = _classify_rtc_failure(RtcError("response request ID mismatch"))
@@ -397,6 +420,294 @@ class TimedSynchronizedRunnerTest(unittest.TestCase):
         self.assertEqual(result.clean_chunks, 1)
         self.assertEqual(result.stuck_replans, 0)
         self.assertIs(result.observation, fresh)
+
+    def test_exhausted_rtc_recovery_reobserves_after_c2_handoff_rejection(self):
+        observation = SimpleNamespace(seq=10)
+        fresh = SimpleNamespace(seq=20)
+        state = SimpleNamespace(
+            timeline_version=8,
+            motion_gate_open=True,
+            gate_reason="ready",
+            arm_clipped=False,
+            frozen_reason="hold",
+        )
+        rejected = TrajectoryEvent(
+            4,
+            "trajectory_command_rejected",
+            1.0,
+            "s",
+            "rejected",
+            8,
+            0.0,
+            reason_code="c2_blend_infeasible",
+            detail="trajectory C2 handoff is infeasible",
+        )
+        checkpoint = TrajectoryEvent(6, "checkpoint_ready", 6.0, "s", "clean", 9, 19.0)
+        connection = SimpleNamespace(
+            latest_state=lambda max_local_age_s=None: state,
+            wait_for_event=lambda **kwargs: checkpoint,
+        )
+        heartbeat = SimpleNamespace(error=None, update_version=lambda version: None)
+        actions = np.zeros((RTC_HORIZON, 16))
+
+        with (
+            patch(
+                "marvinpro_deploy.rollout_client._load_bridge_trajectory",
+                side_effect=(
+                    BridgeCommandRejected("bridge rejected trajectory", rejected),
+                    TrajectoryEvent(5, "trajectory_loaded", 2.0, "s", "clean", 9, 0.0),
+                ),
+            ),
+            patch(
+                "marvinpro_deploy.rollout_client._wait_bridge_tracking",
+                return_value=(state, 1.0),
+            ) as wait_tracking,
+            patch(
+                "marvinpro_deploy.rollout_client._fresh_observation_after_source_time",
+                return_value=fresh,
+            ) as reobserve,
+            patch(
+                "marvinpro_deploy.rollout_client._wait_checkpoint_observation",
+                return_value=SimpleNamespace(seq=30),
+            ),
+            patch(
+                "marvinpro_deploy.rollout_client.infer_actions",
+                return_value=(actions, {"wall_ms": 100.0}),
+            ),
+        ):
+            result = _run_bridge_synchronized(
+                self._args(),
+                connection,
+                object(),
+                SimpleNamespace(),
+                heartbeat,
+                session_id="s",
+                initial_observation=observation,
+                initial_actions=actions,
+                episode_deadline=time.monotonic() + 30.0,
+                required_clean_chunks=1,
+                retry_c2_handoff_rejections=True,
+            )
+
+        wait_tracking.assert_called_once()
+        reobserve.assert_called_once()
+        self.assertEqual(result.clean_chunks, 1)
+        self.assertEqual(result.stuck_replans, 0)
+        self.assertEqual(result.inference_count, 1)
+
+    def test_exhausted_rtc_recovery_stops_after_two_c2_handoff_rejections(self):
+        observation = SimpleNamespace(seq=10)
+        fresh = SimpleNamespace(seq=20)
+        state = SimpleNamespace(
+            timeline_version=8,
+            motion_gate_open=True,
+            gate_reason="ready",
+            arm_clipped=False,
+            frozen_reason="hold",
+        )
+        rejection = TrajectoryEvent(
+            4,
+            "trajectory_command_rejected",
+            1.0,
+            "s",
+            "rejected",
+            8,
+            0.0,
+            reason_code="c2_blend_infeasible",
+            detail="trajectory C2 handoff is infeasible",
+        )
+        connection = SimpleNamespace(latest_state=lambda max_local_age_s=None: state)
+        heartbeat = SimpleNamespace(error=None, update_version=lambda version: None)
+        actions = np.zeros((RTC_HORIZON, 16))
+
+        with (
+            patch(
+                "marvinpro_deploy.rollout_client._load_bridge_trajectory",
+                side_effect=(
+                    BridgeCommandRejected("first rejection", rejection),
+                    BridgeCommandRejected("second rejection", rejection),
+                ),
+            ),
+            patch(
+                "marvinpro_deploy.rollout_client._wait_bridge_tracking",
+                return_value=(state, 1.0),
+            ),
+            patch(
+                "marvinpro_deploy.rollout_client._fresh_observation_after_source_time",
+                return_value=fresh,
+            ),
+            patch(
+                "marvinpro_deploy.rollout_client.infer_actions",
+                return_value=(actions, {"wall_ms": 100.0}),
+            ),
+        ):
+            result = _run_bridge_synchronized(
+                self._args(),
+                connection,
+                object(),
+                SimpleNamespace(),
+                heartbeat,
+                session_id="s",
+                initial_observation=observation,
+                initial_actions=actions,
+                episode_deadline=time.monotonic() + 30.0,
+                retry_c2_handoff_rejections=True,
+            )
+
+        self.assertTrue(result.exhausted)
+        self.assertEqual(result.stuck_replans, 2)
+        self.assertEqual(result.inference_count, 1)
+
+    def test_third_recovery_failure_switches_to_synchronized_fallback(self):
+        observation = SimpleNamespace(seq=10)
+        state = SimpleNamespace(
+            timeline_version=8,
+            motion_gate_open=True,
+            gate_reason="ready",
+            arm_clipped=False,
+            frozen_reason="hold",
+        )
+        checkpoint = TrajectoryEvent(
+            1,
+            "checkpoint_ready",
+            1.0,
+            "s",
+            "initial",
+            1,
+            10.0,
+            checkpoint_id=1,
+        )
+        loaded = TrajectoryEvent(2, "trajectory_loaded", 0.0, "s", "initial", 1, 0.0)
+        rejection = TrajectoryEvent(
+            3,
+            "trajectory_command_rejected",
+            1.0,
+            "s",
+            "rejected",
+            8,
+            0.0,
+            reason_code="c2_blend_infeasible",
+            detail="trajectory C2 handoff is infeasible",
+        )
+        actions = np.zeros((RTC_HORIZON, 16))
+        sync_result = TimedSynchronizedResult(
+            inference_count=0,
+            observation=SimpleNamespace(seq=30),
+            clean_chunks=1,
+            stuck_replans=0,
+            exhausted=False,
+        )
+        connection = SimpleNamespace(
+            latest_state=lambda max_local_age_s=None: state,
+            latest=lambda: SimpleNamespace(input_mode=0),
+            wait_for_event=lambda **kwargs: checkpoint,
+            poll_event=lambda **kwargs: None,
+            send=lambda command: None,
+        )
+        policy = SimpleNamespace(
+            infer=lambda request: (_ for _ in ()).throw(ConnectionError("transport timeout")),
+            close=lambda: None,
+        )
+
+        class FakeHeartbeat:
+            error = None
+
+            def start(self):
+                return None
+
+            def join(self):
+                return None
+
+            def update_version(self, version):
+                return None
+
+        with (
+            patch("marvinpro_deploy.rollout_client._TrajectoryHeartbeat", return_value=FakeHeartbeat()),
+            patch(
+                "marvinpro_deploy.rollout_client.infer_actions",
+                return_value=(
+                    actions,
+                    {
+                        "wall_ms": 100.0,
+                        "observation_preparation_ms": 0.0,
+                        "client_timing": {},
+                        "policy_timing": {},
+                        "server_timing": {},
+                    },
+                ),
+            ),
+            patch("marvinpro_deploy.rollout_client.build_policy_observation", return_value={}),
+            patch("marvinpro_deploy.rollout_client.build_rtc_request", return_value={}),
+            patch("marvinpro_deploy.rollout_client._load_bridge_trajectory", return_value=loaded),
+            patch(
+                "marvinpro_deploy.rollout_client._wait_checkpoint_observation",
+                return_value=observation,
+            ),
+            patch(
+                "marvinpro_deploy.rollout_client._latch_measured_bridge_position",
+                return_value=loaded,
+            ) as latch_hold,
+            patch(
+                "marvinpro_deploy.rollout_client._wait_bridge_tracking",
+                return_value=(state, 1.0),
+            ),
+            patch(
+                "marvinpro_deploy.rollout_client._fresh_observation_after_source_time",
+                return_value=observation,
+            ),
+            patch(
+                "marvinpro_deploy.rollout_client._reconnect_policy",
+                return_value=(1, {"rtc": {}}),
+            ) as reconnect,
+            patch(
+                "marvinpro_deploy.rollout_client._run_bridge_synchronized",
+                side_effect=(
+                    BridgeCommandRejected("first", rejection),
+                    BridgeCommandRejected("second", rejection),
+                    BridgeCommandRejected("third", rejection),
+                    sync_result,
+                ),
+            ) as run_sync,
+            patch("marvinpro_deploy.rollout_client._hold_bridge_position", return_value=loaded),
+            patch("marvinpro_deploy.rollout_client._wait_for_none_after_trajectory"),
+        ):
+            result = _run_trajectory_schedule(
+                parse_args(
+                    [
+                        "--robot-host",
+                        "127.0.0.1",
+                        "--policy-host",
+                        "127.0.0.1",
+                    "--episode-seconds",
+                        "300",
+                        "--execute",
+                        "--rollout-schedule",
+                        "rtc",
+                        "--playback-mode",
+                        "interpolated",
+                        "--control-hz",
+                        "100",
+                        "--model-hz",
+                        "15",
+                        "--playback-time-scale",
+                        "3",
+                        "--execute-steps",
+                        "20",
+                    ]
+                ),
+                connection,
+                policy,
+                observation,
+                [],
+            )
+
+        self.assertEqual(result, 1)
+        self.assertEqual(run_sync.call_count, 4)
+        self.assertEqual(reconnect.call_count, 4)
+        self.assertGreaterEqual(latch_hold.call_count, 4)
+        fourth_kwargs = run_sync.call_args_list[3].kwargs
+        self.assertFalse(fourth_kwargs["required_clean_chunks"] is not None)
+        self.assertTrue(fourth_kwargs["retry_c2_handoff_rejections"])
 
 
     def test_execution_confirmation_forces_a_new_observation(self):

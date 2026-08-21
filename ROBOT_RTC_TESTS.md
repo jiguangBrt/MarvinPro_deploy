@@ -674,3 +674,38 @@ fallback 原因和操作员结论。
 - 尚未覆盖：protocol v9 controller dry-run、真实 observation replay、H20 单 chunk tracking、synchronized
   回归、continuous shadow、C2 blend 真机可行性、RTC merge，以及 synchronized fallback 稳定一次后重新建立
   RTC epoch。进入任何 motion-enabled 测试前仍须从第 2～5 节按顺序执行。
+
+### 2026-08-19 protocol v10/H20 三组真机测试与长任务问题
+
+- 第一组 protocol v10 motion-disabled dry-run：通过。controller bridge 在 `6.6.7.100:7332` 启动，
+  `motion_allowed=False`、publish rate 约 `99.94 Hz`；真实 topic 映射、H264 图像接收、实测夹爪反馈和
+  protocol v10 连接均正常，没有发送任何运动命令。现场输出记录为 18:26 左右的 bridge dry-run 日志。
+- 第二组 timed synchronized：通过。日志目录为
+  `logs/h20_baseline_20260819_183256`；H20、5 Hz、100 Hz command，完成 3 个 synchronized chunk，
+  每个 chunk 均在 deadline 内到位并稳定，`arm-clipped ticks=0`，无抽动、回弹、撞击或失控。
+  第一次输出因 C2 handoff 的夹爪浮点边界拒绝而重试；第二次重试已正常完成，日志目录为
+  `logs/h20_baseline_retry_20260819_183918`。
+- 第三组短 RTC fallback/recovery/merge：通过。日志目录为
+  `logs/h20_rtc_recovery_20260819_184521`；完成 2 次 RTC merge，`rtc_final_status=clean_completion`，
+  `recoveries=0`，无 clipping、stale、hard freeze、协议错位或可感知冲击。
+- 三组真机验收结论：protocol v10 联通、timed synchronized、continuous RTC merge 和基础 recovery
+  路径均已跑通；夹爪实测反馈使用归一化 `[0,1]` policy 值，未再出现夹爪反馈 topic 缺失问题。
+
+### 2026-08-19 长任务暴露的问题与离线修复
+
+- `logs/h20_rtc_task5m_20260819_193006` 的 5 分钟任务没有运行到 5 分钟：约 12 秒时先发生一次
+  `rtc_late (d_pred=2, d_actual=2)`，随后连续 3 次 synchronized recovery 的 C2 handoff 因机械臂 jerk
+  超限被原子拒绝，最大值为 `24.86/31.05/27.49 rad/s^3`，2-knot 候选更高；这不是夹爪范围问题，
+  也没有 arm clipping、stale feedback、hard freeze 或模式异常。
+- 已按模型动作较激进的实际情况，把 bridge 默认
+  `--rtc-blend-max-jerk-rad-s3` 从 `20` 提高到 `40 rad/s^3`；速度 `0.45 rad/s`、加速度
+  `2.0 rad/s^2`、关节包络和其他安全门保持不变，命令行仍可显式覆盖该值。
+- 已修复 recovery 状态机：第三次可恢复 RTC recovery 失败后，不再直接结束并固定 hold；先重新锁存实测姿态、
+  等待稳定并获取新观测，再切换到不再重建 RTC 的 timed synchronized fallback，并开启最多两次 C2 replan。
+  离线回归测试覆盖了“三次失败后第四步进入 fallback”路径。
+- 本轮修复后的非真机验证：deploy pytest `108 passed`，Ruff 通过，Python compileall 和 `git diff --check`
+  通过；没有重新连接真机，也没有重启远程 policy 服务。
+- 明日真机复测顺序：先重新启动已同步当前工作树的 bridge，执行一次短 timed synchronized chunk，再执行
+  短 RTC recovery/merge，最后再跑 5 分钟任务。重点确认日志出现
+  `rtc_recovery_exhausted; switching to timed synchronized fallback` 后仍继续运行，且没有 jerk、clipping、
+  stale、hard freeze、模式异常或可感知冲击。若出现安全异常，立即切回 Input Mode None 并停止 bridge。

@@ -8,10 +8,15 @@ import math
 from .config import JOINT_LOWER, JOINT_UPPER
 
 ARM_ACTION_INDICES = tuple(range(7)) + tuple(range(8, 15))
+_GRIPPER_TARGET_EPSILON = 1e-9
 
 
 class SafetyError(ValueError):
     pass
+
+
+class C2BlendError(SafetyError):
+    """A trajectory handoff was rejected without changing the active target."""
 
 
 @dataclass(frozen=True)
@@ -43,14 +48,17 @@ def validate_action(
     max_joint_step_rad: float,
     joint_limit_margin_rad: float = 0.02,
 ) -> tuple[float, ...]:
-    values = _finite_vector(action, 16, "action")
+    values = list(_finite_vector(action, 16, "action"))
     joints = _finite_vector(current_joints, 14, "current_joints")
     if max_joint_step_rad <= 0:
         raise SafetyError("max_joint_step_rad must be positive")
-    if not (0.0 <= values[7] <= 1.0 and 0.0 <= values[15] <= 1.0):
+    if not all(-_GRIPPER_TARGET_EPSILON <= values[index] <= 1.0 + _GRIPPER_TARGET_EPSILON for index in (7, 15)):
         raise SafetyError(f"gripper targets must be in [0, 1], got {values[7]:.4f}, {values[15]:.4f}")
+    for index in (7, 15):
+        values[index] = max(0.0, min(1.0, values[index]))
 
-    targets = action_arms(values)
+    result = tuple(values)
+    targets = action_arms(result)
     for index, (target, current, lower, upper) in enumerate(zip(targets, joints, JOINT_LOWER, JOINT_UPPER)):
         safe_lower = lower + joint_limit_margin_rad
         safe_upper = upper - joint_limit_margin_rad
@@ -63,7 +71,7 @@ def validate_action(
             raise SafetyError(
                 f"joint {index} step {delta:.5f}rad exceeds {max_joint_step_rad:.5f}rad"
             )
-    return values
+    return result
 
 
 def filter_action(

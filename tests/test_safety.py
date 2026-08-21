@@ -26,6 +26,20 @@ class SafetyTest(unittest.TestCase):
         with self.assertRaisesRegex(SafetyError, "gripper"):
             validate_action(bad, [0.0] * 14, max_joint_step_rad=0.08)
 
+    def test_clamps_only_numerical_gripper_boundary_error(self):
+        action = action16()
+        action[7] = -3.469446951953614e-18
+        action[15] = 1.0 + 2.220446049250313e-16
+
+        result = validate_action(action, [0.0] * 14, max_joint_step_rad=0.08)
+
+        self.assertEqual(result[7], 0.0)
+        self.assertEqual(result[15], 1.0)
+
+        action[7] = -1e-6
+        with self.assertRaisesRegex(SafetyError, "gripper"):
+            validate_action(action, [0.0] * 14, max_joint_step_rad=0.08)
+
     def test_filter_clamps_step_and_gripper(self):
         filtered = filter_action(action16(1.0, 2.0), [0.0] * 14, max_joint_step_rad=0.08)
         self.assertEqual(filtered.action[0], 0.08)
