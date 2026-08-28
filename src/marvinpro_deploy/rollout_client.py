@@ -68,6 +68,7 @@ _ACTIVE_STATE_LOG_INTERVAL_S = 0.10
 _HOLD_STATE_LOG_INTERVAL_S = 1.0
 _ACTION_NAMES = JOINT_NAMES[:7] + ("Gripper_L",) + JOINT_NAMES[7:] + ("Gripper_R",)
 _TRACKING_PLAYBACK_TIME_SCALE = 3.0
+_TRACKING_ALLOWED_TIME_SCALES = (1.0, _TRACKING_PLAYBACK_TIME_SCALE)
 
 
 class JointTelemetryRecorder:
@@ -3452,11 +3453,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         if (
             args.control_hz != 100.0
             or args.model_hz != 15.0
-            or args.playback_time_scale != _TRACKING_PLAYBACK_TIME_SCALE
+            or args.playback_time_scale not in _TRACKING_ALLOWED_TIME_SCALES
         ):
             parser.error(
                 "synchronized/tracking/rtc requires --control-hz 100 --model-hz 15 "
-                "--playback-time-scale 3 (fixed 5 Hz knot rate)"
+                "--playback-time-scale 1 or 3 (15 Hz or 5 Hz knot rate)"
             )
         if args.execute_steps != RTC_HORIZON:
             parser.error(f"synchronized/tracking/rtc requires --execute-steps {RTC_HORIZON}")

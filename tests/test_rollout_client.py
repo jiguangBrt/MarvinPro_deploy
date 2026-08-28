@@ -1026,6 +1026,29 @@ class RolloutArgumentTest(unittest.TestCase):
         self.assertEqual(args.max_joint_step_rad, 0.16)
         self.assertEqual(args.rtc_late_result_policy, "discard")
 
+    def test_rtc_schedule_allows_native_fifteen_hz_playback_scale(self):
+        args = parse_args(
+            [
+                "--execute",
+                "--rollout-schedule",
+                "rtc",
+                "--playback-mode",
+                "interpolated",
+                "--control-hz",
+                "100",
+                "--model-hz",
+                "15",
+                "--playback-time-scale",
+                "1",
+                "--execute-steps",
+                str(RTC_HORIZON),
+                "--rtc-continuous",
+            ]
+        )
+
+        self.assertEqual(args.rollout_schedule, "rtc")
+        self.assertEqual(args.playback_time_scale, 1.0)
+
     def test_rtc_schedule_allows_wait_late_result_comparison_policy(self):
         args = parse_args(
             [

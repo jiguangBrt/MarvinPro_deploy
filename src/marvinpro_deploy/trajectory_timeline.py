@@ -7,6 +7,30 @@ import math
 
 
 _GRIPPER_INDICES = (7, 15)
+# Blend windows target a fixed duration in seconds (0.6s == 3 knots at the
+# original 5 Hz knot rate) so physical blend derivatives stay in the same
+# envelope no matter the knot rate; the blend must fit before the next
+# checkpoint, which caps the length at 9 knots for a 10-knot horizon.
+_BLEND_TARGET_SECONDS = 0.6
+_MAX_BLEND_KNOTS = 9
+
+# Validated blend safety envelopes per knot rate: (velocity rad/s,
+# acceleration rad/s^2, jerk rad/s^3). The 5 Hz values are operationally
+# validated; the 15 Hz values are calibrated from the stack_cones_slow_260826
+# teleop dataset (104 episodes at native 15 Hz: p99.9 = 0.556/2.34/49.8,
+# demonstrated max = 1.167/14.2/289) as max(3x p99.9, 1.3x max).
+# Rates without a validated envelope are refused by the bridge.
+BLEND_CAPS_BY_KNOT_HZ = {
+    5.0: (0.45, 2.0, 40.0),
+    15.0: (1.7, 18.0, 380.0),
+}
+
+
+def blend_knot_candidates(knot_hz: float, max_knots: int) -> list[int]:
+    """Blend lengths to try, longest first, sized to keep ~0.6s windows."""
+    preferred = min(int(round(_BLEND_TARGET_SECONDS * knot_hz)), _MAX_BLEND_KNOTS, max_knots)
+    candidates = {min(value, max_knots) for value in (preferred, (2 * preferred) // 3, 3, 2)}
+    return sorted((value for value in candidates if value >= 2), reverse=True)
 
 
 def _finite_knots(knots) -> tuple[tuple[float, ...], ...]:
@@ -203,8 +227,8 @@ class TrajectoryTimeline:
         replacement[phase] = anchor
         timeline = TrajectoryTimeline(tuple(replacement), self.knot_hz, self.checkpoint_horizon)
         if blend_knots is not None:
-            if blend_knots not in (2, 3):
-                raise ValueError("RTC blend must span 2 or 3 knots")
+            if not 2 <= blend_knots <= _MAX_BLEND_KNOTS:
+                raise ValueError(f"RTC blend must span 2..{_MAX_BLEND_KNOTS} knots")
             end_phase = float(phase + blend_knots)
             if end_phase > timeline.checkpoint_phase or end_phase >= timeline.final_phase:
                 raise ValueError("RTC blend does not fit before the next checkpoint")
@@ -233,8 +257,8 @@ class TrajectoryTimeline:
 
     def with_c2_handoff(self, anchor, *, blend_knots: int) -> "TrajectoryTimeline":
         """Start arms C2-stationary; transition bounded gripper position commands smoothly."""
-        if blend_knots not in (2, 3):
-            raise ValueError("trajectory handoff blend must span 2 or 3 knots")
+        if not 2 <= blend_knots <= _MAX_BLEND_KNOTS:
+            raise ValueError(f"trajectory handoff blend must span 2..{_MAX_BLEND_KNOTS} knots")
         anchor = _finite_vector(anchor, width=16, label="trajectory handoff anchor")
         knots = list(self.knots)
         knots[0] = anchor

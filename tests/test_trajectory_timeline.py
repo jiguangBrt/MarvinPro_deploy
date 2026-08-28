@@ -1,6 +1,10 @@
 import unittest
 
-from marvinpro_deploy.trajectory_timeline import TrajectoryTimeline
+from marvinpro_deploy.trajectory_timeline import (
+    BLEND_CAPS_BY_KNOT_HZ,
+    TrajectoryTimeline,
+    blend_knot_candidates,
+)
 
 
 def knot(value):
@@ -152,6 +156,60 @@ class TrajectoryTimelineTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "does not fit"):
             timeline.with_c2_handoff(knot(0), blend_knots=3)
+
+
+class BlendKnotCandidatesTest(unittest.TestCase):
+    def test_five_hz_keeps_legacy_candidates(self):
+        self.assertEqual(blend_knot_candidates(5.0, 9), [3, 2])
+
+    def test_fifteen_hz_scales_window_to_match_point_six_seconds(self):
+        self.assertEqual(blend_knot_candidates(15.0, 9), [9, 6, 3, 2])
+
+    def test_candidates_are_clipped_to_fit_before_checkpoint(self):
+        self.assertEqual(blend_knot_candidates(15.0, 6), [6, 4, 3, 2])
+        self.assertEqual(blend_knot_candidates(5.0, 2), [2])
+        self.assertEqual(blend_knot_candidates(15.0, 1), [])
+
+    def test_nine_knot_replacement_blend_is_c2_at_both_ends(self):
+        timeline = TrajectoryTimeline(tuple(knot(index * 0.01) for index in range(20)), 15.0, 10)
+        actions = tuple(knot(0.2 + index * 0.02) for index in range(20))
+        replacement, phase = timeline.replacement(
+            actions,
+            actual_delay_steps=1,
+            anchor=knot(0.1),
+            blend_knots=9,
+            start_velocity=knot(0.01),
+            start_acceleration=knot(0.0),
+        )
+
+        self.assertEqual(phase, 0.0)
+        start = replacement.phase_kinematics(phase)
+        end = replacement.phase_kinematics(phase + 9.0)
+        for index, actual in enumerate(start[1]):
+            self.assertAlmostEqual(actual, 0.0 if index in (7, 15) else 0.01)
+        for actual, expected in zip(end[0], actions[9]):
+            self.assertAlmostEqual(actual, expected)
+        for index, actual in enumerate(end[1]):
+            self.assertAlmostEqual(actual, 0.0 if index in (7, 15) else 0.02)
+
+    def test_blend_length_above_nine_is_rejected(self):
+        timeline = TrajectoryTimeline(tuple(knot(index) for index in range(20)), 15.0, 20)
+
+        with self.assertRaisesRegex(ValueError, "2..9 knots"):
+            timeline.with_c2_handoff(knot(0), blend_knots=10)
+
+    def test_blend_envelopes_cover_only_validated_knot_rates(self):
+        self.assertEqual(set(BLEND_CAPS_BY_KNOT_HZ), {5.0, 15.0})
+        for velocity, acceleration, jerk in BLEND_CAPS_BY_KNOT_HZ.values():
+            self.assertGreater(velocity, 0.0)
+            self.assertGreater(acceleration, 0.0)
+            self.assertGreater(jerk, 0.0)
+        # Teleop calibration (stack_cones_slow_260826, native 15 Hz):
+        # demonstrated maxima were 1.167 / 14.2 / 289; envelopes must exceed them.
+        velocity_15, acceleration_15, jerk_15 = BLEND_CAPS_BY_KNOT_HZ[15.0]
+        self.assertGreaterEqual(velocity_15, 1.167)
+        self.assertGreaterEqual(acceleration_15, 14.2)
+        self.assertGreaterEqual(jerk_15, 289.0)
 
 
 if __name__ == "__main__":

@@ -100,9 +100,11 @@ def test_bridge_cli_uses_current_governor_and_safety_envelope_defaults():
     assert args.tracking_run_error_rad == 0.02
     assert args.tracking_resume_error_rad == 0.12
     assert args.tracking_stop_error_rad == 0.16
-    assert args.rtc_blend_max_velocity_rad_s == 0.45
-    assert args.rtc_blend_max_acceleration_rad_s2 == 2.0
-    assert args.rtc_blend_max_jerk_rad_s3 == 40.0
+    # Blend caps default to the validated per-knot-rate envelope table
+    # (BLEND_CAPS_BY_KNOT_HZ); CLI flags are explicit overrides.
+    assert args.rtc_blend_max_velocity_rad_s is None
+    assert args.rtc_blend_max_acceleration_rad_s2 is None
+    assert args.rtc_blend_max_jerk_rad_s3 is None
 
 
 def test_bridge_cli_rejects_validation_envelope_below_trajectory_clipping_envelope():

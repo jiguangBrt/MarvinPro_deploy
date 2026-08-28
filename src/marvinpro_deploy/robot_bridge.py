@@ -71,7 +71,7 @@ from .protocol import (
 from .rtc import RTC_EXECUTION_HORIZON, RTC_HORIZON
 from .safety import C2BlendError, SafetyError, action_arms, filter_action, validate_action
 from .tracking import TrackingGovernor
-from .trajectory_timeline import TrajectoryTimeline
+from .trajectory_timeline import BLEND_CAPS_BY_KNOT_HZ, TrajectoryTimeline, blend_knot_candidates
 
 
 def _now() -> float:
@@ -130,9 +130,9 @@ class MarvinBridgeNode(Node):
         tracking_stop_error_rad: float,
         tracking_tolerance_rad: float,
         tracking_settle_seconds: float,
-        rtc_blend_max_velocity_rad_s: float,
-        rtc_blend_max_acceleration_rad_s2: float,
-        rtc_blend_max_jerk_rad_s3: float,
+        rtc_blend_max_velocity_rad_s: float | None,
+        rtc_blend_max_acceleration_rad_s2: float | None,
+        rtc_blend_max_jerk_rad_s3: float | None,
     ) -> None:
         super().__init__("marvinpro_rollout_bridge")
         self.allow_motion = allow_motion
@@ -674,6 +674,23 @@ class MarvinBridgeNode(Node):
         blend = timeline.blend
         if blend is None:
             raise SafetyError("RTC replacement is missing its C1/C2 blend")
+        # Validated per-rate envelopes calibrated from teleop demonstrations
+        # are the default; explicit CLI overrides bypass the table entirely.
+        overrides = (
+            self.rtc_blend_max_velocity_rad_s,
+            self.rtc_blend_max_acceleration_rad_s2,
+            self.rtc_blend_max_jerk_rad_s3,
+        )
+        default_caps = BLEND_CAPS_BY_KNOT_HZ.get(timeline.knot_hz)
+        if default_caps is None and any(cap is None for cap in overrides):
+            raise SafetyError(
+                f"no validated blend envelope for knot rate {timeline.knot_hz}; "
+                "set all --rtc-blend-max-* overrides to run at an unvalidated rate"
+            )
+        velocity_cap, acceleration_cap, jerk_cap = (
+            override if override is not None else default
+            for override, default in zip(overrides, default_caps or (0.0, 0.0, 0.0))
+        )
         duration_s = blend.duration_phases / timeline.knot_hz
         sample_count = max(1, int(math.ceil(duration_s * self.publish_hz)))
         max_velocity = 0.0
@@ -701,22 +718,22 @@ class MarvinBridgeNode(Node):
             max_acceleration = max(max_acceleration, acceleration)
             max_jerk = max(max_jerk, jerk)
             for joint_index, (value, urdf_limit) in enumerate(zip(arm_velocity, JOINT_VELOCITY)):
-                limit = min(urdf_limit, self.rtc_blend_max_velocity_rad_s)
+                limit = min(urdf_limit, velocity_cap)
                 if value > limit + 1e-9:
                     raise SafetyError(
                         f"RTC blend joint {joint_index} velocity {value:.5f}rad/s exceeds "
                         f"{limit:.5f}rad/s at 100Hz sample {sample_index}/{sample_count}"
                     )
-            if acceleration > self.rtc_blend_max_acceleration_rad_s2 + 1e-9:
+            if acceleration > acceleration_cap + 1e-9:
                 raise SafetyError(
                     f"RTC blend acceleration {acceleration:.5f}rad/s^2 exceeds "
-                    f"{self.rtc_blend_max_acceleration_rad_s2:.5f}rad/s^2 at 100Hz sample "
+                    f"{acceleration_cap:.5f}rad/s^2 at 100Hz sample "
                     f"{sample_index}/{sample_count}"
                 )
-            if jerk > self.rtc_blend_max_jerk_rad_s3 + 1e-9:
+            if jerk > jerk_cap + 1e-9:
                 raise SafetyError(
                     f"RTC blend jerk {jerk:.5f}rad/s^3 exceeds "
-                    f"{self.rtc_blend_max_jerk_rad_s3:.5f}rad/s^3 at 100Hz sample "
+                    f"{jerk_cap:.5f}rad/s^3 at 100Hz sample "
                     f"{sample_index}/{sample_count}"
                 )
         return max_velocity, max_acceleration, max_jerk
@@ -828,7 +845,10 @@ class MarvinBridgeNode(Node):
         blend_metrics = None
         if message.c2_handoff:
             blend_errors = []
-            for blend_knots in (3, 2):
+            max_blend = min(
+                int(base_timeline.checkpoint_phase), base_timeline.horizon - 2
+            )
+            for blend_knots in blend_knot_candidates(message.knot_hz, max_blend):
                 try:
                     candidate = base_timeline.with_c2_handoff(
                         measured_anchor, blend_knots=blend_knots
@@ -999,7 +1019,8 @@ class MarvinBridgeNode(Node):
         timeline = None
         blend_metrics = None
         blend_errors = []
-        for blend_knots in (3, 2):
+        max_blend = int(old_timeline.checkpoint_phase) - (self._actual_delay_steps - 1)
+        for blend_knots in blend_knot_candidates(old_timeline.knot_hz, max_blend):
             try:
                 candidate, candidate_phase = old_timeline.replacement(
                     message.actions,
@@ -1951,12 +1972,37 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--tracking-stop-error-rad", type=float, default=0.16)
     parser.add_argument("--tracking-tolerance-rad", type=float, default=0.01)
     parser.add_argument("--tracking-settle-seconds", type=float, default=0.20)
-    parser.add_argument("--rtc-blend-max-velocity-rad-s", type=float, default=0.45)
-    parser.add_argument("--rtc-blend-max-acceleration-rad-s2", type=float, default=2.0)
-    parser.add_argument("--rtc-blend-max-jerk-rad-s3", type=float, default=40.0)
+    parser.add_argument(
+        "--rtc-blend-max-velocity-rad-s",
+        type=float,
+        default=None,
+        help="override the blend velocity cap (rad/s); default uses the validated "
+        "per-knot-rate envelope (5 Hz: 0.45, 15 Hz: 1.7)",
+    )
+    parser.add_argument(
+        "--rtc-blend-max-acceleration-rad-s2",
+        type=float,
+        default=None,
+        help="override the blend acceleration cap (rad/s^2); default uses the validated "
+        "per-knot-rate envelope (5 Hz: 2.0, 15 Hz: 18.0)",
+    )
+    parser.add_argument(
+        "--rtc-blend-max-jerk-rad-s3",
+        type=float,
+        default=None,
+        help="override the blend jerk cap (rad/s^3); default uses the validated "
+        "per-knot-rate envelope (5 Hz: 40, 15 Hz: 380)",
+    )
     args = parser.parse_args(argv)
     if args.publish_hz <= 0 or args.command_timeout <= 0 or args.duration <= 0:
         parser.error("rates, timeouts, and duration must be positive")
+    for blend_cap in (
+        args.rtc_blend_max_velocity_rad_s,
+        args.rtc_blend_max_acceleration_rad_s2,
+        args.rtc_blend_max_jerk_rad_s3,
+    ):
+        if blend_cap is not None and blend_cap <= 0:
+            parser.error("rtc blend caps must be positive when provided")
     if not (
         0 < args.tracking_run_error_rad
         < args.tracking_resume_error_rad
@@ -1978,12 +2024,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.trajectory_heartbeat_timeout,
         args.tracking_tolerance_rad,
         args.tracking_settle_seconds,
-        args.rtc_blend_max_velocity_rad_s,
-        args.rtc_blend_max_acceleration_rad_s2,
-        args.rtc_blend_max_jerk_rad_s3,
     ) <= 0:
         parser.error("trajectory timeouts and tracking parameters must be positive")
-    if args.rtc_blend_max_velocity_rad_s > min(JOINT_VELOCITY):
+    if (
+        args.rtc_blend_max_velocity_rad_s is not None
+        and args.rtc_blend_max_velocity_rad_s > min(JOINT_VELOCITY)
+    ):
         parser.error(
             "--rtc-blend-max-velocity-rad-s cannot exceed the active URDF joint velocity limit "
             f"({min(JOINT_VELOCITY):.4f} rad/s)"
