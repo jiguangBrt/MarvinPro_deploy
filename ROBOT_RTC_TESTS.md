@@ -1,8 +1,7 @@
 # MarvinPro Tracking-Aware RTC Robot Test Checklist
 
-> **2026-08-28 注**：本文现汇总全部 RTC/轨迹测试材料——原验收清单、调度与轨迹诊断工具、
-> RTC 决策与实现记录（吸收自 `RTC_TODO_20260818.md`）、异步 action chunk 错位分析（吸收自
-> `ASYNC_ACTION_CHUNKING.md`），以及带日期的真机测试记录。命令块中的 checkout 路径已更新，但
+> **2026-08-28 注**：本文汇总全部 RTC/轨迹测试材料——验收清单、诊断工具、RTC 决策记录和带日期的
+> 真机测试记录（测试记录已精简，保留结论与关键数据）。命令块中的 checkout 路径已更新，但
 > checkpoint、prompt 等参数保留当时记录，不再逐条刷新。当前推荐的真机执行命令（新 checkpoint
 > `pi05_marvinpro_red_cones_slow`、新任务 prompt、全新 `RUN_DIR` 日志约定和 dry-run -> synchronized
 > -> RTC shadow -> `--max-rtc-merges 1` 的执行顺序）以 [`_HANDOFF.md`](_HANDOFF.md) 为准；其中
@@ -31,32 +30,18 @@ Impedance Mode、Home 或清故障；这些步骤必须由现场人员确认。�
 
 ### 2026-08-19 protocol v10 无真机现态结果
 
-本轮没有连接 `6.6.7.100`、没有启动 controller bridge、没有切换 Apex 模式，也没有发送真机 action。
+本轮没有连接控制器、没有启动 bridge、没有发送真机 action。要点：
 
-- deploy 全套：`100 passed`；OpenPI WebSocket client 定向测试：`7 passed`；两个仓库相关 Ruff 全部通过。
-- `192.168.50.73:8000` TCP 直连和 `scripts/marvinpro_rtc_smoke.py` 通过；metadata 为 `rtc_v1`、H20/s10、
-  native/model action dim 16/32、`d_max=4`、`schedule=exp`，普通/RTC 输出均为有限 `(20,16)`。
-- 同一持久连接完成 20 次 RTC 请求，`d_pred=1..4` 各 5 次，0 timeout；wall latency
-  min/p50/p95/max 为 `302.834/342.882/389.927/393.233 ms`，server infer 为
-  `170.622/179.795/184.632/187.170 ms`。5 Hz 加 50 ms guard 后 p95 对应 `d_pred=3`，未超过 `d_max=4`。
-- 用 `request_timeout_s=0.001` 强制触发超时后，旧 socket 被关闭；重新连接能再次校验 metadata，并在
-  2 秒默认请求时限内返回有限 `(20,16)`。
-- 当前仍未验证 protocol v10 controller 握手、真实 H264 observation、topic freshness、实机 5 秒 deadline、
-  measured hold 是否无跳变，以及 fallback 后的真实 RTC merge；这些只按文末“最小三组测试”执行。
-
-当前 `tmp` 分支真机接口：关节、输入模式、robot/arm state、夹爪和动作 topic 均在 `/tj` 命名空间；
-相机仍为 `/quad_tile/compressed`，消息格式为 `h264`。客户端必须保留连续 H264 解码状态，不能用
-Pillow 直接把单个 H264 包当 JPEG 解码。
-
-夹爪反馈处理（2026-08-19）：已确认 `/tj/info/gripper_feedback_L/R` 可以收到左右夹爪五维信息。protocol v10
-中 policy state、action state 和 RTC handoff anchor 使用实测 `q` 按训练标定 `0.0..1.25` 归一化后的值；
-telemetry 同时记录原始/归一化位置、速度、力矩、温度、命令和位置误差。任一侧 feedback 缺失或过期会关闭
-运动门。RTC tracking governor 仍只基于 14 个机械臂关节，不使用夹爪误差推进或冻结 phase。
-
-2026-08-19 protocol v9 motion-disabled 历史验证已通过：5 秒 doctor 中左右 feedback 均为 `334.5 Hz`；protocol
-v10 必须重新执行下述 motion-disabled dry-run。历史全链路
-dry-run 中客户端收到的左右 feedback age 为 `1.197/1.061 ms`，日志为
-`gripper_state_source=measured_feedback`，远程 H20 policy 完成 19 次推理，未发送任何 action。
+- deploy 全套 `100 passed`；OpenPI WebSocket client 定向测试 `7 passed`；两端 Ruff 通过。
+- 远程 smoke 通过：metadata 为 `rtc_v1`、H20/s10、`d_max=4`、`schedule=exp`，普通/RTC 输出均为
+  有限 `(20,16)`；同一持久连接 20 次 RTC 请求 0 timeout，wall min/p50/p95/max
+  `302.8/342.9/389.9/393.2 ms`，server infer p95 `184.6 ms`。5 Hz 加 50 ms guard 后 p95 对应
+  `d_pred=3`，未超过 `d_max=4`。强制 recv timeout 后 reconnect 正常。
+- 夹爪反馈已确认：`/tj/info/gripper_feedback_L/R` 五维信息可用；protocol v10 的 policy state、
+  action state 和 RTC handoff anchor 使用实测 `q` 按 `0.0..1.25` 归一化；任一侧 feedback 缺失或
+  过期关闭运动门；RTC tracking governor 只基于 14 个机械臂关节。
+- 未验证项（只按文末“最小三组测试”执行）：protocol v10 controller 握手、真实 H264 observation、
+  topic freshness、实机 5 秒 deadline、measured hold 无跳变、fallback 后的真实 RTC merge。
 
 ## 1. 网络与代理预检（只读）
 
@@ -134,7 +119,7 @@ reference、settle 时长、state/image skew、clipping、freeze 和 delay。hol
 需要临时在终端查看详细诊断时再加 `--console-log-level DEBUG`。两端日志必须同时保留。
 
 设置 `--log-file "$RUN_DIR/rollout.log"` 时，客户端还会自动创建
-`$RUN_DIR/rollout.telemetry.csv`；也可以用 `--telemetry-file` 指定路径。该 CSV 不写终端日志，而是逐条
+`$RUN_DIR/rollout.telemetry.csv`；也可以用 `--telemetry-file` 指定路径。该 CSV 逐条
 记录 bridge 收到的实测 14 关节、bridge 100 Hz 插帧后的 `sent_target`，以及 legacy/prefetch 客户端的
 插帧请求和 safety-filter 后发送值；后两者分别在 `client_reference_*` 与 `client_command_*` 列中，
 并用 `record_type=bridge_state` 或 `client_command` 区分来源。绘图命令为：
@@ -505,39 +490,11 @@ overlap、phase-rate 分布、delay budget 利用率、late/discard 比例，以
 > 实际已发送目标衔接新计划，并缩短open-loop段。
 
 该模式保持模型节点的 15 Hz 时间语义，把时间拉长 2 倍，并在节点之间以 100 Hz 线性插值；每次完整
-消费 policy 输出的全部 10 个节点（从上一段末目标到下一段 `action[0]` 也作为一个节点间隔插值），
-每段持续 `10 / 7.5 = 1.333 s`，队列还剩 `0.30 s` 时开始推理下一段，返回后追加到队尾，不在段中
-覆盖旧计划。实测约 `153-173 ms` 推理延迟下仍有 `13-15` 个 100 Hz 点留在队列中。
+消费 policy 输出的全部 10 个节点，每段持续 `1.333 s`，队列还剩 `0.30 s` 时开始推理下一段，返回后
+追加到队尾，不在段中覆盖旧计划。
 
-bridge（Apex Input Mode 保持 None）：
-
-```bash
-cd /home/jh/TianJi_Marvinpro/MarvinPro_deploy
-./scripts/run_bridge_on_controller.sh --allow-motion --publish-hz 100
-```
-
-已执行过的5秒真机失败参数（仅供记录）：
-
-```bash
-cd /home/jh/OpenPI_UR/openpi
-PYTHONPATH=/home/jh/TianJi_Marvinpro/MarvinPro_deploy/src \
-uv run python -m marvinpro_deploy.rollout_client \
-  --robot-host 6.6.7.100 \
-  --policy-host 192.168.50.73 \
-  --execute \
-  --episode-seconds 5 \
-  --playback-mode interpolated \
-  --control-hz 100 \
-  --model-hz 15 \
-  --playback-time-scale 2 \
-  --execute-steps 10 \
-  --chunk-prefetch-seconds 0.30 \
-  --log-level DEBUG
-```
-
-确认页必须显示 `effective knot rate: 7.50Hz`、`command rate: 100.0Hz` 和
-`selected chunk: 10 knots over 1.333s`；`chunk_append_diag` 中稳态 `underruns_since_last` 应为
-`0`，`queued_before` 应大于 `0`。
+已执行过的5秒真机失败参数（仅供记录）：`--playback-mode interpolated --control-hz 100 --model-hz 15
+--playback-time-scale 2 --execute-steps 10 --chunk-prefetch-seconds 0.30`。
 
 ### 同步执行、到位、保持、重观测诊断
 
@@ -651,25 +608,19 @@ uv run python -m marvinpro_deploy.frozen_chunk_test_client \
 
 ## RTC 决策与实现记录（2026-08-18/19）
 
-本节吸收自原 `RTC_TODO_20260818.md`。2026-08-19 的三组真机验收结果和长任务修复见下方“测试记录”，
-此处不再重复。
+### protocol v10 实现要点（2026-08-19，全部完成并真机验收）
 
-### protocol v10 实现状态（2026-08-19）
-
-- [x] H20 synchronized/tracking/fallback 统一为 bridge-owned timed chunk：名义 4 秒，默认 1 秒 grace。
-- [x] 健康 timeout 由 controller 原子锁存最新实测双臂位置，保留最后夹爪命令，稳定后从新图像重推理；
-  连续两次 timeout 后固定 hold 并结束。
-- [x] 新计划优先使用 3-knot quintic C2 handoff，失败再试 2-knot；动力学或安全限制失败时原子拒绝。
-- [x] RTC failure 使用结构化 reason code：late/discard、transport timeout、observation lag 和单次 C2
+- H20 synchronized/tracking/fallback 统一为 bridge-owned timed chunk：名义 4 秒，默认 1 秒 grace；
+  健康 timeout 由 controller 原子锁存最新实测双臂位置，保留最后夹爪命令，连续两次 timeout 后固定
+  hold 并结束。
+- 新计划优先使用 3-knot quintic C2 handoff，失败再试 2-knot；动力学或安全限制失败时原子拒绝。
+- RTC failure 使用结构化 reason code：late/discard、transport timeout、observation lag 和单次 C2
   merge infeasible 可恢复；clipping、freeze、stale、heartbeat/timer、状态门、
   事务/协议/shape/finite/URDF 错误不可恢复。
-- [x] 可恢复故障废弃旧连接/request/epoch，实测 hold，执行至少一个 clean synchronized chunk，再用新
+- 可恢复故障废弃旧连接/request/epoch，实测 hold，执行至少一个 clean synchronized chunk，再用新
   H20 普通推理初始化新 DelayEstimator epoch 和 `s=10` RTC bootstrap；每 episode 最多 3 次。
-- [x] 本地 OpenPI WebSocket client 支持 connect/request timeout、`close()` 解阻塞和 metadata 校验
+- 本地 OpenPI WebSocket client 支持 connect/request timeout、`close()` 解阻塞和 metadata 校验
   重连；MarvinPro 默认连接 5 秒、请求 2 秒。
-- [x] 无真机验证：deploy `100 passed`、OpenPI client `7 passed`、两端 Ruff 通过；远程 H20 smoke、
-  20 次持久 RTC 请求、强制 recv timeout 后 reconnect 均通过。
-- [x] 真机三步验收已于 2026-08-19 完成（见“测试记录”）。
 
 ### 指数 soft mask 基线冻结（2026-08-18 已决）
 
@@ -687,15 +638,9 @@ weight[i] = 0,                                         i >= P
 soft transition knot；增大 `d_max` 不改变同一 `d_pred` 的权重表，实际使用更大的 `d_pred` 反而减少
 `P-d_pred`，缩短 soft transition。保持 `d_max=4`；不得为了获得更多平滑点提高 `d_max`，也不得设置
 `d_max=H-s=10`。客户端发送 `schedule=exp`、`beta=5.0`；远程 metadata 公布
-`prefix_attention_schedule=exp` 并结构化拒绝不支持的 schedule。
-
-2026-08-18 非真机验证：`scripts/marvinpro_rtc_smoke.py` 通过（普通/RTC 推理均返回有限 `(20,16)`，
-错误 prefix 被拒后连接可继续）；同一持久连接 2 次 discarded warmup + 20 次有效 RTC 请求
-（`d_pred=1..4` 各 5 次）；wall latency p50/p95/max `375.670/447.539/568.937 ms`，5 Hz 加 50 ms
-guard 后 p95 对应 `d_pred=3`；server infer p50/p95/max `210.021/221.055/222.916 ms`，network
-residual estimate p50/p95/max `163.474/231.425/351.140 ms`；错误 prefix、`d_pred=5`、错误 `s` 和
-不支持的 schedule 均返回 `invalid_rtc_request`；deploy `80 passed`、OpenPI 定向 CPU
-`25 passed, 2 deselected`。
+`prefix_attention_schedule=exp` 并结构化拒绝不支持的 schedule。非真机验证：20 次持久 RTC 请求
+wall p50/p95/max `375.7/447.5/568.9 ms`，错误 prefix、`d_pred=5`、错误 `s` 和不支持的 schedule
+均被结构化拒绝。
 
 ### synchronized fallback 稳定一次后重新进入 RTC（已实现）
 
@@ -727,62 +672,37 @@ Mode/Robot Ready/arm state 异常；session/plan/timeline/checkpoint/request ID 
 shape、URDF、安全包络、协议版本或本地 invariant 错误。bootstrap inference/安全 C2 handoff 失败消耗
 一次 recovery attempt；到达 3 次上限后固定 hold。
 
-实现约束（均已实现）：fallback 拆出“只执行一个恢复 chunk”的入口，返回末端 checkpoint、新
-observation 和 timeline version；进入 fallback 时所有旧 RTC worker/result 失效，恢复后只接受新
-request ID、新 timeline version、新 checkpoint ID；`DelayEstimator.reset_epoch()` 后不能在没有稳定
-样本时直接调用 `predicted_steps()`，用恢复后新观测的初始推理/明确 discarded probe 建立新 epoch，
-禁止复用导致本次 fallback 的旧 latency；恢复后的初始 plan 使用 RTC checkpoint horizon `s=10`；
-每 episode 最多自动恢复 3 次，第 4 次只执行 timed synchronized fallback；日志记录 recovery ID、
-原始 failure reason、恢复阶段、旧/新 estimator epoch、stable source time、observation seq、
-plan/timeline/request ID 和最终结果。fake bridge 已覆盖 `RTC -> C2 reject -> measured hold ->
-sync clean -> bootstrap -> merge` 端到端注入，旧 request/timeline 被拒绝。
+实现约束（均已实现）：fallback 拆出“只执行一个恢复 chunk”的入口；进入 fallback 时所有旧 RTC
+worker/result 失效，恢复后只接受新 request ID、新 timeline version、新 checkpoint ID；
+`DelayEstimator.reset_epoch()` 后用恢复后新观测的初始推理建立新 epoch，禁止复用旧 latency；恢复后
+初始 plan 使用 RTC checkpoint horizon `s=10`；每 episode 最多自动恢复 3 次，第 4 次只执行 timed
+synchronized fallback。fake bridge 已覆盖端到端注入，旧 request/timeline 被拒绝。
 
 ### 夹爪实测反馈（2026-08-19）
 
-- 控制器 `/tj/info/gripper_feedback_L/R` 左右夹爪五维信息已确认；右侧“打开→夹持→打开”记录中
-  `q` 和 `tau` 均随阶段明显、可逆变化。
-- protocol v10 的 policy state、action state、RTC handoff anchor 和 measured hold 使用 feedback
-  `q`；bridge 不再用最后发布命令覆盖夹爪实测状态；任一侧 feedback 缺失或超过 state stale 阈值关闭
-  运动门；telemetry 恢复原始/归一化位置、速度、力矩、温度、命令和位置误差列。
-- 尚未形成左右夹爪各自完整、同工况的开合端点标定；旧的 `0.0~1.25 -> 0~1` 不能视为已验证映射，
-  保留为任务效果评价中的独立风险。
+- `/tj/info/gripper_feedback_L/R` 五维信息已确认；protocol v10 的 policy state、action state、RTC
+  handoff anchor 和 measured hold 使用 feedback `q`；bridge 不再用最后发布命令覆盖夹爪实测状态。
+- 尚未形成左右夹爪各自完整、同工况的开合端点标定；旧的 `0.0~1.25 -> 0~1` 不能视为已验证映射。
 
-### 2026-08-19 20-merge 长跑（`logs/h20_rtc_soak20_20260819_142740`）暴露的问题
+### 2026-08-19 20-merge 长跑暴露的问题
 
-操作员先后启动两个 episode；第二个中途主动 `Ctrl+C`（bridge 随后 `trajectory_stopped`，不是推理
-服务崩溃）。两次都没有成功 RTC merge，后续动作实际由 synchronized fallback 执行，因此本轮不能
-断言“H20 连续 RTC 比 H10 差”。
+`logs/h20_rtc_soak20_20260819_142740`：两个 episode 均未成功 RTC merge（后续动作由 synchronized
+fallback 执行），不能据此评价 H20 连续 RTC。要点：
 
-- 两个 episode 的首次 RTC 结果均为 `d_pred=2`、`d_actual=2`，hard anchor 偏差很小，但 3-knot C2
-  最大 jerk 分别为 `22.06194` 和 `24.56892 rad/s^3`，超过当时的 `20 rad/s^3` 上限；2-knot 候选更差
-  （`73.90878` / `63.91702 rad/s^3`）。bridge 正确原子拒绝 merge，未把不安全边界发给机器人。根因
-  指向“旧轨迹在 merge 点的速度/加速度与 H20 新轨迹开头不够相容”，不是网络延迟尖峰（两次推理均在
-  正常量级，无 stale、ID mismatch、arm clipping 或延迟越界）。后续 2026-08-19 晚已将 bridge 默认
-  `--rtc-blend-max-jerk-rad-s3` 从 `20` 提高到 `40 rad/s^3`（见“测试记录”长任务条目）；更长的
-  受约束 C2 blend 是否可行仍需离线回放评估，不得再直接放宽上限。
-- 第一段 fallback 的最后一个 H20 chunk 在目标发出后始终未满足 `0.01 rad` 且连续稳定 `0.20 s`
-  （`Joint4_L` 最大误差约 `0.01155 rad`），等待 `4 s` 轨迹加 `5 s` tracking timeout 后报
-  `timed out waiting for trajectory event`；现场机械臂已触达桌面，高度疑似接触约束使目标物理不可达。
-  不要通过取消 timeout 或放宽 tolerance 掩盖该问题。
-- **telemetry 覆盖事故**：两个 episode 复用同一个 `rtc-soak20.log` 和 telemetry 文件，CSV 被第二次
-  运行覆盖，第一段高频 telemetry 丢失。此后每个 episode 必须使用新的 `RUN_DIR`/文件名；该约定现为
-  强制要求，见 [`_HANDOFF.md`](_HANDOFF.md)。
-- 两次 episode 的初始机器人/夹爪状态不同，第二次左夹爪反馈约 `0.708`，预测夹爪值频繁落到投影边界。
-  H10/H20 对比必须固定机械臂初始姿态、物体布局和两侧夹爪状态，并把 gripper clipping 单独统计。
-- `--episode-seconds 60` 是整轮运动的外层安全时限，`--max-rtc-merges 20` 只是“最多允许 20 次成功
-  replacement”（本轮实际成功 merge 为 0）；两者都不应直接取消。完整任务应使用足够但有限的 episode
-  时长，并把“任务时限到达”和“某个目标在 tracking timeout 内不可达”分开报告。
-
-下一轮优先顺序：先离线提取成功 merge 与两次失败 merge 的旧/新边界，按关节对比位置、速度、加速度和
-jerk（保留 hard anchor、C2 和安全上限）；每次使用独立 RUN_DIR，用相同初始姿态/物体/夹爪条件分别跑
-H10 与 H20，成功 RTC merge 和 fallback episode 分开统计；在没有复现至少 2 次连续安全 merge 前不做
-20-merge soak，按单 merge -> 2 merges -> 10 merges 逐级放大，并保证机械臂不会以桌面接触作为停止
-条件。
+- 首次 RTC 结果 `d_pred=2`、`d_actual=2`，hard anchor 偏差很小，但 3-knot C2 最大 jerk 分别为
+  `22.06` 和 `24.57 rad/s^3`，超过当时的 `20 rad/s^3` 上限；2-knot 候选更差（`73.9`/`63.9`）。
+  bridge 正确原子拒绝。根因指向“旧轨迹在 merge 点的速度/加速度与 H20 新轨迹开头不够相容”，不是
+  网络延迟尖峰。当晚已将 bridge 默认 `--rtc-blend-max-jerk-rad-s3` 从 `20` 提高到 `40 rad/s^3`；
+  更长的受约束 C2 blend 是否可行仍需离线回放评估，不得再直接放宽上限。
+- 一段 fallback 的最后一个 chunk 始终未满足到位+稳定（`Joint4_L` 最大误差约 `0.01155 rad`），现场
+  机械臂已触达桌面，高度疑似接触约束使目标物理不可达。不要通过取消 timeout 或放宽 tolerance 掩盖。
+- **telemetry 覆盖事故**：两个 episode 复用同一个日志/telemetry 文件，CSV 被第二次运行覆盖。
+  此后每个 episode 必须使用新的 `RUN_DIR`/文件名；该约定现为强制要求，见
+  [`_HANDOFF.md`](_HANDOFF.md)。
+- H10/H20 对比必须固定机械臂初始姿态、物体布局和两侧夹爪状态，并把 gripper clipping 单独统计。
+- `--episode-seconds` 是外层安全时限，`--max-rtc-merges` 只是成功 replacement 上限；两者都不应取消。
 
 ## 异步 action chunk 错位分析（2026-08-07）
-
-本节吸收自原 `ASYNC_ACTION_CHUNKING.md`，保留设计依据。其中“服务端 RTC”方案已在后续实现并真机
-验收（见上文清单与决策记录）。
 
 ### 模型时间语义
 
@@ -792,7 +712,7 @@ H10 与 H20，成功 RTC merge 和 fallback episode 分开统计；在没有复�
 `action[0]` 是当前数据帧时刻的 action。训练阶段关节 action 以相对当前 state 的 delta 进入模型，
 输出变换还原为绝对关节目标；夹爪维度不做关节 delta 变换。
 
-### 错位机制与 2026-08-07 真机证据
+### 错位机制与真机证据
 
 异步 prefetch 中，第二次观测 `O1` 生成的新 chunk B 的 `B0` 基于 `O1` 所见的真实机器人状态，而旧
 计划 A9 已位于更远的未来目标。把 B 追加到 A 的 raw 尾部形成
@@ -815,37 +735,26 @@ H10 与 H20，成功 RTC merge 和 fallback episode 分开统计；在没有复�
 的时间和状态一致性；简单线性插值不能把 `B0` 变成语义正确的 `A10`；安全裁剪不能充当轨迹规划器；
 增大预取窗口只会让生成 B 所用的观测更陈旧。
 
-### 可选方案调研
+### 可选方案调研（结论）
 
-1. **同步 chunk 执行**：执行完 chunk、等待跟踪稳定、保持、采集新观测、推理、从保持姿态执行下一
-   chunk。因果最清楚、不需要改模型或服务器，作为安全基线；代价是每个 chunk 之间停顿约 150 至
-   400 ms 另加稳定时间，训练示范中没有周期性停顿。Physical Intelligence 说明 RTC 发布前的
-   π0、π0-FAST 和 π0.5 就是这种同步方案。
-2. **Receding horizon / 短前缀执行**：只执行 10 个预测节点中的前 3 至 5 个，丢弃尾部并用新观测
-   重规划。限制：推理耗时必须小于可用前缀时间；新 chunk 必须从最后实际发送目标或反馈连续衔接；
-   固定跳到 `new[k]` 不是充分的延迟补偿，`k` 应同时考虑推理延迟和实际跟踪进度。Diffusion Policy
-   采用 action-sequence prediction 与 receding-horizon control 结合。
-3. **ACT temporal ensemble**：只能聚合时间对齐的预测，不能直接平均相邻时刻的 A9 与 B0；当前
-   150 至 400 ms 远程延迟无法在 15 Hz 每帧完成一次独立推理；PI 报告针对 flow-based VLA 的简单
-   temporal ensembling 不保证有效或安全。
-4. **通用异步动作队列与重叠聚合**（LeRobot/SmolVLA）：参数为 `actions_per_chunk`、
-   `chunk_size_threshold`、`aggregate_fn`，主要解决推理期间没有动作可执行的问题；LeRobot 文档明确
-   区分异步队列解决 idle、RTC 解决 chunk 间不连续，只移植队列仍可能复现回弹。
-5. **Real-Time Chunking（RTC）**：按实际推理延迟确定必然执行的旧前缀并冻结，对剩余新 chunk 执行
-   inpainting/guidance，用软过渡权重折中连续性与反应性；面向 diffusion/flow policy，不要求重新
-   训练。当时 OpenPI WebSocket 接口只接收观测并返回独立 chunk，必须修改服务端采样；这是本项目
-   后来实施的方案。
-6. **训练时 action prefix conditioning**：训练阶段模拟推理延迟并直接条件化已承诺的 action
-   prefix，推理更简单、对大延迟稳健，但需要重新训练 checkpoint；在客户端基线与推理时 RTC 验证后
-   再考虑。
+1. **同步 chunk 执行**：因果最清楚、不改模型/服务器，作为安全基线；代价是 chunk 间停顿约 150 至
+   400 ms 另加稳定时间。PI 说明 RTC 发布前的 π0 系列就是这种方案。
+2. **Receding horizon / 短前缀执行**：只执行前 3 至 5 个节点并用新观测重规划；新 chunk 必须从最后
+   实际发送目标或反馈连续衔接；固定跳到 `new[k]` 不是充分的延迟补偿。
+3. **ACT temporal ensemble**：只能聚合时间对齐的预测；当前远程延迟无法支撑，PI 报告对 flow-based
+   VLA 不保证有效或安全。
+4. **通用异步动作队列**（LeRobot/SmolVLA）：主要解决推理期间无动作可执行；只移植队列仍可能复现
+   回弹（LeRobot 文档明确区分异步队列解决 idle、RTC 解决 chunk 间不连续）。
+5. **Real-Time Chunking（RTC）**：冻结必然执行的旧前缀，对剩余新 chunk 做 inpainting/guidance；
+   不要求重新训练。本项目已实施并真机验收。
+6. **训练时 action prefix conditioning**：对大延迟稳健但需要重新训练 checkpoint；在客户端基线与
+   推理时 RTC 验证后再考虑。
 
 ### 与 2 倍时间尺度的关系
 
-训练时 A0 至 A9 覆盖约 0.6 秒；严格 2 倍慢放应覆盖约 1.2 秒，加上“实时锚点到 A0”的一个节点间隔
-后整个动作段为 1.333 秒。时间拉伸不改变模型输出的关节目标值，但会把同一路径的目标速度约降为
-一半、加速度约降为四分之一，并改变接触、夹爪闭合和物体运动的时间关系。冻结 chunk 中 2 倍慢放改善
-跟踪，说明降低目标速度有价值；持续 rollout 的失败来自过长 open-loop 执行和错误 chunk 锚点，两件事
-必须分开评估。
+训练时 A0 至 A9 覆盖约 0.6 秒；2 倍慢放后整个动作段约 1.333 秒。时间拉伸不改变模型输出的关节目标
+值，但把目标速度约降为一半、加速度约降为四分之一。冻结 chunk 中 2 倍慢放改善跟踪，说明降低目标
+速度有价值；持续 rollout 的失败来自过长 open-loop 执行和错误 chunk 锚点，两件事必须分开评估。
 
 ### 不应采用的简化方案
 
@@ -878,228 +787,109 @@ H10 与 H20，成功 RTC merge 和 fallback episode 分开统计；在没有复�
 
 每轮记录：日期、两仓库 commit、checkpoint、完整 CLI、GPU、网络/代理环境、state/image 频率、RTC 各阶段
 延迟、`d_pred/d_actual`、phase、tracking/reference/servo error、clipping、freeze、checkpoint/merge IDs、
-fallback 原因和操作员结论。
+fallback 原因和操作员结论。以下为精简后的记录，保留结论与关键数据。
 
 ### 2026-08-10 本机到控制器只读测试
 
-- 代理环境：当前 shell 未设置 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 或 `NO_PROXY`；
-- 路由：`6.6.7.100 dev enp49s0 src 6.6.7.10`，SSH 配置无 `ProxyCommand`/`ProxyJump`；
-- 连通性：SSH 22 和 bridge 7332 可达；测试前后控制器均无残留 bridge 进程或 7332 listener；
-- 8 秒 doctor：`/joint_states` 63.4 Hz，左右夹爪各 472.4 Hz，相机 11.6 Hz，robot/arm state
-  各 126.7 Hz，joint mapping 正常；当时 Apex 为 None，状态为 `input_mode=0`、`robot_state=(0,0)`、
-  `arm_state=(0,0)`；
-- protocol v3 dry-run bridge（历史记录）：hello 为 `version=3`、`motion_allowed=False`、`publish_hz=100`，关节限位
-  14/14；6 秒内收到 1091 个递增 state 和 88 张 JPEG，state 最大接收间隔 34.35 ms，joint source
-  最大间隔 28.77 ms，image 最大间隔 89.95 ms，最后一帧反馈 age 为 2.9/1.6/0.5 ms；
-- 未连接正在使用的 policy 服务器，未启动 `--allow-motion`，未改变 Apex 模式，未发送任何 action；
-- motion-disabled 安全门：发送 `execute=True` 的 trajectory load 后收到结构化
-  `trajectory_command_rejected`，原因是未启用 `--allow-motion`；timeline 保持 0，session/phase 均为空；
-- 首次退出发现 rclpy SIGINT 重复 shutdown；改为单一 shutdown owner 后，短 bridge 启停退出码为 0，
-  无线程异常或重复 shutdown traceback，修改后的 doctor 也可正常退出。
+通过。路由 `6.6.7.100 dev enp49s0`，无代理/ProxyCommand；SSH 22 和 bridge 7332 可达。8 秒 doctor：
+`/joint_states` 63.4 Hz、左右夹爪各 472.4 Hz、相机 11.6 Hz、robot/arm state 各 126.7 Hz。motion-disabled
+安全门验证：`execute=True` 的 trajectory load 被结构化拒绝，timeline 保持 0。修复了 rclpy SIGINT 重复
+shutdown（改为单一 shutdown owner）。
 
 ### 2026-08-10 单 chunk tracking governor 真机测试
 
-- 结论：通过；日志目录为 `logs/tracking_retry_20260810_183404`，MarvinPro_deploy 基线 commit
-  `780247f`，OpenPI 基线 commit `6fc6a90`，两边均包含未提交的本轮 RTC/诊断修改；
-- 配置：远程 policy `192.168.50.73:8000`、controller bridge `6.6.7.100:7332`、100 Hz command、
-  15 Hz policy knot、2.0x 时间尺度、10 knot、tracking schedule、1 秒 episode；
-- policy metadata 为 `rtc_v1`、horizon 10、execution horizon 4、最大预测延迟 4；warmup 为
-  `248.6 ms`，实际初始推理 wall time 为 `381.9 ms`，服务端 infer 为 `69.3 ms`；
-- trajectory phase 从 0 单调到 9；较大跟踪误差时 phase rate 自动降低，未发生 hard freeze、heartbeat
-  timeout、timer overrun、stale feedback 或 command rejection；
-- A9 checkpoint tracking/servo error 为 `0.005103 rad`，低于 `0.01 rad`，source timestamp 证明连续
-  settle `0.202462 s`；checkpoint 后新观测 state/image skew 为 `6.144 ms`；
-- 全程 `arm_clipped=False` 且 raw/sent arm reference 最大差值为 0；policy 的小幅负夹爪输出在客户端边界
-  投影到 `[0, 1]`，左夹爪 7 个点、右夹爪 10 个点被投影，未改变 14 个手臂关节；
-- hold 阶段 DEBUG 周期采样约 1 Hz，终端仅保留安全 WARNING 和交互提示；操作员切回 None 后记录
-  `trajectory_stopped` 和 `trajectory_exit_mode_confirmed input_mode=0`，客户端正常退出；
-- 下一阶段 synchronized 多 chunk 回归尚未执行，需要操作员重新确认真机环境安全。
+通过（`logs/tracking_retry_20260810_183404`）。100 Hz command、15 Hz knot、2.0x、10 knot；phase 0->9
+单调，跟踪误差大时 phase rate 自动降低；A9 checkpoint tracking error `0.005103 rad`、source timestamp
+证明连续 settle `0.202 s`；checkpoint 后 state/image skew `6.1 ms`；全程无 clipping、freeze、stale、
+heartbeat/timer 异常。操作员切回 None 后正常退出。
 
 ### 2026-08-11 synchronized 卡顿调查
 
-- `logs/synchronized_20260811_095502`：2.0x、100 Hz、3 个 chunk；每段新增 134 个 command tick。chunk 1
-  `track_peak_error=0.27883 rad`、到位耗时 `1.954 s`、`arm_clipped=228`；chunk 2/3 的 arm clipping 为 0。
-  本轮不通过，且不能进入 RTC。
-- `logs/synchronized_scale3_20260811_101136`：3.0x、2 个 chunk；arm clipping 为 0，但 chunk 1/2 之间仍有
-  `2.701 s` 的诊断间隔，而每个 chunk 的发送时长为 `2.000 s`；`episode_underruns=222` 表示计划队列为空时
-  客户端重复发送锁存末目标，属于 synchronized 的预期 hold，不是网络丢包。
-- synchronized 的卡顿根因已确认是调度语义：完整 chunk 发送后必须等待目标跟踪、连续 `0.20 s` 稳定、
-  再保持 `0.20 s`、采集新观测并完成远程推理，下一 chunk 才会开始。因此它适合隔离边界问题，不适合评价
-  连续运动平滑性。增大 playback time scale 只能消除 arm clipping，不能消除 chunk 间停顿。
-- `logs/tracking_retry_20260810_183404`：tracking governor 观测到误差从 `0.0171` 上升至约 `0.0356 rad`，
-  phase rate 从 `0.7627` 降至 `0.1479`，随后随误差下降恢复至约 `0.91`。这是当前 `run=0.01`、
-  `resume=0.03`、`stop=0.04 rad` governor 的主动降速，不是 heartbeat、stale feedback 或 policy 请求中断；
-  但会被操作者感知为运动迟滞。
-- 控制器只读 doctor（2026-08-11）：`/joint_states=80.5 Hz`、图像 `12.9 Hz`、robot/arm state `160.8 Hz`。
-  新增无运动 tick 诊断显示：客户端 `late_ticks=0/skipped_ticks=0/max_gap=10.146 ms`；bridge 空载平均
-  `99.73 Hz`、`65` 次间隔超过 `15 ms`、最大间隔 `22.691 ms`；连接 dry-run 后平均 `99.64 Hz`、`78` 次
-  超过 `15 ms`、最大间隔 `27.034 ms`。这属于需要继续观测的控制器定时抖动，但量级不足以解释 synchronized
-  已确认的 `0.7-1.0 s` chunk 停顿。
-- 当前结论：两种“卡顿”不是同一个故障。synchronized 的长停顿是设计行为；tracking 的迟滞来自 governor
-  对跟踪误差的降速，另有约 20-27 ms 的 bridge timer jitter 候选。未完成连续平滑运动修复前，不进入 RTC
-  shadow 或 RTC merge。
+- `logs/synchronized_20260811_095502`：2.0x、3 chunk；chunk 1 `track_peak_error=0.27883 rad`、
+  `arm_clipped=228`，不通过，不能进 RTC。
+- `logs/synchronized_scale3_20260811_101136`：3.0x、2 chunk；clipping 为 0，但 chunk 间仍有 `2.701 s`
+  间隔。卡顿根因是调度语义（发送后等待跟踪、稳定、保持、重观测、推理），增大 time scale 只能消除
+  clipping，不能消除 chunk 间停顿；synchronized 适合隔离边界问题，不适合评价连续平滑性。
+- tracking governor 观测：误差 `0.0171 -> 0.0356 rad` 时 phase rate `0.7627 -> 0.1479`，随后恢复
+  约 `0.91`——主动降速，会被感知为迟滞。
+- bridge 定时抖动约 `20-27 ms`（平均 `99.6 Hz`），量级不足以解释 `0.7-1.0 s` 的 chunk 停顿。
+- 结论：两种“卡顿”不是同一个故障；连续平滑运动修复前不进入 RTC shadow/merge。
 
 ### 2026-08-11 连续 prefetch 边界对照
 
-- `logs/prefetch_scale3_20260811_103829`：3.0x、5 秒、3 次推理；除首次推理前预期的 15 个 hold tick 外，
-  后续两次推理均在队列剩余 35 tick 时完成，`underruns_since_last=0`。操作员确认几乎没有 synchronized
-  的 chunk 间长停顿。
-- 客户端 publisher 为 `late_ticks=0`、`skipped_ticks=0`、`max_gap=10.816 ms`；bridge 平均 `99.61 Hz`、
-  最大 gap `31.069 ms`。因此本轮抽动不是 action queue 空或客户端发送线程停顿。
-- 第二次推理的 `new action[0] -> old queue tail` 最大臂关节差为 `0.15034 rad`，同时队尾相对当时已发送
-  目标仍相差 `0.07810 rad`；第三次对应差值降为 `0.02512 rad`。这支持“异步观测产生的新 chunk 与旧队尾
-  时间错位”是抽动来源，属于 RTC prefix conditioning/未来 knot merge 需要解决的问题。
-- 本轮有 86 个 arm-clipped tick，记录到 action dimension 8 的一次样本为 `-1.20570 -> -1.20672`，即原始
-  目标略微超出当前反馈 `0.08 rad` 包络；真正 RTC merge 时仍要求 arm clipping 为 0，否则 bridge governor
-  必须冻结并 fallback。
-- episode 动作结束后的人工 hold 阶段记录到两次极短门控变化：`robot_state=(2,3)` 和 `(1,3)`，随后恢复
-  `(3,3)`。它们不在三次活动 chunk 的推理/追加时间点，但 RTC shadow 日志仍需确认没有活动轨迹门控丢失。
-- 结论：允许进入 RTC shadow，因为 shadow 丢弃 RTC 输出，不执行 replacement merge；shadow 通过前不允许
-  进入真实 RTC merge。
+`logs/prefetch_scale3_20260811_103829`：3.0x、5 秒、3 次推理、无 underrun；第二次推理的
+`new action[0] -> old queue tail` 最大臂关节差 `0.15034 rad`（队尾相对已发送目标还差 `0.07810 rad`），
+支持“异步观测产生的新 chunk 与旧队尾时间错位”是抽动来源。86 个 arm-clipped tick。结论：允许进入
+RTC shadow（shadow 丢弃 RTC 输出），shadow 通过前不允许真实 merge。
 
 ### 2026-08-11 settled RTC 五 chunk 卡顿调查
 
-- `logs/rtc_five_chunk_20260811_115028` 完成初始 chunk 加 4 次 replacement，共 5 次推理；操作员确认没有
-  前后抽动，但存在明显周期卡顿。
-- 4 次 merge 的 `d_pred` 均为 2，`d_actual` 为 `2,1,1,1`；无 arm clipping、hard freeze、stale、拒绝或
-  fallback。边界速度跳变为 `0.01913,0.01070,0.00495,0.02011 rad/knot`，未产生可感知回弹。
-- 首次 A3 到 `rtc_resumed` 冻结约 `1.291 s`；随后三次约 `0.368,0.471,0.432 s`。其中每个 checkpoint
-  固定要求约 `0.20 s` settle，首次还需等待跟踪误差从 `0.03286 rad` 降到容差内。
-- bridge 平均 `99.53 Hz`、最大 gap `25.028 ms`，不足以解释上述 0.37-1.29 秒停顿。根因是 settled
-  checkpoint 状态机，不是网络、policy 延迟或 action chunk 错位。
-- 已新增显式 `--rtc-continuous` 模式；本地 fake bridge 验证 checkpoint 不暂停、拿图期间 elapsed knot
-  计入 `d_actual`，以及后续整数边界 replacement 仍不暂停。下一真机阶段必须从 continuous shadow 开始。
+`logs/rtc_five_chunk_20260811_115028`：初始 chunk + 4 次 replacement；`d_pred=2`，`d_actual=2,1,1,1`；
+无 clipping/freeze/stale/fallback；边界速度跳变 `0.00495-0.02011 rad/knot`，无可感知回弹。但每次
+checkpoint 明显停顿：首次 `1.291 s`、后续 `0.368/0.471/0.432 s`；bridge `99.53 Hz` 不能解释——根因是
+settled checkpoint 状态机的固定等待（每次约 `0.20 s` settle + 首次等待跟踪误差收敛）。已新增
+`--rtc-continuous` 模式。
 
 ### 2026-08-11 continuous RTC shadow
 
-- `logs/rtc_continuous_shadow_20260811_135240`：`--rtc-continuous --rtc-shadow`，100 Hz、15 Hz、2.0x；
-  checkpoint 事件为 `continuous_checkpoint=True`、`settle_s=None`、`frozen=None`，tracking error 为
-  `0.02375 rad`，phase 在事件后继续运行到 `3.36`。
-- `rtc_resumed` 在 `75.9 ms` 后到达，初始 `d_actual=0`；随后到 `d_pred=d_actual=2` 的 deadline 才暂停。
-  该 deadline pause 和后续 synchronized fallback 是 shadow 丢弃 RTC 输出的预期行为，不是 continuous
-  checkpoint 停顿。
-- 本轮没有 clipping、stale、hard freeze 或 command rejection；bridge 平均 `98.94 Hz`、最大 gap `27.540 ms`。
-- continuous shadow 通过，允许下一轮单次实际 continuous RTC merge；仍需操作员重新确认真机安全环境。
+通过（`logs/rtc_continuous_shadow_20260811_135240`）。checkpoint 事件
+`continuous_checkpoint=True`、`settle_s=None`、`frozen=None`，phase 事件后继续；`rtc_resumed` 初始
+`d_actual=0`；无 clipping/stale/freeze。末尾的 deadline pause 和 synchronized fallback 是 shadow
+丢弃输出的预期行为。允许下一轮单次实际 continuous RTC merge。
 
-### 2026-08-11 execution horizon 6 远程验证
+### 2026-08-11 execution horizon 6 远程验证（历史，H10/s6 阶段）
 
-- 当前协议改为 `H=10`、`s=6`、旧轨迹 prefix `(4,16)`、`d_pred<=4`；模型 checkpoint 和权重未修改。
-- 本地部署端 53 项测试全部通过；本地和远程 OpenPI 定向 CPU 套件均为 `21 passed, 2 deselected`，远程
-  Ruff 通过。
-- GPU 5 直接 checkpoint 测试首次缓存/JIT 为 `3954.34 ms`；稳定 `d_pred=1..4` 为
-  `109.30-116.16 ms`，输出均为有限 `(10,16)`，无形状相关重编译。
-- WebSocket metadata 正确公布 execution horizon 6；旧 `s=4/(6,16)` 请求被结构化拒绝，随后同一连接的
-  有效请求成功。第一组 20 次 wall latency 出现 `p95=808.58 ms/max=1230.51 ms` 的链路尖峰，不通过
-  delay 门槛；立即重复的稳定序列为 `225.34-413.38 ms`，server 为 `105.34-125.27 ms`，带 50 ms guard
-  的预测上限为 4。真机必须重新从 continuous shadow 开始，不得直接执行 replacement。
+协议改为 `H=10`、`s=6`、`d_pred<=4`，模型权重未修改。稳定 `d_pred=1..4` 推理 `109-116 ms`。第一组
+20 次 wall latency 出现 `p95=808.6 ms/max=1230.5 ms` 链路尖峰，不通过 delay 门槛；立即重复的稳定序列
+为 `225.3-413.4 ms`，带 50 ms guard 的预测上限为 4。教训：链路尖峰按 link fault 处理，不得扩大
+deadline 覆盖。
 
 ### 2026-08-14 governor 与 5 Hz 配置变更
 
-- protocol 提升到 v6；控制器 bridge 和客户端必须同时更新并重启；
-- `tracking/rtc` 固定为 15 Hz 模型节点、3.0x 时间尺度，即名义 `5 Hz` knot rate；旧 2.0x/7.5 Hz 配置被拒绝；
-- governor 使用 `run=0.02`、`resume=0.12`、`stop=0.16 rad`。正常运行时在 `0.02..0.16 rad` 线性降速，
-  error hard stop 锁存后降到 `0.12 rad` 才恢复；
-- trajectory arm clipping 和 bridge 目标校验包络统一为 `0.16 rad`；
-- 本条只记录代码和离线测试配置，不能视为新参数已通过真机验证。真机必须从单 chunk tracking 开始，确认
-  clipping、phase rate、timer gap 和最大 tracking error 后，再进入 continuous RTC shadow。
+- protocol 提升到 v6；`tracking/rtc` 固定 15 Hz 节点、3.0x 时间尺度（名义 5 Hz knot rate），旧
+  2.0x/7.5 Hz 配置被拒绝；
+- governor 使用 `run=0.02`、`resume=0.12`、`stop=0.16 rad`；trajectory arm clipping 和 bridge 目标
+  校验包络统一为 `0.16 rad`。
 
 ### 2026-08-14 d_pred 与迟到结果治理
 
-已完成的非真机验证：
-
-- protocol v7 在 `ResumeTrajectoryCommand` 中携带 `discard|wait`，默认 `discard`；bridge 在实际
-  `d_actual == d_pred` 时使迟到 epoch 无效，消除客户端事件接收竞态；
-- estimator 使用 epoch 内可行样本的保守 p95 和 `50 ms` guard。`1.56 s` 类 horizon fault 及任何错过物理
-  deadline 的样本会被记录但不进入稳定分布；fallback 清空旧 epoch；
-- 保持 `d_max=4`、H=10、s=6 和 bridge 物理 knot crossing 的 `d_actual`，没有改成 wall-time 估算；
-- 本地单元/fake bridge 套件为 `77 passed`；远端 CPU 套件为 `23 passed, 2 deselected`。两个仓库的 Ruff
-  检查均通过。
-
-以下是 2026-08-14 H10/protocol v7 阶段的历史待办；其中“不得把 `d_max` 提高到4以上”只适用于当时
-4-knot old tail，现已由 protocol v9/H20 基线和第9节的分级方案取代：
-
-1. 同时部署 protocol v7 controller bridge 和客户端，先做 motion-disabled dry-run，确认旧协议端被拒绝；
-2. 从已提交的远端代码重启 policy service，执行两次 discarded warmup 和至少 20 次 persistent-connection
-   RTC 请求；确认日志非空记录 request serialization、transport/network estimate、server queue、denoise 和 decode；
-3. 在 GPU 上复核 `d_pred=1..4` 不发生 shape-dependent JIT，记录稳定 p50/p95/max；稳定 p95 若消耗 3-4 个
-   5 Hz knot，停止真机 RTC 并评估更长 action horizon、降低链路延迟或本地推理，不得把 `d_max` 提高到 4 以上；
-4. continuous shadow 使用默认 `--rtc-late-result-policy discard` 注入/等待一次超过 deadline 的结果，确认
-   bridge 发出匹配 request ID 的 `rtc_invalid`、没有 `rtc_merged`，随后固定 hold、重新观测并进入 synchronized；
-5. 单独使用 `--rtc-late-result-policy wait` 做对照，不与正常验收混用；比较 deadline 停顿、最大位置/速度/
-   加速度边界跳变和任务恢复率。历史 `1.56 s` wait 样本曾冻结约 `1.02 s`，速度跳变为
-   `0.10757 rad/knot`，这是必须优于的失败基线；
-6. 验证 fallback 后 estimator 日志进入新 epoch，旧 outlier 不改变新 epoch 的 `d_pred`；确认所有 merge 的
-   `d_actual` 来自 bridge 实际 knot crossing，且满足 `d_actual <= d_pred <= 4`；
-7. 完成默认 discard 的单次 merge、连续多次 merge 和任务恢复率验收前，不提高 episode 长度。
+- protocol v7：`ResumeTrajectoryCommand` 携带 `discard|wait`，默认 `discard`；bridge 在实际
+  `d_actual == d_pred` 时使迟到 epoch 无效；
+- estimator 使用 epoch 内可行样本的保守 p95 + `50 ms` guard；`1.56 s` 类 horizon fault 及错过物理
+  deadline 的样本不进入稳定分布；fallback 清空旧 epoch；
+- 失败基线：历史 `1.56 s` wait 样本曾冻结约 `1.02 s`、速度跳变 `0.10757 rad/knot`——后续方案必须
+  优于该基线；
+- 当时的“不得把 `d_max` 提高到 4 以上”只适用于 4-knot old tail，已由 H20 基线和第 9 节分级方案取代。
 
 ### 2026-08-18 H20 远程推理非真机验证
 
-- 范围：只连接 `192.168.50.73:8000` policy service，没有连接机器人控制器、启动 bridge、切换 Apex 模式
-  或发送任何真机 action。服务端仓库 commit `542b191`，除 `logs/` 未跟踪目录外工作树无代码修改；本地
-  OpenPI checkout commit `a29834b`，deploy commit `ad0ef1f`。
-- 网络：本机存在本地代理变量，但 `NO_PROXY/no_proxy` 已包含 `192.168.0.0/16`；路由为
-  `192.168.50.73 via 192.168.30.1 dev wlp0s20f3`，TCP 8000 直连成功。
-- 只读 SSH 核验：端口 8000 的 Python PID 为 `881261`，启动于 2026-08-18 10:50:45，进程占用物理 GPU 1
-  `NVIDIA GeForce RTX 5090`，checkpoint 为
-  `pi05_marvinpro_red_cones_h20/marvinpro_red_cones_h20_80k_gpu1/79999`。
-- metadata 与本地 H20 基线一致：`rtc_v1`、H=20、s=10、native/model action dim 16/32、`d_max=4`、
-  `prefix_attention_schedule=exp`。`scripts/marvinpro_rtc_smoke.py` 通过，普通和 RTC 推理均返回有限
-  `(20,16)`，错误 prefix 被结构化拒绝后连接仍可继续使用。
-- 同一持久连接执行 2 次 discarded warmup，wall 分别为 `479.135/379.078 ms`；随后执行 20 次有效 RTC
-  请求，`d_pred=1..4` 各 5 次，所有 response ID、shape 和 finite 检查通过。
-- 20 次 wall latency 为 min/p50/p95/max `332.560/375.670/447.539/568.937 ms`；transport 为
-  `331.295/374.044/446.009/567.944 ms`；network residual estimate 为
-  `133.647/163.474/231.425/351.140 ms`。
-- server infer 为 min/p50/p95/max `184.825/210.021/221.055/222.916 ms`，server queue 为
-  `0.141/0.395/3.744/3.778 ms`，RTC denoise 为 `151.089/153.610/159.201/159.445 ms`。本轮已预热的
-  persistent service 在切换 `d_pred=1..4` 时没有 compile 量级尖峰；这不替代冷启动 direct-checkpoint JIT
-  测试。
-- 5 Hz 下按 `ceil((p95_wall+0.05 s)*5)` 得到保守 `d_pred=3`；单次 max 加 guard 对应 4，仍在当前
-  `d_max=4` 内。本轮没有出现超出 horizon 的 link fault，但 20 次样本只作为短时链路证据，不代表长任务
-  不会出现延迟尖峰。
-- 错误 prefix shape、`d_pred=5`、`s=9` 和 `schedule=linear` 均返回
-  `ok=false/error_code=invalid_rtc_request`；四次拒绝后同连接有效 `d_pred=2` 请求以 `340.528 ms` 成功。
-  这同时确认最新决策仍是保留原始指数 soft mask，不实施线性 schedule。
-- 本地 deploy 全套为 `80 passed`；本地 OpenPI 定向 CPU 套件为 `25 passed, 2 deselected`，仅有既有
-  JAX/Flax deprecation warning；两仓库相关 Ruff 检查均通过。
-- 尚未覆盖：protocol v9 controller dry-run、真实 observation replay、H20 单 chunk tracking、synchronized
-  回归、continuous shadow、C2 blend 真机可行性、RTC merge，以及 synchronized fallback 稳定一次后重新建立
-  RTC epoch。进入任何 motion-enabled 测试前仍须从第 2～5 节按顺序执行。
+只连接 policy service，未碰机器人。metadata 与本地 H20 基线一致（`rtc_v1`、H=20、s=10、`d_max=4`、
+`schedule=exp`）。同一持久连接 2 次 discarded warmup + 20 次有效 RTC 请求（`d_pred=1..4` 各 5 次）：
+wall min/p50/p95/max `332.6/375.7/447.5/568.9 ms`；server infer p95 `221.1 ms`；server queue 最大
+`3.8 ms`；切换 `d_pred` 无 compile 量级尖峰。5 Hz 下保守 `d_pred=3`，仍在 `d_max=4` 内。错误 prefix
+shape、`d_pred=5`、`s=9`、`schedule=linear` 均返回 `invalid_rtc_request`，拒绝后同连接可继续。
+本轮 20 次样本只作短时链路证据，不代表长任务无延迟尖峰。
 
 ### 2026-08-19 protocol v10/H20 三组真机测试与长任务问题
 
-- 第一组 protocol v10 motion-disabled dry-run：通过。controller bridge 在 `6.6.7.100:7332` 启动，
-  `motion_allowed=False`、publish rate 约 `99.94 Hz`；真实 topic 映射、H264 图像接收、实测夹爪反馈和
-  protocol v10 连接均正常，没有发送任何运动命令。现场输出记录为 18:26 左右的 bridge dry-run 日志。
-- 第二组 timed synchronized：通过。日志目录为
-  `logs/h20_baseline_20260819_183256`；H20、5 Hz、100 Hz command，完成 3 个 synchronized chunk，
-  每个 chunk 均在 deadline 内到位并稳定，`arm-clipped ticks=0`，无抽动、回弹、撞击或失控。
-  第一次输出因 C2 handoff 的夹爪浮点边界拒绝而重试；第二次重试已正常完成，日志目录为
-  `logs/h20_baseline_retry_20260819_183918`。
-- 第三组短 RTC fallback/recovery/merge：通过。日志目录为
-  `logs/h20_rtc_recovery_20260819_184521`；完成 2 次 RTC merge，`rtc_final_status=clean_completion`，
-  `recoveries=0`，无 clipping、stale、hard freeze、协议错位或可感知冲击。
-- 三组真机验收结论：protocol v10 联通、timed synchronized、continuous RTC merge 和基础 recovery
-  路径均已跑通；夹爪实测反馈使用归一化 `[0,1]` policy 值，未再出现夹爪反馈 topic 缺失问题。
+- 第一组 motion-disabled dry-run：通过。topic 映射、H264 图像、夹爪反馈、v10 连接均正常，未发动作。
+- 第二组 timed synchronized：通过（`logs/h20_baseline_20260819_183256`）。3 个 chunk 均在 deadline
+  内到位并稳定，`arm-clipped ticks=0`，无抽动、回弹、撞击。
+- 第三组短 RTC fallback/recovery/merge：通过（`logs/h20_rtc_recovery_20260819_184521`）。完成 2 次
+  RTC merge，`rtc_final_status=clean_completion`，`recoveries=0`，无 clipping、stale、hard freeze 或
+  可感知冲击。
+- 结论：protocol v10 联通、timed synchronized、continuous RTC merge 和基础 recovery 路径均已跑通。
 
 ### 2026-08-19 长任务暴露的问题与离线修复
 
-- `logs/h20_rtc_task5m_20260819_193006` 的 5 分钟任务没有运行到 5 分钟：约 12 秒时先发生一次
-  `rtc_late (d_pred=2, d_actual=2)`，随后连续 3 次 synchronized recovery 的 C2 handoff 因机械臂 jerk
-  超限被原子拒绝，最大值为 `24.86/31.05/27.49 rad/s^3`，2-knot 候选更高；这不是夹爪范围问题，
-  也没有 arm clipping、stale feedback、hard freeze 或模式异常。
-- 已按模型动作较激进的实际情况，把 bridge 默认
-  `--rtc-blend-max-jerk-rad-s3` 从 `20` 提高到 `40 rad/s^3`；速度 `0.45 rad/s`、加速度
-  `2.0 rad/s^2`、关节包络和其他安全门保持不变，命令行仍可显式覆盖该值。
-- 已修复 recovery 状态机：第三次可恢复 RTC recovery 失败后，不再直接结束并固定 hold；先重新锁存实测姿态、
-  等待稳定并获取新观测，再切换到不再重建 RTC 的 timed synchronized fallback，并开启最多两次 C2 replan。
-  离线回归测试覆盖了“三次失败后第四步进入 fallback”路径。
-- 本轮修复后的非真机验证：deploy pytest `108 passed`，Ruff 通过，Python compileall 和 `git diff --check`
-  通过；没有重新连接真机，也没有重启远程 policy 服务。
-- 明日真机复测顺序：先重新启动已同步当前工作树的 bridge，执行一次短 timed synchronized chunk，再执行
-  短 RTC recovery/merge，最后再跑 5 分钟任务。重点确认日志出现
-  `rtc_recovery_exhausted; switching to timed synchronized fallback` 后仍继续运行，且没有 jerk、clipping、
-  stale、hard freeze、模式异常或可感知冲击。若出现安全异常，立即切回 Input Mode None 并停止 bridge。
+- `logs/h20_rtc_task5m_20260819_193006` 约 12 秒时先发生一次 `rtc_late (d_pred=2, d_actual=2)`，随后
+  连续 3 次 synchronized recovery 的 C2 handoff 因 jerk 超限被原子拒绝（最大 `24.86/31.05/27.49
+  rad/s^3`，2-knot 更高）。bridge 默认 `--rtc-blend-max-jerk-rad-s3` 从 `20` 提高到 `40 rad/s^3`，
+  速度 `0.45 rad/s`、加速度 `2.0 rad/s^2` 和其他安全门不变。
+- 已修复 recovery 状态机：第三次可恢复 recovery 失败后不再直接固定 hold 结束，而是重新锁存实测姿态、
+  稳定取新观测后切换到不再重建 RTC 的 timed synchronized fallback（最多两次 C2 replan）。
+- 复测顺序：短 synchronized -> 短 RTC recovery/merge -> 5 分钟任务；重点确认
+  `rtc_recovery_exhausted; switching to timed synchronized fallback` 后仍继续运行。
 
 ### 2026-08-28 新任务 RTC 真机首跑（`logs/rtc_20260828_114357`）
 
@@ -1107,11 +897,10 @@ fallback 原因和操作员结论。
   "Stack the three red cones from right to left inside the white square to form a stable stack."，
   服务器 10:23 重启后首次接受请求。参数：continuous RTC、`discard`、`--max-rtc-merges 1`、
   `--policy-request-timeout 5`、20s episode、确认键 `E`。
-- 前两次尝试（`rtc_20260828_113116` / `rtc_20260828_113833`）均在 warmup 阶段 abort：
-  第一次普通推理超时（2s 门限），第二次普通 warmup 147ms 通过但第一次 RTC 请求超时（5s 门限）。
-  定位为 **JAX 按代码路径分别 JIT 编译**：服务器重启后普通推理路径和 RTC(prefix attention) 路径
-  各自需要一次性编译，client 侧 request timeout 等不及。用 `/tmp/policy_warmup.py`（双路径 dummy
-  请求）预热后两条路径均 ~110-170ms。**教训：服务器每次重启后先跑预热脚本再上真机。**
+- 前两次尝试均在 warmup 阶段 abort：定位为 **JAX 按代码路径分别 JIT 编译**——服务器重启后普通推理
+  路径和 RTC(prefix attention) 路径各自需要一次性编译，client 侧 request timeout 等不及。用
+  `/tmp/policy_warmup.py`（双路径 dummy 请求）预热后两条路径均 ~110-170ms。
+  **教训：服务器每次重启后先跑预热脚本再上真机。**
 - 正式跑结果：`rtc_final_status=clean_completion merges=1 recoveries=0`。
   初始推理 128ms（server infer 74ms）；连续 checkpoint 于 knot 10 到达，RTC 请求 d_pred=1、
   d_actual=1、wall 137ms；merge 边界速度跳变 0.019 rad、加速度跳变 0.021 rad/s2、
