@@ -1,5 +1,13 @@
 # MarvinPro Tracking-Aware RTC Robot Test Checklist
 
+> **2026-08-28 注**：本文现汇总全部 RTC/轨迹测试材料——原验收清单、调度与轨迹诊断工具、
+> RTC 决策与实现记录（吸收自 `RTC_TODO_20260818.md`）、异步 action chunk 错位分析（吸收自
+> `ASYNC_ACTION_CHUNKING.md`），以及带日期的真机测试记录。命令块中的 checkout 路径已更新，但
+> checkpoint、prompt 等参数保留当时记录，不再逐条刷新。当前推荐的真机执行命令（新 checkpoint
+> `pi05_marvinpro_red_cones_slow`、新任务 prompt、全新 `RUN_DIR` 日志约定和 dry-run -> synchronized
+> -> RTC shadow -> `--max-rtc-merges 1` 的执行顺序）以 [`_HANDOFF.md`](_HANDOFF.md) 为准；其中
+> 测试3 的 RTC 配置仍是当前推荐的 RTC 验收参数。
+
 本清单记录当前因真机未连接而不能执行的测试。不要让自动化脚本切换 Apex Input Mode、Robot Ready、
 Impedance Mode、Home 或清故障；这些步骤必须由现场人员确认。远程推理端还必须先通过
 `/home/jh/OpenPI_UR/openpi/REMOTE_RTC_TESTS.md`。
@@ -12,7 +20,8 @@ Impedance Mode、Home 或清故障；这些步骤必须由现场人员确认。�
 - H20/s10 下 A9 feedback 仍在 A8 时不产生 checkpoint，stale feedback 不能累计 `0.20 s` settle；
 - fake bridge 完整执行 `Load -> A9 checkpoint -> Resume -> Stage -> integer-boundary merge`；
 - merge 使用真实 `d_actual`，并将当前旧 reference 放到 `C[k-1]` 作为 anchor；
-- merge 保留硬位置锚点，并以 2～3 knot C2 blend 衔接速度和加速度；不安全的 blend 原子拒绝；
+- merge 保留硬位置锚点，并以 quintic C2 blend 衔接速度和加速度（blend 窗口按秒恒定：5 Hz 下
+  2～3 knot，15 Hz 下最长 9 knot）；不安全的 blend 原子拒绝；
 - timed H20 chunk 在 5 秒 controller deadline 内 clean 完成；健康超时原子锁存实测臂位置且保留夹爪命令；
 - RTC 失败使用结构化 reason code；可恢复故障经过一个 clean synchronized chunk 后重建 epoch，安全故障只 hold。
 - fake bridge 已跑通 `RTC C2 reject -> measured hold -> sync clean -> bootstrap -> RTC merge`，并拒绝旧
@@ -78,7 +87,7 @@ nc -vz -w 3 192.168.50.73 8000
 ## 2. 控制器只读 doctor
 
 ```bash
-cd /home/jh/TianJi_data_collector/MarvinPro_deploy
+cd /home/jh/TianJi_Marvinpro/MarvinPro_deploy
 ./scripts/run_bridge_on_controller.sh --doctor --duration 8
 ```
 
@@ -98,7 +107,7 @@ robot state 和 arm state 均必须有消息。doctor 不通过时停止，不�
 
 ```bash
 cd /home/jh/OpenPI_UR/openpi
-PYTHONPATH=/home/jh/TianJi_data_collector/MarvinPro_deploy/src \
+PYTHONPATH=/home/jh/TianJi_Marvinpro/MarvinPro_deploy/src \
 uv run python -m marvinpro_deploy.rollout_client \
   --robot-host 6.6.7.100 \
   --policy-host 192.168.50.73 \
@@ -113,7 +122,7 @@ uv run python -m marvinpro_deploy.rollout_client \
 为每轮运动测试建立独立目录，并在两个本机终端中设置为同一个绝对路径：
 
 ```bash
-export RUN_DIR=/home/jh/TianJi_data_collector/MarvinPro_deploy/logs/tracking_$(date +%Y%m%d_%H%M%S)
+export RUN_DIR=/home/jh/TianJi_Marvinpro/MarvinPro_deploy/logs/tracking_$(date +%Y%m%d_%H%M%S)
 mkdir -p "$RUN_DIR"
 printf '%s\n' "$RUN_DIR" | tee /tmp/marvinpro_tracking_run_dir
 ```
@@ -131,7 +140,7 @@ reference、settle 时长、state/image skew、clipping、freeze 和 delay。hol
 并用 `record_type=bridge_state` 或 `client_command` 区分来源。绘图命令为：
 
 ```bash
-PYTHONPATH=/home/jh/TianJi_data_collector/MarvinPro_deploy/src \
+PYTHONPATH=/home/jh/TianJi_Marvinpro/MarvinPro_deploy/src \
 /home/jh/OpenPI_UR/openpi/.venv/bin/python \
 scripts/plot_rollout_joints.py \
   "$RUN_DIR/rollout.telemetry.csv" \
@@ -141,7 +150,7 @@ scripts/plot_rollout_joints.py \
 清空工作区、急停可触及，Apex Input Mode 初始保持 None。重新启动 motion-enabled 100 Hz bridge：
 
 ```bash
-cd /home/jh/TianJi_data_collector/MarvinPro_deploy
+cd /home/jh/TianJi_Marvinpro/MarvinPro_deploy
 ./scripts/run_bridge_on_controller.sh \
   --local-log "$RUN_DIR/bridge.log" \
   --allow-motion \
@@ -153,7 +162,7 @@ cd /home/jh/TianJi_data_collector/MarvinPro_deploy
 ```bash
 cd /home/jh/OpenPI_UR/openpi
 export RUN_DIR="$(cat /tmp/marvinpro_tracking_run_dir)"
-PYTHONPATH=/home/jh/TianJi_data_collector/MarvinPro_deploy/src \
+PYTHONPATH=/home/jh/TianJi_Marvinpro/MarvinPro_deploy/src \
 uv run python -m marvinpro_deploy.rollout_client \
   --robot-host 6.6.7.100 \
   --policy-host 192.168.50.73 \
@@ -181,13 +190,13 @@ uv run python -m marvinpro_deploy.rollout_client \
 
 ## 5. synchronized 回归
 
-使用 README 中的 timed synchronized 参数运行至少两个 chunk。protocol v10 更新后，边界误差、跟踪时间、
+使用 [`_HANDOFF.md`](_HANDOFF.md) 快速开始中的 timed synchronized 参数运行至少两个 chunk。protocol v10 更新后，边界误差、跟踪时间、
 clipping 和固定 hold 行为不得劣于旧基线。回归失败时不进入 RTC shadow。
 
 Terminal A 在 Apex Input Mode 为 None 时启动 bridge，并记录本轮目录：
 
 ```bash
-cd /home/jh/TianJi_data_collector/MarvinPro_deploy
+cd /home/jh/TianJi_Marvinpro/MarvinPro_deploy
 export RUN_DIR="$PWD/logs/synchronized_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$RUN_DIR"
 printf '%s\n' "$RUN_DIR" | tee /tmp/marvinpro_synchronized_run_dir
@@ -203,7 +212,7 @@ Terminal B 运行10秒同步调度：
 ```bash
 cd /home/jh/OpenPI_UR/openpi
 export RUN_DIR="$(cat /tmp/marvinpro_synchronized_run_dir)"
-PYTHONPATH=/home/jh/TianJi_data_collector/MarvinPro_deploy/src \
+PYTHONPATH=/home/jh/TianJi_Marvinpro/MarvinPro_deploy/src \
 uv run python -m marvinpro_deploy.rollout_client \
   --robot-host 6.6.7.100 \
   --policy-host 192.168.50.73 \
@@ -229,7 +238,7 @@ uv run python -m marvinpro_deploy.rollout_client \
 
 ```bash
 export RUN_DIR="$(cat /tmp/marvinpro_tracking_run_dir)"
-PYTHONPATH=/home/jh/TianJi_data_collector/MarvinPro_deploy/src \
+PYTHONPATH=/home/jh/TianJi_Marvinpro/MarvinPro_deploy/src \
 uv run python -m marvinpro_deploy.rollout_client \
   --robot-host 6.6.7.100 \
   --policy-host 192.168.50.73 \
@@ -297,7 +306,7 @@ settled RTC 通过后，才允许用 `--rtc-continuous` 验证无停车观测。
 先完成只读 doctor、远程 H20 smoke 和 motion-disabled protocol v10 dry-run。这三步不会发送机器人动作：
 
 ```bash
-cd /home/jh/TianJi_data_collector/MarvinPro_deploy
+cd /home/jh/TianJi_Marvinpro/MarvinPro_deploy
 ./scripts/run_bridge_on_controller.sh --doctor --duration 8
 
 cd /home/jh/OpenPI_UR/openpi
@@ -309,7 +318,7 @@ uv run python scripts/marvinpro_rtc_smoke.py \
 doctor 和 smoke 通过后，Terminal A 启动不允许运动的 bridge：
 
 ```bash
-cd /home/jh/TianJi_data_collector/MarvinPro_deploy
+cd /home/jh/TianJi_Marvinpro/MarvinPro_deploy
 ./scripts/run_bridge_on_controller.sh --publish-hz 100
 ```
 
@@ -317,7 +326,7 @@ Terminal B 运行 dry-run；确认 protocol v10、H20 policy 输出、相机、j
 
 ```bash
 cd /home/jh/OpenPI_UR/openpi
-PYTHONPATH=/home/jh/TianJi_data_collector/MarvinPro_deploy/src \
+PYTHONPATH=/home/jh/TianJi_Marvinpro/MarvinPro_deploy/src \
 uv run python -m marvinpro_deploy.rollout_client \
   --robot-host 6.6.7.100 --policy-host 192.168.50.73 \
   --episode-seconds 10 --log-level DEBUG
@@ -330,7 +339,7 @@ uv run python -m marvinpro_deploy.rollout_client \
 建立本组日志并重新启动 motion-enabled bridge：
 
 ```bash
-cd /home/jh/TianJi_data_collector/MarvinPro_deploy
+cd /home/jh/TianJi_Marvinpro/MarvinPro_deploy
 export RUN_DIR="$PWD/logs/h20_baseline_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$RUN_DIR"
 printf '%s\n' "$RUN_DIR" | tee /tmp/marvinpro_h20_baseline_run_dir
@@ -343,7 +352,7 @@ Terminal B 执行两个完整 timed H20 synchronized chunk，并按上述顺序�
 ```bash
 cd /home/jh/OpenPI_UR/openpi
 export RUN_DIR="$(cat /tmp/marvinpro_h20_baseline_run_dir)"
-PYTHONPATH=/home/jh/TianJi_data_collector/MarvinPro_deploy/src \
+PYTHONPATH=/home/jh/TianJi_Marvinpro/MarvinPro_deploy/src \
 uv run python -m marvinpro_deploy.rollout_client \
   --robot-host 6.6.7.100 --policy-host 192.168.50.73 --execute \
   --episode-seconds 10 --rollout-schedule synchronized \
@@ -365,7 +374,7 @@ uv run python -m marvinpro_deploy.rollout_client \
 
 ```bash
 # Terminal A
-cd /home/jh/TianJi_data_collector/MarvinPro_deploy
+cd /home/jh/TianJi_Marvinpro/MarvinPro_deploy
 export RUN_DIR="$PWD/logs/h20_rtc_recovery_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$RUN_DIR"
 printf '%s\n' "$RUN_DIR" | tee /tmp/marvinpro_h20_recovery_run_dir
@@ -375,7 +384,7 @@ printf '%s\n' "$RUN_DIR" | tee /tmp/marvinpro_h20_recovery_run_dir
 # Terminal B
 cd /home/jh/OpenPI_UR/openpi
 export RUN_DIR="$(cat /tmp/marvinpro_h20_recovery_run_dir)"
-PYTHONPATH=/home/jh/TianJi_data_collector/MarvinPro_deploy/src \
+PYTHONPATH=/home/jh/TianJi_Marvinpro/MarvinPro_deploy/src \
 uv run python -m marvinpro_deploy.rollout_client \
   --robot-host 6.6.7.100 --policy-host 192.168.50.73 --execute \
   --episode-seconds 20 --rollout-schedule rtc \
@@ -482,6 +491,388 @@ jerk。任何 `unsafe RTC blend` 拒绝都视为该频率/轨迹不通过，不�
 
 每轮除通用测试记录外，还必须记录：名义/实际 knot rate、playback time scale、`d_max`、prefix 剩余 soft
 overlap、phase-rate 分布、delay budget 利用率、late/discard 比例，以及 blend 最大速度/加速度/jerk。
+
+## 调度与轨迹诊断工具
+
+本节吸收原 README 的诊断章节，命令保留 2026-08-07 现场形态。这些客户端用于隔离单一变量；除特别
+说明外，不应带 `--execute` 重复已失败的组合。version 2 冻结计划固化在
+`artifacts/marvinpro_red_cones_chunk_ab_v2.json`。
+
+### 持续 rollout 的慢速插值诊断（失败实验，禁止真机复现）
+
+> **失败实验，禁止继续真机复现。** 2026-08-07 真机结果出现约1.33秒周期的明显回弹和77个手臂
+> 裁剪tick。以下命令仅保留用于复现实验参数，不应再次带 `--execute` 运行。后续测试必须先改为按
+> 实际已发送目标衔接新计划，并缩短open-loop段。
+
+该模式保持模型节点的 15 Hz 时间语义，把时间拉长 2 倍，并在节点之间以 100 Hz 线性插值；每次完整
+消费 policy 输出的全部 10 个节点（从上一段末目标到下一段 `action[0]` 也作为一个节点间隔插值），
+每段持续 `10 / 7.5 = 1.333 s`，队列还剩 `0.30 s` 时开始推理下一段，返回后追加到队尾，不在段中
+覆盖旧计划。实测约 `153-173 ms` 推理延迟下仍有 `13-15` 个 100 Hz 点留在队列中。
+
+bridge（Apex Input Mode 保持 None）：
+
+```bash
+cd /home/jh/TianJi_Marvinpro/MarvinPro_deploy
+./scripts/run_bridge_on_controller.sh --allow-motion --publish-hz 100
+```
+
+已执行过的5秒真机失败参数（仅供记录）：
+
+```bash
+cd /home/jh/OpenPI_UR/openpi
+PYTHONPATH=/home/jh/TianJi_Marvinpro/MarvinPro_deploy/src \
+uv run python -m marvinpro_deploy.rollout_client \
+  --robot-host 6.6.7.100 \
+  --policy-host 192.168.50.73 \
+  --execute \
+  --episode-seconds 5 \
+  --playback-mode interpolated \
+  --control-hz 100 \
+  --model-hz 15 \
+  --playback-time-scale 2 \
+  --execute-steps 10 \
+  --chunk-prefetch-seconds 0.30 \
+  --log-level DEBUG
+```
+
+确认页必须显示 `effective knot rate: 7.50Hz`、`command rate: 100.0Hz` 和
+`selected chunk: 10 knots over 1.333s`；`chunk_append_diag` 中稳态 `underruns_since_last` 应为
+`0`，`queued_before` 应大于 `0`。
+
+### 同步执行、到位、保持、重观测诊断
+
+该模式严格按 `完整发送当前chunk -> 锁存末目标 -> 等待全部14个臂关节到位 -> 稳定保持 -> 等待一帧
+新的图像/关节观测 -> 远程推理 -> 执行下一chunk` 运行，不提前采集下一段观测，也不在当前chunk运动
+期间推理。每个 H20 synchronized chunk 从 controller 的 `trajectory_loaded` 起有 `4 s + 1 s`
+deadline；5 秒内到位并基于真实 source timestamp 稳定 `0.20 s` 才算 clean；健康超时时 bridge 原子
+锁存当前实测臂位置，再从新图像推理；连续两次卡住后结束运动；episode 剩余不足 5 秒时不再启动新
+chunk。默认到位条件是所有臂关节误差不超过 `0.01 rad` 并连续保持 `0.20 s`，夹爪不参与到位判断。
+
+结束等待阶段只锁存一次当前测量姿态，固定目标一直保持到 Input Mode 离开 Custom，避免结束阶段的
+单向漂移（该修复已通过短时真机回归确认）。若出现 `tracking timeout`，不要直接放宽误差阈值或关节
+步长，先记录超时关节、误差和 `arm-clipped ticks`。
+
+真机命令与上文第 5 节“synchronized 回归”相同，此处不再重复。
+
+### 锁存姿态保持诊断
+
+不连接 policy server；客户端只在开始时读取一次当前姿态，之后持续发送完全相同的绝对关节目标，
+用于区分 Custom/bridge 控制链抖动和模型轨迹抖动。bridge 以 `--allow-motion` 启动（先用默认
+15 Hz，停止后可加 `--publish-hz 100` 重复），Apex 完成关节阻抗模式但保持 Input Mode 为 None：
+
+```bash
+cd /home/jh/TianJi_Marvinpro/MarvinPro_deploy
+./scripts/run_bridge_on_controller.sh --allow-motion
+```
+
+```bash
+cd /home/jh/OpenPI_UR/openpi
+PYTHONPATH=/home/jh/TianJi_Marvinpro/MarvinPro_deploy/src \
+uv run python -m marvinpro_deploy.hold_test_client \
+  --robot-host 6.6.7.100 \
+  --duration 10
+```
+
+客户端显示等待后把 Apex 切到 Custom，核对模式和锁存关节值，现场安全后输入 `HOLD`；10 秒结束时
+客户端继续发送同一目标，此时先在 Apex 切回 None。客户端退出时打印各关节峰峰值、标准差和最大
+跟踪误差。异常时优先切回 None 或急停，不要依赖 `Ctrl+C`。
+
+判读：15 Hz 抖动而 100 Hz 明显改善，则 bridge 低频目标发布是主要因素；两次都稳定而 rollout 抖，
+问题在模型动作或重规划衔接；两次恒定目标都抖，继续检查 Custom 控制链和阻抗参数。
+
+### 确定性慢速轨迹诊断
+
+不连接 policy server。bridge 保持 100 Hz，默认只让 `Joint7_L` 在当前姿态附近按最小 jerk 曲线完成
+`0 -> +0.04 -> -0.04 -> 0 rad`，总时长 8 秒；理论峰值速度 `0.0375 rad/s`、峰值加速度小于
+`0.06 rad/s^2`，均低于官方 Home 限制。分别用 `--command-hz 15` 和 `100` 各跑一次：
+
+```bash
+cd /home/jh/OpenPI_UR/openpi
+PYTHONPATH=/home/jh/TianJi_Marvinpro/MarvinPro_deploy/src \
+uv run python -m marvinpro_deploy.trajectory_test_client \
+  --robot-host 6.6.7.100 \
+  --command-hz 15
+```
+
+客户端等待时将 Apex 切到 Custom，核对后输入 `MOVE`；轨迹返回起点后先切回 None。判读：15 Hz 有
+阶梯顿挫而 100 Hz 平滑，则客户端目标更新离散度是主要因素；两次都平滑但 rollout 抖，则模型动作或
+异步重规划衔接是主要因素；100 Hz 仍抖，继续检查 bridge/ROS 动态指令路径和阻抗响应。不要使用
+`--yes` 跳过首次真机确认。
+
+### 单个冻结 Policy Chunk 诊断
+
+连接真实 policy，但只保存一次 10 步输出，执行期间不再推理、不替换 chunk，并保持夹爪目标不变。
+JSON 同时保存原始 policy 节点和限制在推理姿态 `±0.03 rad` 的实际回放节点。先按 15 Hz 直接发送
+有界回放节点（自动用最小 jerk 返回推理姿态），再加载同一 JSON 以相同 15 Hz 时间轴做 100 Hz 线性
+插值回放；两次模型目标和总时长相同，唯一变量是目标更新方式。
+
+bridge 保持 100 Hz，Apex Input Mode 先 None：
+
+```bash
+cd /home/jh/OpenPI_UR/openpi
+PYTHONPATH=/home/jh/TianJi_Marvinpro/MarvinPro_deploy/src \
+uv run python -m marvinpro_deploy.frozen_chunk_test_client \
+  --robot-host 6.6.7.100 \
+  --policy-host 192.168.50.73 \
+  --capture-plan /tmp/marvinpro_red_cones_chunk_ab_v2.json \
+  --playback-mode discrete
+```
+
+切到 Custom 核对后输入 `DISCRETE`；15 Hz 回放后自动返回推理姿态，切回 None。若计划超过诊断安全
+上限 `0.45 rad/s` 或 `2.0 rad/s^2`，程序只保存 JSON 并拒绝运动。回到 None 后从同一姿态加载相同
+计划做插值回放（输入 `INTERPOLATE`）：
+
+```bash
+PYTHONPATH=/home/jh/TianJi_Marvinpro/MarvinPro_deploy/src \
+uv run python -m marvinpro_deploy.frozen_chunk_test_client \
+  --robot-host 6.6.7.100 \
+  --load-plan /tmp/marvinpro_red_cones_chunk_ab_v2.json \
+  --playback-mode interpolated
+```
+
+判读：15 Hz 离散抖、100 Hz 插值平滑，则低频阶梯目标是主要因素；两次都抖，则模型 chunk 节点变化
+或简单线性插值不合适；两次都平滑而持续 rollout 抖，则异步重规划延迟和 chunk 边界替换是主要因素。
+
+需要隔离 `±0.03 rad` 诊断包络时，可加载同一 version 2 JSON 并加 `--target-source raw`（客户端先
+验证原始节点的硬限位、bridge 步长包络、离散速度和加速度，任一超限不进入执行）；原始节点同样先做
+15 Hz 离散、自动回锚切回 None 后再做 100 Hz 插值。保持 raw 节点和 100 Hz 插值不变、只把播放时长
+拉长 2 倍可加 `--playback-time-scale 2.0`（总时长从 `0.667 s` 到 `1.333 s`，最大速度减半、加速度
+降为四分之一；参数不允许小于 `1.0`）：
+
+```bash
+PYTHONPATH=/home/jh/TianJi_Marvinpro/MarvinPro_deploy/src \
+uv run python -m marvinpro_deploy.frozen_chunk_test_client \
+  --robot-host 6.6.7.100 \
+  --load-plan /tmp/marvinpro_red_cones_chunk_ab_v2.json \
+  --target-source raw \
+  --playback-mode interpolated \
+  --playback-time-scale 2.0
+```
+
+## RTC 决策与实现记录（2026-08-18/19）
+
+本节吸收自原 `RTC_TODO_20260818.md`。2026-08-19 的三组真机验收结果和长任务修复见下方“测试记录”，
+此处不再重复。
+
+### protocol v10 实现状态（2026-08-19）
+
+- [x] H20 synchronized/tracking/fallback 统一为 bridge-owned timed chunk：名义 4 秒，默认 1 秒 grace。
+- [x] 健康 timeout 由 controller 原子锁存最新实测双臂位置，保留最后夹爪命令，稳定后从新图像重推理；
+  连续两次 timeout 后固定 hold 并结束。
+- [x] 新计划优先使用 3-knot quintic C2 handoff，失败再试 2-knot；动力学或安全限制失败时原子拒绝。
+- [x] RTC failure 使用结构化 reason code：late/discard、transport timeout、observation lag 和单次 C2
+  merge infeasible 可恢复；clipping、freeze、stale、heartbeat/timer、状态门、
+  事务/协议/shape/finite/URDF 错误不可恢复。
+- [x] 可恢复故障废弃旧连接/request/epoch，实测 hold，执行至少一个 clean synchronized chunk，再用新
+  H20 普通推理初始化新 DelayEstimator epoch 和 `s=10` RTC bootstrap；每 episode 最多 3 次。
+- [x] 本地 OpenPI WebSocket client 支持 connect/request timeout、`close()` 解阻塞和 metadata 校验
+  重连；MarvinPro 默认连接 5 秒、请求 2 秒。
+- [x] 无真机验证：deploy `100 passed`、OpenPI client `7 passed`、两端 Ruff 通过；远程 H20 smoke、
+  20 次持久 RTC 请求、强制 recv timeout 后 reconnect 均通过。
+- [x] 真机三步验收已于 2026-08-19 完成（见“测试记录”）。
+
+### 指数 soft mask 基线冻结（2026-08-18 已决）
+
+保留 OpenPI `schedule=exp`，不修改 soft-mask 公式、`d_max` 或远程 policy metadata：
+
+```text
+P = H - s
+start = min(d_pred, P)
+base[i] = clip(1 + (start - 1 - i) / (P - start + 1), 0, 1)
+weight[i] = base[i] * (exp(base[i]) - 1) / (e - 1), i < P
+weight[i] = 0,                                         i >= P
+```
+
+理由：soft-mask 非零范围由 `P=H-s` 决定，不由 `d_max` 决定。H20/s10 在常见 `d_pred=2` 时已有 8 个
+soft transition knot；增大 `d_max` 不改变同一 `d_pred` 的权重表，实际使用更大的 `d_pred` 反而减少
+`P-d_pred`，缩短 soft transition。保持 `d_max=4`；不得为了获得更多平滑点提高 `d_max`，也不得设置
+`d_max=H-s=10`。客户端发送 `schedule=exp`、`beta=5.0`；远程 metadata 公布
+`prefix_attention_schedule=exp` 并结构化拒绝不支持的 schedule。
+
+2026-08-18 非真机验证：`scripts/marvinpro_rtc_smoke.py` 通过（普通/RTC 推理均返回有限 `(20,16)`，
+错误 prefix 被拒后连接可继续）；同一持久连接 2 次 discarded warmup + 20 次有效 RTC 请求
+（`d_pred=1..4` 各 5 次）；wall latency p50/p95/max `375.670/447.539/568.937 ms`，5 Hz 加 50 ms
+guard 后 p95 对应 `d_pred=3`；server infer p50/p95/max `210.021/221.055/222.916 ms`，network
+residual estimate p50/p95/max `163.474/231.425/351.140 ms`；错误 prefix、`d_pred=5`、错误 `s` 和
+不支持的 schedule 均返回 `invalid_rtc_request`；deploy `80 passed`、OpenPI 定向 CPU
+`25 passed, 2 deselected`。
+
+### synchronized fallback 稳定一次后重新进入 RTC（已实现）
+
+目标状态机：
+
+```text
+RTC 可恢复异常
+-> invalidate 当前 RTC request/epoch
+-> fixed hold
+-> tracking 到位并连续稳定 0.20 s
+-> 获取 hold 之后的新 state/image
+-> 执行 1 个完整 synchronized H20 chunk
+-> 在 chunk 末端再次 tracking 到位并连续稳定 0.20 s
+-> 获取末端稳定之后的新 state/image
+-> 建立新的 RTC delay/request/timeline epoch
+-> 从新观测推理并加载新的 RTC 初始 chunk
+-> 回到 continuous RTC
+```
+
+“稳定一次”定义为：完整 synchronized chunk 成功执行到末端 checkpoint，满足 tracking tolerance、
+source timestamp 连续前进、settle 0.20 s、无 clipping/hard freeze/stale/timer overrun，再取得满足
+时间屏障的新观测；不能仅靠等待固定秒数。
+
+可自动恢复的故障：RTC late-result discard / delay budget miss；明确的瞬时 transport timeout 或
+policy server 暂时不可用；可通过重新观测消除的 observation freshness/lag；单次 RTC C2 merge 不可行
+（原 merge 仍原子拒绝且不放宽 jerk，经过 clean chunk 换边界后才重试）。继续锁存、不自动重进 RTC
+的故障：arm clipping、tracking hard freeze、joint stale、timer overrun、heartbeat、Input
+Mode/Robot Ready/arm state 异常；session/plan/timeline/checkpoint/request ID 不匹配；非 finite、
+shape、URDF、安全包络、协议版本或本地 invariant 错误。bootstrap inference/安全 C2 handoff 失败消耗
+一次 recovery attempt；到达 3 次上限后固定 hold。
+
+实现约束（均已实现）：fallback 拆出“只执行一个恢复 chunk”的入口，返回末端 checkpoint、新
+observation 和 timeline version；进入 fallback 时所有旧 RTC worker/result 失效，恢复后只接受新
+request ID、新 timeline version、新 checkpoint ID；`DelayEstimator.reset_epoch()` 后不能在没有稳定
+样本时直接调用 `predicted_steps()`，用恢复后新观测的初始推理/明确 discarded probe 建立新 epoch，
+禁止复用导致本次 fallback 的旧 latency；恢复后的初始 plan 使用 RTC checkpoint horizon `s=10`；
+每 episode 最多自动恢复 3 次，第 4 次只执行 timed synchronized fallback；日志记录 recovery ID、
+原始 failure reason、恢复阶段、旧/新 estimator epoch、stable source time、observation seq、
+plan/timeline/request ID 和最终结果。fake bridge 已覆盖 `RTC -> C2 reject -> measured hold ->
+sync clean -> bootstrap -> merge` 端到端注入，旧 request/timeline 被拒绝。
+
+### 夹爪实测反馈（2026-08-19）
+
+- 控制器 `/tj/info/gripper_feedback_L/R` 左右夹爪五维信息已确认；右侧“打开→夹持→打开”记录中
+  `q` 和 `tau` 均随阶段明显、可逆变化。
+- protocol v10 的 policy state、action state、RTC handoff anchor 和 measured hold 使用 feedback
+  `q`；bridge 不再用最后发布命令覆盖夹爪实测状态；任一侧 feedback 缺失或超过 state stale 阈值关闭
+  运动门；telemetry 恢复原始/归一化位置、速度、力矩、温度、命令和位置误差列。
+- 尚未形成左右夹爪各自完整、同工况的开合端点标定；旧的 `0.0~1.25 -> 0~1` 不能视为已验证映射，
+  保留为任务效果评价中的独立风险。
+
+### 2026-08-19 20-merge 长跑（`logs/h20_rtc_soak20_20260819_142740`）暴露的问题
+
+操作员先后启动两个 episode；第二个中途主动 `Ctrl+C`（bridge 随后 `trajectory_stopped`，不是推理
+服务崩溃）。两次都没有成功 RTC merge，后续动作实际由 synchronized fallback 执行，因此本轮不能
+断言“H20 连续 RTC 比 H10 差”。
+
+- 两个 episode 的首次 RTC 结果均为 `d_pred=2`、`d_actual=2`，hard anchor 偏差很小，但 3-knot C2
+  最大 jerk 分别为 `22.06194` 和 `24.56892 rad/s^3`，超过当时的 `20 rad/s^3` 上限；2-knot 候选更差
+  （`73.90878` / `63.91702 rad/s^3`）。bridge 正确原子拒绝 merge，未把不安全边界发给机器人。根因
+  指向“旧轨迹在 merge 点的速度/加速度与 H20 新轨迹开头不够相容”，不是网络延迟尖峰（两次推理均在
+  正常量级，无 stale、ID mismatch、arm clipping 或延迟越界）。后续 2026-08-19 晚已将 bridge 默认
+  `--rtc-blend-max-jerk-rad-s3` 从 `20` 提高到 `40 rad/s^3`（见“测试记录”长任务条目）；更长的
+  受约束 C2 blend 是否可行仍需离线回放评估，不得再直接放宽上限。
+- 第一段 fallback 的最后一个 H20 chunk 在目标发出后始终未满足 `0.01 rad` 且连续稳定 `0.20 s`
+  （`Joint4_L` 最大误差约 `0.01155 rad`），等待 `4 s` 轨迹加 `5 s` tracking timeout 后报
+  `timed out waiting for trajectory event`；现场机械臂已触达桌面，高度疑似接触约束使目标物理不可达。
+  不要通过取消 timeout 或放宽 tolerance 掩盖该问题。
+- **telemetry 覆盖事故**：两个 episode 复用同一个 `rtc-soak20.log` 和 telemetry 文件，CSV 被第二次
+  运行覆盖，第一段高频 telemetry 丢失。此后每个 episode 必须使用新的 `RUN_DIR`/文件名；该约定现为
+  强制要求，见 [`_HANDOFF.md`](_HANDOFF.md)。
+- 两次 episode 的初始机器人/夹爪状态不同，第二次左夹爪反馈约 `0.708`，预测夹爪值频繁落到投影边界。
+  H10/H20 对比必须固定机械臂初始姿态、物体布局和两侧夹爪状态，并把 gripper clipping 单独统计。
+- `--episode-seconds 60` 是整轮运动的外层安全时限，`--max-rtc-merges 20` 只是“最多允许 20 次成功
+  replacement”（本轮实际成功 merge 为 0）；两者都不应直接取消。完整任务应使用足够但有限的 episode
+  时长，并把“任务时限到达”和“某个目标在 tracking timeout 内不可达”分开报告。
+
+下一轮优先顺序：先离线提取成功 merge 与两次失败 merge 的旧/新边界，按关节对比位置、速度、加速度和
+jerk（保留 hard anchor、C2 和安全上限）；每次使用独立 RUN_DIR，用相同初始姿态/物体/夹爪条件分别跑
+H10 与 H20，成功 RTC merge 和 fallback episode 分开统计；在没有复现至少 2 次连续安全 merge 前不做
+20-merge soak，按单 merge -> 2 merges -> 10 merges 逐级放大，并保证机械臂不会以桌面接触作为停止
+条件。
+
+## 异步 action chunk 错位分析（2026-08-07）
+
+本节吸收自原 `ASYNC_ACTION_CHUNKING.md`，保留设计依据。其中“服务端 RTC”方案已在后续实现并真机
+验收（见上文清单与决策记录）。
+
+### 模型时间语义
+
+训练配置 `pi05_marvinpro_red_cones`：数据集 15 Hz、`action_horizon=10`；每次输入三路图像、16 维
+关节/夹爪状态和 prompt，输出 10 组 16 维绝对关节/夹爪目标。数据加载器为 action 构造的时间偏移是
+`[0/15, 1/15, ..., 9/15]` 秒，即 `policy(O(t)) -> [A(t), A(t+0.0667), ..., A(t+0.6000)]`；
+`action[0]` 是当前数据帧时刻的 action。训练阶段关节 action 以相对当前 state 的 delta 进入模型，
+输出变换还原为绝对关节目标；夹爪维度不做关节 delta 变换。
+
+### 错位机制与 2026-08-07 真机证据
+
+异步 prefetch 中，第二次观测 `O1` 生成的新 chunk B 的 `B0` 基于 `O1` 所见的真实机器人状态，而旧
+计划 A9 已位于更远的未来目标。把 B 追加到 A 的 raw 尾部形成
+`追赶未实现的A9 -> chunk切换 -> 反向拉回O1附近 -> 再向前追赶` 的周期回弹。
+
+失败测试使用 10 节点完整消费、100 Hz 线性插值、2 倍时间尺度和 0.30 秒预取，操作员观察到约 1.33 秒
+周期的明显回弹。决定性重规划样本：
+
+| 指标 | 数值 |
+| --- | ---: |
+| 第二次推理耗时 | `289.2 ms` |
+| 推理返回时旧队列剩余 | `2` 个100 Hz点 |
+| 旧raw尾部到最后实际发送目标 | `0.07926 rad` |
+| 新 `B0` 到旧raw尾部 | `0.16913 rad` |
+| 新 `B0` 到真实反馈 | `0.01041 rad` |
+
+运动阶段 531 个发布 tick 中有 77 个手臂裁剪 tick，主要涉及 `Joint1_R` 和 `Joint4_R`；第三次推理
+`386.6 ms` 超过 0.30 秒预取窗口，造成 8 个 measured-pose hold tick。教训：机器人没有实现旧 raw
+轨迹尾部，不能把它当作下一 chunk 的真实起点；异步推理消除了大部分等待，但没有自动解决新旧 chunk
+的时间和状态一致性；简单线性插值不能把 `B0` 变成语义正确的 `A10`；安全裁剪不能充当轨迹规划器；
+增大预取窗口只会让生成 B 所用的观测更陈旧。
+
+### 可选方案调研
+
+1. **同步 chunk 执行**：执行完 chunk、等待跟踪稳定、保持、采集新观测、推理、从保持姿态执行下一
+   chunk。因果最清楚、不需要改模型或服务器，作为安全基线；代价是每个 chunk 之间停顿约 150 至
+   400 ms 另加稳定时间，训练示范中没有周期性停顿。Physical Intelligence 说明 RTC 发布前的
+   π0、π0-FAST 和 π0.5 就是这种同步方案。
+2. **Receding horizon / 短前缀执行**：只执行 10 个预测节点中的前 3 至 5 个，丢弃尾部并用新观测
+   重规划。限制：推理耗时必须小于可用前缀时间；新 chunk 必须从最后实际发送目标或反馈连续衔接；
+   固定跳到 `new[k]` 不是充分的延迟补偿，`k` 应同时考虑推理延迟和实际跟踪进度。Diffusion Policy
+   采用 action-sequence prediction 与 receding-horizon control 结合。
+3. **ACT temporal ensemble**：只能聚合时间对齐的预测，不能直接平均相邻时刻的 A9 与 B0；当前
+   150 至 400 ms 远程延迟无法在 15 Hz 每帧完成一次独立推理；PI 报告针对 flow-based VLA 的简单
+   temporal ensembling 不保证有效或安全。
+4. **通用异步动作队列与重叠聚合**（LeRobot/SmolVLA）：参数为 `actions_per_chunk`、
+   `chunk_size_threshold`、`aggregate_fn`，主要解决推理期间没有动作可执行的问题；LeRobot 文档明确
+   区分异步队列解决 idle、RTC 解决 chunk 间不连续，只移植队列仍可能复现回弹。
+5. **Real-Time Chunking（RTC）**：按实际推理延迟确定必然执行的旧前缀并冻结，对剩余新 chunk 执行
+   inpainting/guidance，用软过渡权重折中连续性与反应性；面向 diffusion/flow policy，不要求重新
+   训练。当时 OpenPI WebSocket 接口只接收观测并返回独立 chunk，必须修改服务端采样；这是本项目
+   后来实施的方案。
+6. **训练时 action prefix conditioning**：训练阶段模拟推理延迟并直接条件化已承诺的 action
+   prefix，推理更简单、对大延迟稳健，但需要重新训练 checkpoint；在客户端基线与推理时 RTC 验证后
+   再考虑。
+
+### 与 2 倍时间尺度的关系
+
+训练时 A0 至 A9 覆盖约 0.6 秒；严格 2 倍慢放应覆盖约 1.2 秒，加上“实时锚点到 A0”的一个节点间隔
+后整个动作段为 1.333 秒。时间拉伸不改变模型输出的关节目标值，但会把同一路径的目标速度约降为
+一半、加速度约降为四分之一，并改变接触、夹爪闭合和物体运动的时间关系。冻结 chunk 中 2 倍慢放改善
+跟踪，说明降低目标速度有价值；持续 rollout 的失败来自过长 open-loop 执行和错误 chunk 锚点，两件事
+必须分开评估。
+
+### 不应采用的简化方案
+
+- 不要把新 `B0` 直接追加到未实现的旧raw尾部。
+- 不要固定跳到 `B2` 或 `B3` 并称为延迟补偿；真机数据已经显示更高索引未必更接近反馈。
+- 不要用逐点硬裁剪制造“平滑轨迹”；裁剪会产生新的速度/加速度折角。
+- 不要仅增大prefetch窗口；这会增加观测到执行之间的陈旧时间。
+- 不要对未按绝对时间对齐的action做普通平均。
+- 不要放宽客户端 `0.08 rad` 或bridge `0.12 rad` 包络来掩盖跟踪失败。
+- 不要再次运行10节点、2倍时间、提前0.30秒并追加raw尾部的失败真机参数。
+
+### 一手资料
+
+- Physical Intelligence, Real-Time Action Chunking with Large Models:
+  <https://www.pi.website/research/real_time_chunking>
+- Black, Galliker, Levine, Real-Time Execution of Action Chunking Flow Policies, NeurIPS 2025:
+  <https://arxiv.org/abs/2506.07339>
+- LeRobot, Real-Time Chunking documentation:
+  <https://huggingface.co/docs/lerobot/main/rtc>
+- LeRobot, Asynchronous Inference documentation:
+  <https://huggingface.co/docs/lerobot/main/async>
+- Zhao et al., Learning Fine-Grained Bimanual Manipulation with Low-Cost Hardware (ACT), RSS 2023:
+  <https://roboticsproceedings.org/rss19/p016.pdf>
+- Chi et al., Diffusion Policy: Visuomotor Policy Learning via Action Diffusion, RSS 2023:
+  <https://arxiv.org/abs/2303.04137>
+- Black et al., Training-Time Action Conditioning for Efficient Real-Time Chunking:
+  <https://arxiv.org/abs/2512.05964>
 
 ## 测试记录
 
@@ -709,3 +1100,54 @@ fallback 原因和操作员结论。
   短 RTC recovery/merge，最后再跑 5 分钟任务。重点确认日志出现
   `rtc_recovery_exhausted; switching to timed synchronized fallback` 后仍继续运行，且没有 jerk、clipping、
   stale、hard freeze、模式异常或可感知冲击。若出现安全异常，立即切回 Input Mode None 并停止 bridge。
+
+### 2026-08-28 新任务 RTC 真机首跑（`logs/rtc_20260828_114357`）
+
+- 环境：checkpoint `pi05_marvinpro_red_cones_slow_260826_full/79999`，prompt
+  "Stack the three red cones from right to left inside the white square to form a stable stack."，
+  服务器 10:23 重启后首次接受请求。参数：continuous RTC、`discard`、`--max-rtc-merges 1`、
+  `--policy-request-timeout 5`、20s episode、确认键 `E`。
+- 前两次尝试（`rtc_20260828_113116` / `rtc_20260828_113833`）均在 warmup 阶段 abort：
+  第一次普通推理超时（2s 门限），第二次普通 warmup 147ms 通过但第一次 RTC 请求超时（5s 门限）。
+  定位为 **JAX 按代码路径分别 JIT 编译**：服务器重启后普通推理路径和 RTC(prefix attention) 路径
+  各自需要一次性编译，client 侧 request timeout 等不及。用 `/tmp/policy_warmup.py`（双路径 dummy
+  请求）预热后两条路径均 ~110-170ms。**教训：服务器每次重启后先跑预热脚本再上真机。**
+- 正式跑结果：`rtc_final_status=clean_completion merges=1 recoveries=0`。
+  初始推理 128ms（server infer 74ms）；连续 checkpoint 于 knot 10 到达，RTC 请求 d_pred=1、
+  d_actual=1、wall 137ms；merge 边界速度跳变 0.019 rad、加速度跳变 0.021 rad/s2、
+  blend jerk 5.14 rad/s3（远低于 40 门限），merge 点参考突变仅 7.8e-05 rad，无感知冲击。
+- 局限：`--max-rtc-merges 1` 只执行了约 4.3s 运动（2 次推理）即 hold，不足以评估叠放精度。
+
+同日续跑与配置变更：
+
+- 60s 完整跑（`logs/rtc_20260828_114752`，去掉 merge 上限）：`merges=30 recoveries=0`，
+  clean_completion。但因 `--playback-time-scale 3`（5Hz knot rate、3 倍慢放）只完成了约半个任务。
+  数据采集时已放慢示教速度，无需再慢放。
+- 据此放开 argparse 门控：`synchronized/tracking/rtc` 的 `--playback-time-scale` 白名单从仅 3
+  放宽为 1 或 3（`rollout_client.py` 的 `_TRACKING_ALLOWED_TIME_SCALES`），其余非法值仍拒绝；
+  新增 `test_rtc_schedule_allows_native_fifteen_hz_playback_scale`，pytest 107 passed。
+  下游全部走 `effective_knot_hz = model_hz / time_scale`，15Hz 下 d_pred≈3（上限 4）仍有余量。
+  该改动只在 client 侧，bridge 不需要重传。下一步：time-scale 1 原速 60s 跑，评估叠放精度。
+
+同日 15Hz 首跑暴露 blend 包络问题（`logs/rtc_20260828_133550`）与修复：
+
+- time-scale 1（15Hz knot rate）首跑在第一次 merge 即被 bridge 原子拒绝：3-knot blend jerk
+  `355.7 rad/s^3`、2-knot `1107.7`，门限 40。随后 3 次 synchronized recovery 的 C2 handoff
+  （从静止交接进 15Hz 原生速度的 chunk，jerk `137-170`）也全部超限，最终 `stuck_exhausted`
+  （merges=0, recoveries=4）。安全链按设计工作：机械臂锁存实测姿态 hold，无异常运动。
+- 根因：blend 窗口固定 2~3 knot 且三条上限（vel `0.45` / accel `2.0` / jerk `40`）是 5Hz 下整定的
+  物理值。15Hz 下窗口缩短 3 倍、边界速度大 3 倍，jerk 放大 ~27 倍；且 5Hz 遥测显示 policy 相位
+  峰值速度 `0.081 rad/knot`，15Hz 物理速度 `~1.22 rad/s` 已超 blend 速度上限本身——
+  固定物理上限与 15Hz 运动自相矛盾，单纯延长窗口或提高门限都不是正解。
+- 修复（bridge 侧，`robot_bridge.py` + `trajectory_timeline.py`）：blend 窗口改为按秒恒定
+  （目标 0.6s，knot 数随 knot rate 缩放，15Hz 候选 `(9,6,3,2)`、按 checkpoint 距离裁剪）；
+  blend 上限改为按 knot rate 查表的显式包络 `BLEND_CAPS_BY_KNOT_HZ`：5Hz 保持运行验证过的
+  `0.45/2.0/40`，15Hz 用 `stack_cones_slow_260826` 遥操作数据标定（104 集原生 15Hz，
+  p99.9 = `0.556/2.34/49.8`，示教 max = `1.167/14.2/289`，取 `max(3x p99.9, 1.3x max)`）
+  = **`1.7/18.0/380`**；CLI `--rtc-blend-max-*` 可整体覆盖，未验证 knot rate 无包络直接拒绝。
+  曾考虑过按 `(knot_hz/5)^(1/2/3)` 立方缩放（15Hz jerk 上限 1080），但那是示教最大 jerk 的
+  3.7 倍，过于宽松——窗口按秒恒定后接缝 jerk 只随速度差线性增长，不需要立方放大。
+  按此包络复盘 13:35 的失败：首次 merge 的 355 jerk 在 9-knot 窗口下约 39，recovery 交接
+  137-170 约 15-19，速度 1.22 < 1.7，均可通过。pytest 113 passed。
+  **bridge 代码有改动，下次跑必须重启 bridge（重跑 run_bridge_on_controller.sh 即重传）。**
+- 待验证：15Hz 完整 60s 跑的 merge 成功率、recoveries 数与叠放精度。
