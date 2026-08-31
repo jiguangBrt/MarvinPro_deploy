@@ -320,7 +320,8 @@ cd /home/jh/TianJi_Marvinpro/MarvinPro_deploy
   全部来自 d_pred 估算口径缺陷（只统计推理 wall，漏算相机等待/观测准备/merge staging 约
   1 个 knot；recovery 重建 epoch 后 d_pred=3 低于物理延迟，merge 系统性越界），非机器人侧
   故障；第三次 recovery 时 hold 锁存命令与 bridge invalidation 撞车被拒，client 升级为
-  fatal（bridge 实际已自行安全 hold，此竞态尚未修）。已修复估算口径（见上文 d_pred 条目），
+  fatal（bridge 实际已自行安全 hold；该竞态已于 2026-08-31 修复，见下方待办区
+  recovery 竞态条目，commit bc18107）。已修复估算口径（见上文 d_pred 条目），
   117 tests passed；用两次运行日志回放到新估算器验证：15 Hz 全程 d_pred=4，5 Hz 为
   2~3（旧口径 1~2，更保守但仍在协议范围内）。改动仅在 client 侧（`rtc.py` +
   `rollout_client.py`），bridge 不 import `rtc.py`，不强制重启。
@@ -453,10 +454,16 @@ fallback 和退出固定 hold 通过回归；真机任务成功率和完成时�
   （历史上曾记录到 `(2,3)`/`(1,3)` 瞬时抖动并自愈，本次未恢复）。重连机器人后先确认状态恢复
   `(3,3)`、Apex 无报警再重跑，复现时记录是否在抓取/搬运阶段。进展：18:01 重跑 60 s 全程
   `(3,3)` 未复现（`logs/rtc_20260828_180126`）；厂家确认状态码含义前保持观察。
-- [ ] **recovery 竞态（18:07 运行第三次 recovery，尚未修，等批准）**：hold 锁存命令被
-  bridge `trajectory_command_rejected` 拒绝时 client 直接升级 `fatal_safety_hold`，但
-  bridge 实际已自行安全 hold（`measured_holding` event）。修复方向：client 收到拒绝后先
-  确认 bridge 的 hold 状态再决定是否 fatal，或重试一次锁存。
+- [x] **recovery 竞态（18:07 运行第三次 recovery，2026-08-31 已修复，commit bc18107）**：
+  hold 锁存命令被 bridge `trajectory_command_rejected` 拒绝时 client 直接升级
+  `fatal_safety_hold`，但 bridge 实际已自行安全 hold（`measured_holding` event）。
+  修复采用双保险：bridge 侧锁存命令版本不匹配时若已处于 hold 则幂等确认并补发
+  `measured_holding` 事件；client 侧新增 `_latch_measured_hold_with_retry` 重采
+  timeline 版本重试一次，`_run_trajectory_schedule` 全部 5 处锁存调用点已切换。
+  同一 commit 还修复了 observation-lag 拒绝缺少结构化 reason_code 的问题（bridge
+  现在抛出 `ObservationLagError` 并在拒绝事件中携带 `observation_lag`，RTC
+  recovery 判为可恢复并重新观测重试）。pytest 121 passed；竞态的端到端有效性
+  仍需真机 RTC 长跑确认。
 - [ ] 按 [`ROBOT_RTC_TESTS.md`](ROBOT_RTC_TESTS.md) 执行新 checkpoint 下的 dry-run ->
   synchronized -> RTC shadow -> `--max-rtc-merges 1` 真机验收；merge 数按 1 -> 2 -> 10 逐级放大，
   不直接做 20-merge soak；每次使用独立 RUN_DIR，merge 与 fallback episode 分开统计。
