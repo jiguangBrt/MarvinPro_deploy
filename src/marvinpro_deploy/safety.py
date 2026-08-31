@@ -19,6 +19,10 @@ class C2BlendError(SafetyError):
     """A trajectory handoff was rejected without changing the active target."""
 
 
+class ObservationLagError(SafetyError):
+    """The command was conditioned on an observation the bridge considers stale."""
+
+
 @dataclass(frozen=True)
 class FilteredAction:
     action: tuple[float, ...]

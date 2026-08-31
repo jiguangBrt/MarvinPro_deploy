@@ -1738,6 +1738,49 @@ def _latch_measured_bridge_position(
     return event
 
 
+def _latch_measured_hold_with_retry(
+    connection: RobotConnection,
+    command_ids: _CommandIds,
+    *,
+    session_id: str,
+    reason: str,
+    reason_code: str,
+    timeout_s: float,
+) -> TrajectoryEvent:
+    """Latch a measured hold, tolerating a concurrent bridge-side hold transition.
+
+    The bridge bumps the timeline version when it enters hold on its own
+    (deadline, invalidation, ...), which can race the version the client
+    sampled for the first latch attempt. The bridge confirms an already-active
+    hold idempotently; for any other version drift, re-sample the version and
+    retry once before giving up.
+    """
+    try:
+        return _latch_measured_bridge_position(
+            connection,
+            command_ids,
+            session_id=session_id,
+            reason=reason,
+            reason_code=reason_code,
+            timeout_s=timeout_s,
+        )
+    except (RolloutError, SafetyError) as exc:
+        LOGGER.warning(
+            "measured_hold_latch_rejected session=%s error=%r; "
+            "re-sampling timeline version and retrying once",
+            session_id,
+            exc,
+        )
+        return _latch_measured_bridge_position(
+            connection,
+            command_ids,
+            session_id=session_id,
+            reason=reason,
+            reason_code=reason_code,
+            timeout_s=timeout_s,
+        )
+
+
 def _fresh_observation_after_source_time(
     connection: RobotConnection,
     source_time: float,
@@ -2539,7 +2582,7 @@ def _run_trajectory_schedule(
                     rtc_recovery_count,
                 )
                 try:
-                    holding = _latch_measured_bridge_position(
+                    holding = _latch_measured_hold_with_retry(
                         connection,
                         command_ids,
                         session_id=session_id,
@@ -2650,7 +2693,7 @@ def _run_trajectory_schedule(
                                 new_epoch,
                             )
                             try:
-                                holding = _latch_measured_bridge_position(
+                                holding = _latch_measured_hold_with_retry(
                                     connection,
                                     command_ids,
                                     session_id=session_id,
@@ -2695,7 +2738,7 @@ def _run_trajectory_schedule(
                                 args.max_rtc_recoveries,
                             )
                             try:
-                                holding = _latch_measured_bridge_position(
+                                holding = _latch_measured_hold_with_retry(
                                     connection,
                                     command_ids,
                                     session_id=session_id,
@@ -2837,7 +2880,7 @@ def _run_trajectory_schedule(
                                 args.max_rtc_recoveries,
                             )
                             try:
-                                holding = _latch_measured_bridge_position(
+                                holding = _latch_measured_hold_with_retry(
                                     connection,
                                     command_ids,
                                     session_id=session_id,
@@ -2883,7 +2926,7 @@ def _run_trajectory_schedule(
                             new_epoch,
                         )
                         try:
-                            holding = _latch_measured_bridge_position(
+                            holding = _latch_measured_hold_with_retry(
                                 connection,
                                 command_ids,
                                 session_id=session_id,

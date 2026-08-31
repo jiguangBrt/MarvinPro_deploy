@@ -18,6 +18,7 @@ from marvinpro_deploy.protocol import BridgeHello, RobotStateUpdate, TrajectoryE
 from marvinpro_deploy.rtc import RTC_HORIZON, RtcError
 from marvinpro_deploy.rollout_client import (
     BridgeCommandRejected,
+    _CommandIds,
     _TrajectoryHeartbeat,
     _actions_tuple,
     _confirm_execution,
@@ -25,6 +26,7 @@ from marvinpro_deploy.rollout_client import (
     _classify_rtc_failure,
     _configure_logging,
     _is_observation_lag_rejection,
+    _latch_measured_hold_with_retry,
     _run_bridge_synchronized,
     _run_trajectory_schedule,
     _state_log_interval_s,
@@ -866,6 +868,106 @@ class RolloutArgumentTest(unittest.TestCase):
     def test_observation_lag_rejection_is_retryable_but_other_rejections_are_not(self):
         self.assertTrue(_is_observation_lag_rejection(RolloutError("bridge rejected trajectory: action observation lag is 17 frames (limit 8)")))
         self.assertFalse(_is_observation_lag_rejection(RolloutError("bridge rejected trajectory: robot_state=(3, 12)")))
+
+    def test_observation_lag_rejection_uses_structured_reason_code(self):
+        event = TrajectoryEvent(
+            1,
+            "trajectory_command_rejected",
+            1.0,
+            "session",
+            "plan",
+            2,
+            0.0,
+            reason_code="observation_lag",
+            detail="action observation lag is 13 frames (limit 8)",
+        )
+
+        failure = _classify_rtc_failure(BridgeCommandRejected("bridge rejected trajectory", event))
+
+        self.assertEqual(failure.reason_code, "observation_lag")
+        self.assertTrue(failure.recoverable)
+
+    def test_latch_measured_hold_retries_once_with_freshly_sampled_version(self):
+        class FakeConnection:
+            def __init__(self):
+                self.attempt = 0
+                self.commands = []
+
+            def latest_state(self, max_local_age_s):
+                return SimpleNamespace(timeline_version=41 if self.attempt == 0 else 42)
+
+            def send(self, message):
+                self.commands.append(message)
+
+            def wait_for_event(self, *, timeout_s, event_types):
+                self.attempt += 1
+                if self.attempt == 1:
+                    return TrajectoryEvent(
+                        1,
+                        "trajectory_command_rejected",
+                        1.0,
+                        "s",
+                        "p",
+                        42,
+                        0.0,
+                        reason_code="command_rejected",
+                        detail="measured hold command timeline version mismatch",
+                    )
+                return TrajectoryEvent(
+                    2, "measured_holding", 1.1, "s", "p", 42, 0.0, reason_code="rtc_late"
+                )
+
+        connection = FakeConnection()
+        holding = _latch_measured_hold_with_retry(
+            connection,
+            _CommandIds(),
+            session_id="s",
+            reason="RTC failure",
+            reason_code="rtc_late",
+            timeout_s=1.0,
+        )
+
+        self.assertEqual(holding.event_type, "measured_holding")
+        self.assertEqual(holding.timeline_version, 42)
+        self.assertEqual(
+            [command.expected_timeline_version for command in connection.commands],
+            [41, 42],
+        )
+
+    def test_latch_measured_hold_retry_exhaustion_raises(self):
+        class FakeConnection:
+            def __init__(self):
+                self.attempt = 0
+
+            def latest_state(self, max_local_age_s):
+                return SimpleNamespace(timeline_version=41 + self.attempt)
+
+            def send(self, message):
+                pass
+
+            def wait_for_event(self, *, timeout_s, event_types):
+                self.attempt += 1
+                return TrajectoryEvent(
+                    self.attempt,
+                    "trajectory_command_rejected",
+                    1.0,
+                    "s",
+                    "p",
+                    41 + self.attempt,
+                    0.0,
+                    reason_code="command_rejected",
+                    detail="measured hold command timeline version mismatch",
+                )
+
+        with self.assertRaises(RolloutError):
+            _latch_measured_hold_with_retry(
+                FakeConnection(),
+                _CommandIds(),
+                session_id="s",
+                reason="RTC failure",
+                reason_code="rtc_late",
+                timeout_s=1.0,
+            )
 
     def test_execution_confirmation_accepts_only_single_uppercase_e(self):
         args = parse_args(["--execute"])

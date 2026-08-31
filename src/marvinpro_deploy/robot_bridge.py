@@ -69,7 +69,14 @@ from .protocol import (
     send_message,
 )
 from .rtc import RTC_EXECUTION_HORIZON, RTC_HORIZON
-from .safety import C2BlendError, SafetyError, action_arms, filter_action, validate_action
+from .safety import (
+    C2BlendError,
+    ObservationLagError,
+    SafetyError,
+    action_arms,
+    filter_action,
+    validate_action,
+)
 from .tracking import TrackingGovernor
 from .trajectory_timeline import BLEND_CAPS_BY_KNOT_HZ, TrajectoryTimeline, blend_knot_candidates
 
@@ -80,6 +87,20 @@ def _now() -> float:
 
 def _age(now: float, stamp: float | None) -> float | None:
     return None if stamp is None else max(0.0, now - stamp)
+
+
+def _rejection_reason_code(exc: BaseException) -> str:
+    """Structured reason_code for a rejected trajectory command.
+
+    Keep these values aligned with the client's recoverable-failure set in
+    rollout_client._RECOVERABLE_RTC_CODES; an unrecognized code is treated as
+    fatal by the RTC recovery state machine.
+    """
+    if isinstance(exc, C2BlendError):
+        return "c2_blend_infeasible"
+    if isinstance(exc, ObservationLagError):
+        return "observation_lag"
+    return "command_rejected"
 
 
 QOS_SENSOR = QoSProfile(
@@ -657,7 +678,9 @@ class MarvinBridgeNode(Node):
             raise SafetyError("no camera observation")
         lag = self._latest_observation.seq - int(observation_seq)
         if lag < 0 or lag > self.max_observation_lag:
-            raise SafetyError(f"action observation lag is {lag} frames (limit {self.max_observation_lag})")
+            raise ObservationLagError(
+                f"action observation lag is {lag} frames (limit {self.max_observation_lag})"
+            )
 
     def _validate_trajectory_knots_locked(self, timeline: TrajectoryTimeline) -> None:
         for knot in timeline.knots:
@@ -1180,7 +1203,32 @@ class MarvinBridgeNode(Node):
         if message.session_id != self._trajectory_session_id:
             raise SafetyError("measured hold command does not match trajectory session")
         if message.expected_timeline_version != self._timeline_version:
-            raise SafetyError("measured hold command timeline version mismatch")
+            if self._trajectory_hold_action is None:
+                raise SafetyError("measured hold command timeline version mismatch")
+            # The bridge entered hold on its own (deadline, invalidation, ...) after
+            # the client sampled the timeline version, so the client's expected
+            # version is stale. A measured hold request is idempotent: confirm the
+            # already-active hold instead of rejecting, so that this race cannot
+            # turn an already-safe bridge into a client-side fatal error.
+            self._heartbeat_t = now
+            self._last_command_id = message.command_id
+            self._last_command_status = f"holding fixed position: {message.reason} (already holding)"
+            hold_error = (
+                None
+                if self._joints is None
+                else self._arm_error(self._trajectory_hold_action, self._joints)
+            )
+            self._emit_event_locked(
+                "measured_holding",
+                now,
+                reason_code=message.reason_code,
+                final_error_rad=hold_error,
+                detail=(
+                    f"{message.reason}; hold already active at timeline version "
+                    f"{self._timeline_version}"
+                ),
+            )
+            return
         ready, reason = self._readiness_gate_locked(now)
         if not ready:
             raise SafetyError(reason)
@@ -1268,11 +1316,7 @@ class MarvinBridgeNode(Node):
                         "plan_id",
                         getattr(message, "base_plan_id", self._trajectory_plan_id),
                     )
-                    reason_code = (
-                        "c2_blend_infeasible"
-                        if isinstance(exc, C2BlendError)
-                        else "command_rejected"
-                    )
+                    reason_code = _rejection_reason_code(exc)
                     self._emit_event_locked(
                         "trajectory_command_rejected",
                         now,

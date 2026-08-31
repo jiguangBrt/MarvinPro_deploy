@@ -5,3 +5,4 @@ __pycache__/
 .venv/
 logs/
 cmd_tmp.md
+TODO.md

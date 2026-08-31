@@ -732,6 +732,89 @@ def test_measured_hold_atomically_latches_arms_and_preserves_last_gripper_comman
     assert abs(node._events[-1].final_error_rad - 0.07) < 1e-12
 
 
+def test_observation_lag_rejection_carries_structured_reason_code(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(robot_bridge, "_now", lambda: clock[0])
+    node = _ready_trajectory_node(clock)
+    node._latest_observation = replace(node._latest_observation, seq=20)
+    knots = tuple(_arm_action(index * 0.001) for index in range(robot_bridge.RTC_HORIZON))
+
+    node.accept_command(
+        robot_bridge.LoadTrajectoryCommand(
+            1, 1, "session", "plan", 0, knots, 5.0, robot_bridge.RTC_HORIZON, True
+        )
+    )
+
+    rejected = node._events[-1]
+    assert rejected.event_type == "trajectory_command_rejected"
+    assert rejected.reason_code == "observation_lag"
+    assert "action observation lag is 19 frames" in rejected.detail
+    assert node._trajectory_session_id is None
+
+
+def test_latch_measured_hold_is_idempotent_when_bridge_already_holding(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(robot_bridge, "_now", lambda: clock[0])
+    node = _ready_trajectory_node(clock)
+    knots = tuple(_arm_action(index * 0.001) for index in range(robot_bridge.RTC_HORIZON))
+    node.accept_command(
+        robot_bridge.LoadTrajectoryCommand(
+            1, 1, "session", "plan", 0, knots, 5.0, robot_bridge.RTC_HORIZON, True
+        )
+    )
+    node._joints = (0.03,) * 14
+    node._joints_t = clock[0]
+    node.accept_command(
+        robot_bridge.LatchMeasuredHoldCommand(2, "session", 1, True, "stuck", "tracking_timeout")
+    )
+    assert node._timeline_version == 2
+    held_action = node._trajectory_hold_action
+
+    # A latch carrying the pre-hold version (sampled before the bridge bumped
+    # the timeline) must confirm the active hold instead of being rejected.
+    node.accept_command(
+        robot_bridge.LatchMeasuredHoldCommand(3, "session", 1, True, "RTC failure", "rtc_late")
+    )
+
+    assert node._timeline_version == 2
+    assert node._trajectory_hold_action == held_action
+    confirmed = node._events[-1]
+    assert confirmed.event_type == "measured_holding"
+    assert confirmed.timeline_version == 2
+    assert confirmed.reason_code == "rtc_late"
+    assert node._last_command_id == 3
+    assert node._heartbeat_t == clock[0]
+
+
+def test_latch_measured_hold_stale_version_rejected_while_trajectory_active(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(robot_bridge, "_now", lambda: clock[0])
+    node = _ready_trajectory_node(clock)
+    knots = tuple(_arm_action(index * 0.001) for index in range(robot_bridge.RTC_HORIZON))
+    node.accept_command(
+        robot_bridge.LoadTrajectoryCommand(
+            1, 1, "session", "plan", 0, knots, 5.0, robot_bridge.RTC_HORIZON, True
+        )
+    )
+    node.accept_command(
+        robot_bridge.LoadTrajectoryCommand(
+            2, 1, "session", "plan-2", 1, knots, 5.0, robot_bridge.RTC_HORIZON, True
+        )
+    )
+    assert node._timeline_version == 2
+    assert node._trajectory_hold_action is None
+
+    node.accept_command(
+        robot_bridge.LatchMeasuredHoldCommand(3, "session", 1, True, "RTC failure", "rtc_late")
+    )
+
+    rejected = node._events[-1]
+    assert rejected.event_type == "trajectory_command_rejected"
+    assert rejected.reason_code == "command_rejected"
+    assert "timeline version mismatch" in rejected.detail
+    assert node._trajectory_hold_action is None
+
+
 def test_timed_chunk_deadline_latches_measured_hold_with_diagnostics(monkeypatch):
     clock = [100.0]
     monkeypatch.setattr(robot_bridge, "_now", lambda: clock[0])
