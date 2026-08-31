@@ -1,4 +1,12 @@
-"""Client-side RTC request validation and conservative delay estimation."""
+"""Client-side RTC request validation and conservative delay estimation.
+
+Delay samples are the full client-observed request latency: from checkpoint
+event receipt to the merge (or late-discard) outcome. That includes the camera
+fresh-image wait, observation preparation, inference transport, and merge
+staging, because the bridge counts physical phase-knot crossings over the same
+interval. Contexts without a checkpoint (warmup, initial inference, recovery
+bootstrap) record wall latency plus the running client-overhead estimate.
+"""
 
 from __future__ import annotations
 
@@ -48,6 +56,7 @@ class DelayEstimator:
         self.stable_quantile = float(stable_quantile)
         self._epoch = 0
         self._rejected_samples = 0
+        self._last_prediction_clamped = False
 
     @property
     def epoch(self) -> int:
@@ -60,6 +69,11 @@ class DelayEstimator:
     @property
     def rejected_samples(self) -> int:
         return self._rejected_samples
+
+    @property
+    def last_prediction_clamped(self) -> bool:
+        """True when the last prediction exceeded the protocol cap and was clamped."""
+        return self._last_prediction_clamped
 
     def record_seconds(
         self,
@@ -76,7 +90,10 @@ class DelayEstimator:
             reason = reason or "invalid_latency"
         elif not math.isfinite(rate) or rate <= 0:
             reason = reason or "invalid_knot_rate"
-        elif math.ceil((latency + self.guard_seconds) * rate) > RTC_MAX_DELAY:
+        elif math.ceil(latency * rate) > RTC_MAX_DELAY:
+            # Physical check without the guard: the sample alone spans more
+            # phase knots than the old tail has, so the result could never
+            # merge regardless of the prediction margin.
             reason = "exceeds_rtc_horizon"
         elif not eligible:
             reason = reason or "sample_marked_unstable"
@@ -109,9 +126,11 @@ class DelayEstimator:
         if not self._latencies:
             raise RtcError("no stable policy latency is available for RTC delay prediction")
         prediction = math.ceil((self._stable_latency_seconds() + self.guard_seconds) * float(knot_hz))
-        if not 1 <= prediction <= RTC_MAX_DELAY:
-            raise RtcError(f"predicted RTC delay {prediction} is outside 1..{RTC_MAX_DELAY}")
-        return prediction
+        # d_pred is a protocol-capped prediction (1..RTC_MAX_DELAY); the bridge
+        # still enforces the physical boundary itself and discards late merges,
+        # so an estimate above the cap rides the cap instead of aborting.
+        self._last_prediction_clamped = prediction > RTC_MAX_DELAY
+        return min(max(prediction, 1), RTC_MAX_DELAY)
 
 
 def build_rtc_request(

@@ -250,9 +250,16 @@ uv run python -m marvinpro_deploy.rollout_client \
   stale、timer overrun 和 arm clipping 直接硬冻结。臂关节 safety clipping 包络 `0.16 rad`。
 - RTC A9 checkpoint 只有在全部 14 个臂关节误差不超过 `0.01 rad`，并且由持续更新的 joint source
   timestamp 证明连续稳定 `0.20 s` 后才成立；“客户端已经发出 A9，但反馈仍在 A8”不会触发新观测。
-- `d_pred` 使用当前 estimator epoch 内可行 latency 样本的保守 p95 加 `50 ms` guard；会超过四个
-  old-tail knot 的样本作为 link fault 单独记录。默认 `--rtc-late-result-policy discard`；`d_actual`
-  始终按 bridge 实际 phase 跨过的 knot 计数，不使用 `wall_time * nominal_rate`。
+- `d_pred` 使用当前 estimator epoch 内可行 latency 样本的保守 p95 加 `50 ms` guard。2026-08-28
+  18:30 起样本口径改为 client 观测的完整请求延迟（checkpoint 事件接收到 merge/丢弃结果，含相机
+  等新图像、观测准备、推理传输、merge staging）；warmup/初始推理/recovery bootstrap 等无
+  checkpoint 上下文的位置记录 wall + 开销 EMA（种子 `100 ms`，每次成功 merge 按
+  `full-wall` 更新）。物理超限判定不再含 guard：单样本超过 4 个 old-tail knot 才记 link fault；
+  预测超协议上限 4 时钳位到 4 并按 epoch 告警（`rtc_delay_prediction_clamped`），不再抛错——
+  bridge 仍自行强制物理边界并丢弃迟到 merge。默认 `--rtc-late-result-policy discard`；`d_actual`
+  始终按 bridge 实际 phase 跨过的 knot 计数，不使用 `wall_time * nominal_rate`。旧口径只统计推理
+  wall，15 Hz 下系统性低估约 1 个 knot，recovery 重建 epoch 后 d_pred 掉到 3 会造成每次 merge
+  都在边界外（2026-08-28 18:07 运行三次 rtc_late 中止的根因）。
 - trajectory session 每 `100 ms` 发送 heartbeat；bridge 超过 `250 ms` 未收到会清空 trajectory 并
   停止发布。旧的 discrete/prefetch 仍使用 `ActionCommand`。
 - protocol v10 必须同时更新控制器上的 `MarvinPro_deploy` 和本机客户端。夹爪状态使用归一化实测
@@ -307,16 +314,40 @@ cd /home/jh/TianJi_Marvinpro/MarvinPro_deploy
   `stuck_exhausted`（促成窗口与包络改造）；14:30 15 Hz 重跑 17 merges / 0 recoveries、
   blend jerk 实测最大 ~105，但 12.5 s 后控制器 `robot_state` 掉到 `(1,12)` 中止（见下方
   待办第一条，与本仓库代码无关）。
+- **18:01/18:07 真机运行与估算口径修复**：18:01 60 s 15 Hz 运行 clean completion
+  （`logs/rtc_20260828_180126`，87 merges / 1 recovery，全程 `(3,3)`，`（1,12)` 未复现）。
+  18:07 600 s 运行（`logs/rtc_20260828_180703`）47 s 后 `fatal_safety_hold`：三次 `rtc_late`
+  全部来自 d_pred 估算口径缺陷（只统计推理 wall，漏算相机等待/观测准备/merge staging 约
+  1 个 knot；recovery 重建 epoch 后 d_pred=3 低于物理延迟，merge 系统性越界），非机器人侧
+  故障；第三次 recovery 时 hold 锁存命令与 bridge invalidation 撞车被拒，client 升级为
+  fatal（bridge 实际已自行安全 hold，此竞态尚未修）。已修复估算口径（见上文 d_pred 条目），
+  117 tests passed；用两次运行日志回放到新估算器验证：15 Hz 全程 d_pred=4，5 Hz 为
+  2~3（旧口径 1~2，更保守但仍在协议范围内）。改动仅在 client 侧（`rtc.py` +
+  `rollout_client.py`），bridge 不 import `rtc.py`，不强制重启。
 - **policy server 运维**：服务器进程每次重启后必须先在本地跑
   `cd /home/jh/OpenPI_UR/openpi && uv run python /tmp/policy_warmup.py`（双路径 JIT 预热，
-  稳态 plain ~140 ms / RTC ~170 ms）；服务器侧用 tmux 会话 `policy` 运行
-  （`ssh 192.168.50.73 -t 'tmux attach -t policy'` 接管），日志在服务器
-  `/tmp/serve_policy_8000.log`。
+  稳态 plain ~140 ms / RTC ~170 ms）；服务器侧用 tmux 会话 `policy_redcones` 运行
+  （`ssh 192.168.50.73 -t 'tmux attach -t policy_redcones'` 接管），日志在服务器
+  `/tmp/serve_policy_8000.log`。**不要用 `policy` 这个会话名**：2026-08-28 下午同事在同一
+  服务器用 `policy`（端口 8002，pour_bowl `pi05_sft_r3`）和 `policy_cfg`（端口 8003，
+  `serve_cfg_shim.py` CFG 实验）跑倒碗任务，15:14 重建 `policy` 会话时把 8000 红锥服务
+  进程一并挤掉，导致客户端 `Timed out connecting to policy server`；17:57 已用独立会话名
+  `policy_redcones` 重启并预热（plain 稳态 ~119 ms / RTC ~142 ms）。
+- **18:35 运行暴露的两个 recovery 问题已修（2026-08-31）**：`logs/rtc_20260828_183559`
+  中 recovery 机制本身工作正常（4 次成功回到 RTC），但暴露：① recovery 后 bridge 补发
+  属于旧 request 的 deadline 事件，client 误判 `rtc_fatal`（`bridge deadline event belongs
+  to another request`）——已改为只告警并忽略（旧 request 已被 recovery 握手取代，事件不
+  影响在飞的 request）；② `--max-rtc-recoveries` 默认 3，耗尽后永久切到 synchronized
+  fallback（非 RTC 精度不可用）——长跑命令改用 `--max-rtc-recoveries 20`。仅 client 侧
+  `rollout_client.py`，bridge 不用重启；117 tests passed。注意：单次 recovery 中间仍会
+  执行一段 synchronized 过渡 chunk（无延迟补偿，精度差属固有），跑完一个 clean chunk 即
+  自动回 RTC。
 - **代码已同步 GitHub**：`tmp` 与 `main` 均在 `1099ccd`
   （`git@github.com:jiguangBrt/MarvinPro_deploy`）。
-- **下一步**：机器人重连并确认 `robot_state` 恢复 `(3,3)`、Apex 无报警后，按
-  `cmd_tmp.md` 13:54 段命令重跑 15 Hz 原速 60 s RTC（bridge 必须重启以同步新包络代码），
-  观察 `(1,12)` 是否复现及叠放精度对比 legacy sync 的厘米级偏差。
+- **下一步**：按 `cmd_tmp.md` 2026-08-31 09:47 段命令重跑 15 Hz 原速 600 s RTC
+  （日志目录名带任务描述 `rtc_redcones_600s_rec20_<时间>`；client 代码已变，bridge 可
+  沿用）；观察长时间运行下 recovery 频率、`ignoring stale bridge event` 次数、叠放精度，
+  以及 `(1,12)` 是否在抓取/搬运阶段复现。
 
 ## 待办与已知问题
 
@@ -420,7 +451,12 @@ fallback 和退出固定 hold 通过回归；真机任务成功率和完成时�
   关节速度 <=`0.12 rad/s`（正在搬运第一个锥筒），跳变后 6 s 关节漂移 <`0.003 rad`、夹爪保持
   夹持。状态码 `(1,12)` 的定义在控制器固件侧，需向机器人厂家确认含义与触发条件后再决定对策
   （历史上曾记录到 `(2,3)`/`(1,3)` 瞬时抖动并自愈，本次未恢复）。重连机器人后先确认状态恢复
-  `(3,3)`、Apex 无报警再重跑，复现时记录是否在抓取/搬运阶段。
+  `(3,3)`、Apex 无报警再重跑，复现时记录是否在抓取/搬运阶段。进展：18:01 重跑 60 s 全程
+  `(3,3)` 未复现（`logs/rtc_20260828_180126`）；厂家确认状态码含义前保持观察。
+- [ ] **recovery 竞态（18:07 运行第三次 recovery，尚未修，等批准）**：hold 锁存命令被
+  bridge `trajectory_command_rejected` 拒绝时 client 直接升级 `fatal_safety_hold`，但
+  bridge 实际已自行安全 hold（`measured_holding` event）。修复方向：client 收到拒绝后先
+  确认 bridge 的 hold 状态再决定是否 fatal，或重试一次锁存。
 - [ ] 按 [`ROBOT_RTC_TESTS.md`](ROBOT_RTC_TESTS.md) 执行新 checkpoint 下的 dry-run ->
   synchronized -> RTC shadow -> `--max-rtc-merges 1` 真机验收；merge 数按 1 -> 2 -> 10 逐级放大，
   不直接做 20-merge soak；每次使用独立 RUN_DIR，merge 与 fallback episode 分开统计。

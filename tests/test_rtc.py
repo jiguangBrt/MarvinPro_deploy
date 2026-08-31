@@ -66,6 +66,24 @@ class RtcClientTest(unittest.TestCase):
         self.assertTrue(high_but_feasible.accepted)
         self.assertEqual(estimator.predicted_steps(5.0), 2)
 
+    def test_horizon_rejection_uses_physical_latency_without_guard(self):
+        # Samples are full checkpoint-to-outcome latency; a sample only faults
+        # when it alone spans more knots than the old tail has.
+        estimator = DelayEstimator()
+        feasible = estimator.record_seconds(0.26, knot_hz=15.0)  # 3.9 knots
+        self.assertTrue(feasible.accepted)
+        missed_tail = estimator.record_seconds(0.27, knot_hz=15.0)  # 4.05 knots
+        self.assertFalse(missed_tail.accepted)
+        self.assertEqual(missed_tail.reason, "exceeds_rtc_horizon")
+
+    def test_prediction_clamps_to_protocol_cap_instead_of_raising(self):
+        estimator = DelayEstimator()
+        for _ in range(5):
+            estimator.record_seconds(0.26, knot_hz=15.0)
+        # raw prediction ceil((0.26 + 0.05) * 15) = 5 exceeds the cap
+        self.assertEqual(estimator.predicted_steps(15.0), 4)
+        self.assertTrue(estimator.last_prediction_clamped)
+
     def test_request_response_ids_and_shape(self):
         request = build_rtc_request(
             request_id="request",

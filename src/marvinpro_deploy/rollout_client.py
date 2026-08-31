@@ -1968,6 +1968,14 @@ def _run_bridge_synchronized(
     return TimedSynchronizedResult(inference_count, observation, clean_chunks, stuck_replans, False)
 
 
+# Seed for the client-side pre/post-inference overhead EMA (checkpoint detection,
+# camera fresh-image wait, observation preparation, merge staging) before any
+# merge has been measured. The estimator samples full checkpoint-to-outcome
+# latency; contexts without a checkpoint (warmup, initial inference, recovery
+# bootstrap) record wall latency plus this running overhead estimate instead.
+_RTC_OVERHEAD_SEED_MS = 100.0
+
+
 def _record_rtc_delay_sample(
     estimator: DelayEstimator,
     latency_ms: float,
@@ -2110,14 +2118,22 @@ def _run_trajectory_schedule(
     heartbeat = _TrajectoryHeartbeat(connection, session_id, heartbeat_stop)
     effective_knot_hz = args.model_hz / args.playback_time_scale
     estimator = DelayEstimator()
+    overhead_ema_ms = _RTC_OVERHEAD_SEED_MS
     for latency_ms in warmup_latencies_ms:
-        _record_rtc_delay_sample(estimator, latency_ms, effective_knot_hz, source="warmup")
+        _record_rtc_delay_sample(
+            estimator, latency_ms + overhead_ema_ms, effective_knot_hz, source="warmup"
+        )
     inference_count = 0
     fallback = args.rollout_schedule in ("tracking", "synchronized")
 
     actions, timing = infer_actions(policy, observation, args.prompt)
     inference_count += 1
-    _record_rtc_delay_sample(estimator, timing["wall_ms"], effective_knot_hz, source="initial_inference")
+    _record_rtc_delay_sample(
+        estimator,
+        timing["wall_ms"] + overhead_ema_ms,
+        effective_knot_hz,
+        source="initial_inference",
+    )
     LOGGER.info(
         "trajectory_initial_inference observation_seq=%d wall_ms=%.1f observation_preparation_ms=%.1f "
         "client_timing=%s policy_timing=%s server_timing=%s",
@@ -2196,6 +2212,7 @@ def _run_trajectory_schedule(
     rtc_recovery_count = 0
     policy_connection_generation = 1
     rtc_final_status = "clean_completion"
+    clamped_warning_epoch = -1
 
     try:
         while (
@@ -2210,6 +2227,7 @@ def _run_trajectory_schedule(
             )
             if checkpoint.event_type != "checkpoint_ready":
                 raise RolloutError(f"RTC checkpoint failed: {checkpoint.detail}")
+            checkpoint_received_monotonic = time.monotonic()
             if args.max_rtc_merges is not None and rtc_merge_count >= args.max_rtc_merges:
                 if args.rtc_continuous:
                     LOGGER.info(
@@ -2244,6 +2262,18 @@ def _run_trajectory_schedule(
             failure_event: TrajectoryEvent | None = None
             try:
                 predicted_delay = estimator.predicted_steps(effective_knot_hz)
+                if (
+                    estimator.last_prediction_clamped
+                    and clamped_warning_epoch != estimator.epoch
+                ):
+                    clamped_warning_epoch = estimator.epoch
+                    LOGGER.warning(
+                        "rtc_delay_prediction_clamped epoch=%d knot_hz=%.2f cap=%d; "
+                        "link latency is marginal, occasional late discards are expected",
+                        estimator.epoch,
+                        effective_knot_hz,
+                        RTC_MAX_DELAY,
+                    )
                 observation_preparation_started = time.monotonic()
                 policy_observation = build_policy_observation(observation, args.prompt)
                 observation_preparation_ms = (time.monotonic() - observation_preparation_started) * 1000.0
@@ -2293,9 +2323,20 @@ def _run_trajectory_schedule(
                     )
                     if event is not None:
                         if event.request_id not in (None, request_id):
-                            raise RtcError(
-                                f"bridge deadline event belongs to another request: {event.request_id}"
+                            # Stale event from a superseded request (e.g. the bridge
+                            # still had the pre-recovery request pending when the
+                            # client aborted it). It does not concern the in-flight
+                            # request; dropping it is safe because the recovery
+                            # handshake already re-established the timeline.
+                            LOGGER.warning(
+                                "ignoring stale bridge event from superseded request: "
+                                "type=%s event_request=%s current_request=%s detail=%r",
+                                event.event_type,
+                                event.request_id,
+                                request_id,
+                                event.detail,
                             )
+                            continue
                         deadline_event = event
                         failure_event = event
                         LOGGER.warning(
@@ -2354,17 +2395,25 @@ def _run_trajectory_schedule(
                     policy_timing,
                     rtc_server_timing,
                 )
-                sample = _record_rtc_delay_sample(
-                    estimator,
-                    rtc_timing["wall_ms"],
-                    effective_knot_hz,
-                    source=f"request:{request_id}",
-                    eligible=deadline_event is None,
-                    rejection_reason=(
-                        None if deadline_event is None else f"bridge_{deadline_event.event_type}"
-                    ),
-                )
-                if not sample.accepted and sample.reason == "exceeds_rtc_horizon":
+                request_elapsed_ms = (time.monotonic() - checkpoint_received_monotonic) * 1000.0
+                if deadline_event is not None:
+                    # Missed-deadline results never merge; keep the partial
+                    # checkpoint-to-discard latency out of the stable distribution.
+                    _record_rtc_delay_sample(
+                        estimator,
+                        request_elapsed_ms,
+                        effective_knot_hz,
+                        source=f"request:{request_id}",
+                        eligible=False,
+                        rejection_reason=f"bridge_{deadline_event.event_type}",
+                    )
+                if (
+                    math.ceil(
+                        (rtc_timing["wall_ms"] / 1000.0 + estimator.guard_seconds)
+                        * effective_knot_hz
+                    )
+                    > RTC_MAX_DELAY
+                ):
                     feasible_budget_ms = max(
                         0.0,
                         RTC_MAX_DELAY / effective_knot_hz - estimator.guard_seconds,
@@ -2433,8 +2482,19 @@ def _run_trajectory_schedule(
                     failure_event = merged
                     raise RtcError(f"bridge rejected RTC merge: {merged.detail or merged.event_type}")
                 stage_merge_ms = (time.monotonic() - stage_started) * 1000.0
+                full_latency_ms = (time.monotonic() - checkpoint_received_monotonic) * 1000.0
+                _record_rtc_delay_sample(
+                    estimator,
+                    full_latency_ms,
+                    effective_knot_hz,
+                    source=f"request:{request_id}",
+                )
+                overhead_ema_ms = 0.7 * overhead_ema_ms + 0.3 * max(
+                    0.0, full_latency_ms - rtc_timing["wall_ms"]
+                )
                 LOGGER.info(
                     "RTC merged request=%s d_actual=%s version=%d stage_send_ms=%.3f stage_merge_ms=%.3f "
+                    "full_latency_ms=%.1f "
                     "boundary_velocity_jump_rad=%s boundary_acceleration_jump_rad=%s "
                     "blend_duration_knots=%s blend_max_velocity_rad_s=%s "
                     "blend_max_acceleration_rad_s2=%s blend_max_jerk_rad_s3=%s",
@@ -2443,6 +2503,7 @@ def _run_trajectory_schedule(
                     merged.timeline_version,
                     stage_send_ms,
                     stage_merge_ms,
+                    full_latency_ms,
                     merged.boundary_velocity_jump_rad,
                     merged.boundary_acceleration_jump_rad,
                     merged.blend_duration_knots,
@@ -2721,7 +2782,7 @@ def _run_trajectory_schedule(
                         inference_count += 1
                         sample = _record_rtc_delay_sample(
                             estimator,
-                            bootstrap_timing["wall_ms"],
+                            bootstrap_timing["wall_ms"] + overhead_ema_ms,
                             effective_knot_hz,
                             source=f"recovery_bootstrap:{rtc_recovery_count}",
                         )
