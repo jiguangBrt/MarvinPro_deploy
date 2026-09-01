@@ -167,6 +167,7 @@ def _bare_node():
     node._trajectory_hold_action = None
     node._trajectory_loaded_monotonic = None
     node._trajectory_deadline_monotonic = None
+    node._trajectory_chunk_timeout_s = None
     node._timeline_version = 7
     node._phase = None
     node._joints_t = None
@@ -193,6 +194,7 @@ def _bare_node():
     node._gripper_r_mos_temperature = None
     node._gripper_l_motor_temperature = None
     node._gripper_r_motor_temperature = None
+    node._input_mode_publisher_alive_locked = lambda now: True
     return node
 
 
@@ -247,6 +249,7 @@ def _ready_trajectory_node(clock):
         motion_gate_open=True,
         gate_reason="ready",
     )
+    node._input_mode_publisher_alive_locked = lambda now: True
     return node
 
 
@@ -334,6 +337,54 @@ def test_motion_gate_requires_fresh_gripper_feedback():
     ready, reason = node._readiness_gate_locked(10.1)
     assert not ready
     assert reason == "right gripper feedback is stale"
+
+
+def test_motion_gate_tracks_input_mode_publisher_liveness(monkeypatch):
+    # /tj/control/input_mode is latched: a crashed backend leaves the last
+    # Custom value looking fresh, so the gate must consult the ROS graph.
+    publishers = [1]
+    monkeypatch.setattr(
+        robot_bridge.MarvinBridgeNode,
+        "count_publishers",
+        lambda self, topic: publishers[0],
+        raising=False,
+    )
+    node = _bare_node()
+    node.allow_motion = True
+    node._client_connected = True
+    node._joints = (0.0,) * 14
+    node._joints_t = 10.0
+    node.max_state_age_s = 0.20
+    node._gripper_l = 0.4
+    node._gripper_r = 0.7
+    node._gripper_l_t = node._gripper_r_t = 10.0
+    node._input_mode = 3
+    node._robot_state = node._arm_state = (3, 3)
+    node._robot_state_t = node._arm_state_t = 10.0
+    node.max_status_age_s = 0.50
+    del node._input_mode_publisher_alive_locked  # exercise the real method
+    node._input_mode_publisher_count = None
+    node._input_mode_publisher_count_t = 0.0
+
+    def set_fresh(now: float) -> None:
+        node._joints_t = now
+        node._gripper_l_t = node._gripper_r_t = now
+        node._robot_state_t = node._arm_state_t = now
+
+    set_fresh(10.0)
+    ready, _ = node._readiness_gate_locked(10.1)
+    assert ready
+
+    # The publisher is gone, but the 1 s graph-query cache still holds the
+    # previous count until the refresh interval elapses.
+    publishers[0] = 0
+    set_fresh(10.4)
+    ready, _ = node._readiness_gate_locked(10.5)
+    assert ready
+    set_fresh(11.1)
+    ready, reason = node._readiness_gate_locked(11.2)
+    assert not ready
+    assert reason == "input_mode publisher is not live"
 
 
 def test_rejection_event_can_precede_trajectory_session():
@@ -1092,6 +1143,7 @@ def test_fake_bridge_checkpoint_resume_and_atomic_rtc_merge(monkeypatch):
         motion_gate_open=True,
         gate_reason="ready",
     )
+    node._input_mode_publisher_alive_locked = lambda now: True
     old_knots = tuple(
         _arm_action(index * 0.005) for index in range(robot_bridge.RTC_HORIZON)
     )
@@ -1367,3 +1419,177 @@ def test_fake_bridge_c2_reject_hold_sync_bootstrap_and_merge(monkeypatch):
     assert merged.actual_delay_steps == 1
     assert node._trajectory_session_id == "recovery-session"
     assert node._trajectory_plan_id == "recovered-plan"
+
+
+def test_timed_chunk_resume_rearms_chunk_deadline(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(robot_bridge, "_now", lambda: clock[0])
+    node = _ready_trajectory_node(clock)
+    knots = tuple(_arm_action(index * 0.005) for index in range(robot_bridge.RTC_HORIZON))
+    node.accept_command(
+        robot_bridge.LoadTrajectoryCommand(
+            command_id=1,
+            observation_seq=1,
+            session_id="session",
+            plan_id="plan",
+            expected_timeline_version=0,
+            knots=knots,
+            knot_hz=5.0,
+            checkpoint_horizon=robot_bridge.RTC_EXECUTION_HORIZON,
+            execute=True,
+            chunk_timeout_s=5.0,
+        )
+    )
+    assert node._trajectory_deadline_monotonic == 105.0
+
+    _drive_fake_bridge_until(node, clock, "checkpoint_ready")
+    # The settled checkpoint consumes and clears the deadline.
+    assert node._trajectory_deadline_monotonic is None
+
+    node.accept_command(
+        robot_bridge.ResumeTrajectoryCommand(
+            command_id=2,
+            session_id="session",
+            plan_id="plan",
+            timeline_version=1,
+            checkpoint_id=1,
+            request_id="request",
+            predicted_delay_steps=2,
+        )
+    )
+
+    assert node._trajectory_deadline_monotonic == clock[0] + 5.0
+
+
+def test_rtc_merge_rearms_chunk_deadline():
+    node = _active_rtc_deadline_node("wait")
+    node._trajectory_chunk_timeout_s = 5.0
+    node._trajectory_deadline_monotonic = 0.5  # stale, already in the past
+
+    node._advance_trajectory_locked(1.0, 0.20, 1.0)
+    assert node._pause_kind == "rtc_deadline"
+    node._validate_trajectory_knots_locked = lambda timeline: None
+    node._governor = types.SimpleNamespace(reset=lambda: None)
+    node._accept_stage_rtc_locked(
+        robot_bridge.StageRtcChunkCommand(
+            command_id=2,
+            session_id="session",
+            base_plan_id="plan",
+            replacement_plan_id="replacement",
+            timeline_version=1,
+            checkpoint_id=1,
+            request_id="request",
+            predicted_delay_steps=1,
+            execution_horizon=6,
+            actions=tuple(_action(0.07 + index * 0.001) for index in range(10)),
+        ),
+        1.1,
+    )
+
+    assert node._events[-1].event_type == "rtc_merged"
+    assert node._trajectory_deadline_monotonic == 1.1 + 5.0
+
+
+def test_rtc_merge_without_chunk_timeout_keeps_deadline_disarmed():
+    node = _active_rtc_deadline_node("wait")
+    assert node._trajectory_chunk_timeout_s is None
+    assert node._trajectory_deadline_monotonic is None
+
+    node._advance_trajectory_locked(1.0, 0.20, 1.0)
+    node._validate_trajectory_knots_locked = lambda timeline: None
+    node._governor = types.SimpleNamespace(reset=lambda: None)
+    node._accept_stage_rtc_locked(
+        robot_bridge.StageRtcChunkCommand(
+            command_id=2,
+            session_id="session",
+            base_plan_id="plan",
+            replacement_plan_id="replacement",
+            timeline_version=1,
+            checkpoint_id=1,
+            request_id="request",
+            predicted_delay_steps=1,
+            execution_horizon=6,
+            actions=tuple(_action(0.07 + index * 0.001) for index in range(10)),
+        ),
+        1.1,
+    )
+
+    assert node._events[-1].event_type == "rtc_merged"
+    assert node._trajectory_deadline_monotonic is None
+
+
+def test_hard_freeze_without_deadline_pins_last_sent_target(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(robot_bridge, "_now", lambda: clock[0])
+    node = _ready_trajectory_node(clock)
+    knots = tuple(_arm_action(index * 0.05) for index in range(robot_bridge.RTC_HORIZON))
+    node.accept_command(
+        robot_bridge.LoadTrajectoryCommand(
+            command_id=1,
+            observation_seq=1,
+            session_id="session",
+            plan_id="plan",
+            expected_timeline_version=0,
+            knots=knots,
+            knot_hz=5.0,
+            checkpoint_horizon=robot_bridge.RTC_HORIZON,
+            execute=True,
+        )
+    )
+    assert node._trajectory_deadline_monotonic is None
+    node._handoff_anchor = None
+    node._handoff_phase = None
+    node._phase = 10.0
+    node._raw_reference = knots[10]
+    previous_target = _arm_action(0.01)
+    node._sent_target = previous_target
+    # Measured pose is far from the reference: governor hard-freezes.
+    node._joints = (0.0,) * 14
+    node._joints_t = node._gripper_l_t = node._gripper_r_t = clock[0]
+    node._robot_state_t = node._arm_state_t = node._heartbeat_t = clock[0]
+
+    with node._lock:
+        target, _ = node._trajectory_target_locked(clock[0])
+
+    # No deadline: stay in the session, but publish the pinned previous target
+    # instead of a fresh clip toward the measured pose.
+    assert target == previous_target
+    assert node._sent_target == previous_target
+    assert node._trajectory_session_id == "session"
+    assert all(event.event_type != "fatal_holding" for event in node._events)
+
+
+def test_heartbeat_version_skew_still_proves_liveness(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(robot_bridge, "_now", lambda: clock[0])
+    node = _ready_trajectory_node(clock)
+    knots = tuple(_arm_action(0.0) for _ in range(robot_bridge.RTC_HORIZON))
+    node.accept_command(
+        robot_bridge.LoadTrajectoryCommand(
+            command_id=1,
+            observation_seq=1,
+            session_id="session",
+            plan_id="plan",
+            expected_timeline_version=0,
+            knots=knots,
+            knot_hz=5.0,
+            checkpoint_horizon=robot_bridge.RTC_HORIZON,
+            execute=True,
+        )
+    )
+    assert node._timeline_version == 1
+    node._heartbeat_t = 99.9
+
+    # Client still heartbeats the pre-merge version while it processes the event.
+    node.accept_command(robot_bridge.TrajectoryHeartbeat(session_id="session", timeline_version=0))
+
+    assert node._heartbeat_t == 100.0
+    assert "timeline version mismatch" in node._last_command_status
+    assert node._trajectory_session_id == "session"
+
+    # A foreign session must not refresh liveness.
+    node._heartbeat_t = 99.9
+    node.accept_command(robot_bridge.TrajectoryHeartbeat(session_id="other", timeline_version=1))
+
+    assert node._heartbeat_t == 99.9
+    assert "session mismatch" in node._last_command_status

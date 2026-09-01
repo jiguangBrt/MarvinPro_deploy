@@ -121,6 +121,10 @@ QOS_INPUT_MODE = QoSProfile(
     durability=DurabilityPolicy.TRANSIENT_LOCAL,
     history=HistoryPolicy.KEEP_LAST,
 )
+# How often the readiness gate re-queries the ROS graph for input_mode
+# publisher liveness. The topic is latched (see QOS_INPUT_MODE), so the graph
+# query is the only liveness signal; 1 s keeps it cheap at the 100 Hz gate.
+_INPUT_MODE_LIVENESS_REFRESH_S = 1.0
 QOS_COMMAND = QoSProfile(
     depth=1,
     reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -203,6 +207,8 @@ class MarvinBridgeNode(Node):
         self._gripper_r_motor_temperature: float | None = None
         self._input_mode: int | None = None
         self._input_mode_t: float | None = None
+        self._input_mode_publisher_count: int | None = None
+        self._input_mode_publisher_count_t = 0.0
         self._robot_state: tuple[int, ...] | None = None
         self._robot_state_t: float | None = None
         self._arm_state: tuple[int, ...] | None = None
@@ -253,6 +259,7 @@ class MarvinBridgeNode(Node):
         self._trajectory_hold_action: tuple[float, ...] | None = None
         self._trajectory_loaded_monotonic: float | None = None
         self._trajectory_deadline_monotonic: float | None = None
+        self._trajectory_chunk_timeout_s: float | None = None
 
         self.create_subscription(JointState, TOPIC_JOINT_STATES, self._on_joint_state, QOS_SENSOR)
         self.create_subscription(
@@ -349,6 +356,19 @@ class MarvinBridgeNode(Node):
             self._arm_state = tuple(int(value) for value in msg.data)
             self._arm_state_t = _now()
 
+    def _input_mode_publisher_alive_locked(self, now: float) -> bool:
+        # TOPIC_INPUT_MODE is TRANSIENT_LOCAL latched: the backend publishes on
+        # mode change only, so message age cannot detect a dead publisher (the
+        # latched value would look fresh forever). The ROS graph can: a crashed
+        # backend drops its publisher registration.
+        if (
+            self._input_mode_publisher_count is None
+            or now - self._input_mode_publisher_count_t >= _INPUT_MODE_LIVENESS_REFRESH_S
+        ):
+            self._input_mode_publisher_count = self.count_publishers(TOPIC_INPUT_MODE)
+            self._input_mode_publisher_count_t = now
+        return self._input_mode_publisher_count > 0
+
     def _readiness_gate_locked(self, now: float) -> tuple[bool, str]:
         if not self.allow_motion:
             return False, "bridge was started without --allow-motion"
@@ -368,6 +388,8 @@ class MarvinBridgeNode(Node):
             return False, "right gripper feedback is stale"
         if self._input_mode != CUSTOM_INPUT_MODE:
             return False, f"input_mode={self._input_mode}, expected {CUSTOM_INPUT_MODE} (Custom)"
+        if not self._input_mode_publisher_alive_locked(now):
+            return False, "input_mode publisher is not live"
         if self._robot_state != READY_STATE:
             return False, f"robot_state={self._robot_state}, expected {READY_STATE}"
         if self._arm_state != READY_STATE:
@@ -566,6 +588,7 @@ class MarvinBridgeNode(Node):
         self._trajectory_hold_action = None
         self._trajectory_loaded_monotonic = None
         self._trajectory_deadline_monotonic = None
+        self._trajectory_chunk_timeout_s = None
         self._governor.reset()
         self._clear_target_locked(status)
 
@@ -821,6 +844,7 @@ class MarvinBridgeNode(Node):
         self._pending_rtc = None
         self._trajectory_loaded_monotonic = None
         self._trajectory_deadline_monotonic = None
+        self._trajectory_chunk_timeout_s = None
         self._governor.reset()
         self._last_command_id = command_id
         self._last_command_status = f"holding fixed position: {reason}"
@@ -919,6 +943,7 @@ class MarvinBridgeNode(Node):
         self._pending_rtc = None
         self._trajectory_hold_action = None
         self._trajectory_loaded_monotonic = now
+        self._trajectory_chunk_timeout_s = message.chunk_timeout_s
         self._trajectory_deadline_monotonic = (
             None if message.chunk_timeout_s is None else now + message.chunk_timeout_s
         )
@@ -1002,6 +1027,11 @@ class MarvinBridgeNode(Node):
         self._inference_invalid = False
         self._pending_rtc = None
         self._checkpoint_stable_since = None
+        # A resume starts a fresh chunk: re-arm the per-chunk deadline so chunks
+        # after the first keep their timeout protection.
+        self._trajectory_deadline_monotonic = (
+            None if self._trajectory_chunk_timeout_s is None else now + self._trajectory_chunk_timeout_s
+        )
         self._last_command_id = message.command_id
         self._last_command_status = f"resumed trajectory for RTC request {message.request_id}"
         self._emit_event_locked(
@@ -1115,6 +1145,11 @@ class MarvinBridgeNode(Node):
         actual_delay = self._actual_delay_steps
         self._actual_delay_steps = 0
         self._pending_rtc = None
+        # The merged replacement is a fresh chunk: re-arm the per-chunk deadline.
+        # The old one may already be in the past once _checkpoint_emitted resets.
+        self._trajectory_deadline_monotonic = (
+            None if self._trajectory_chunk_timeout_s is None else now + self._trajectory_chunk_timeout_s
+        )
         self._governor.reset()
         self._last_command_status = f"merged RTC plan {message.replacement_plan_id} after {actual_delay} steps"
         self._emit_event_locked(
@@ -1266,6 +1301,11 @@ class MarvinBridgeNode(Node):
                     if message.session_id != self._trajectory_session_id:
                         raise SafetyError("heartbeat session mismatch")
                     if message.timeline_version != self._timeline_version:
+                        # Version skew is expected while the client switches to a
+                        # freshly bumped timeline version (load/merge/hold). A
+                        # session-matching heartbeat still proves liveness, so
+                        # refresh the timestamp before rejecting the stale version.
+                        self._heartbeat_t = now
                         raise SafetyError("heartbeat timeline version mismatch")
                     self._heartbeat_t = now
                 except (ProtocolError, SafetyError) as exc:
@@ -1651,6 +1691,7 @@ class MarvinBridgeNode(Node):
 
         tracking_error = self._arm_error(raw, self._joints)
         servo_error = self._arm_error(target, self._joints)
+        previous_target = self._sent_target
         decision = self._governor.update(
             tracking_error,
             state_stale=state_stale,
@@ -1692,6 +1733,15 @@ class MarvinBridgeNode(Node):
                     final_error_rad=final_error,
                 )
                 return measured, self._last_command_id
+            if previous_target is not None:
+                # No chunk deadline (RTC mode): do not escalate to fatal hold, but
+                # pin the published target. Re-clipping toward the measured pose
+                # every tick would let the target chase the arm if it is pushed
+                # or drifts while frozen.
+                target = previous_target
+                servo_error = self._arm_error(target, self._joints)
+                self._sent_target = target
+                self._servo_error_rad = servo_error
         self._advance_trajectory_locked(now, dt, self._phase_rate)
         self._update_pause_settle_locked(
             now,

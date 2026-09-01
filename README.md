@@ -33,6 +33,7 @@ rollout 客户端运行在本机；机器人控制器只运行轻量 ROS bridge�
 ## 本地测试
 
 ```bash
-cd /home/jh/TianJi_Marvinpro/MarvinPro_deploy
-PYTHONPATH=src python3 -m unittest discover -s tests -v
+cd /home/jh/Openpi_deploy
+uv sync
+PYTHONPATH=src .venv/bin/python -m pytest tests/ -q
 ```

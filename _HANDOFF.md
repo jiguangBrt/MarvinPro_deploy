@@ -230,7 +230,8 @@ uv run python -m marvinpro_deploy.rollout_client \
 - 真机动作要同时满足以下门控，任一失效 bridge 清空目标并停止发布：
   1. bridge 使用 `--allow-motion` 启动；
   2. rollout 使用 `--execute` 并人工输入单个大写 `E`；
-  3. `input_mode == 3`；
+  3. `input_mode == 3`，且 input_mode publisher 在 ROS graph 中存活（该 topic 为 latched，只在模式切换时
+     发布，无法用消息时效判断 publisher 死活；bridge 以 1 s 缓存的 `count_publishers` 查询代替）；
   4. `/tj/info/robot_state == [3,3]` 且 `/tj/info/arm_state == [3,3]`（关节阻抗模式）；
   5. 关节和左右夹爪 feedback 新鲜，归一化夹爪实测值在 `[0,1]`，policy action 为 finite `(16,)`；
   6. 客户端和 bridge 的臂关节目标相对最新反馈最多 `0.16 rad`；
@@ -261,7 +262,10 @@ uv run python -m marvinpro_deploy.rollout_client \
   wall，15 Hz 下系统性低估约 1 个 knot，recovery 重建 epoch 后 d_pred 掉到 3 会造成每次 merge
   都在边界外（2026-08-28 18:07 运行三次 rtc_late 中止的根因）。
 - trajectory session 每 `100 ms` 发送 heartbeat；bridge 超过 `250 ms` 未收到会清空 trajectory 并
-  停止发布。旧的 discrete/prefetch 仍使用 `ActionCommand`。
+  停止发布。旧的 discrete/prefetch 仍使用 `ActionCommand`。注意（2026-09-01 起）：session 匹配但
+  timeline 版本滞后的 heartbeat 也会刷新存活时间戳——这是 load/merge/hold 后客户端切换心跳版本的正常
+  窗口；代价是事件线程卡死但心跳线程仍活的客户端不再触发心跳超时，此时轨迹靠 plan 耗尽自然转 hold
+  兜底。
 - protocol v10 必须同时更新控制器上的 `MarvinPro_deploy` 和本机客户端。夹爪状态使用归一化实测
   feedback；RTC 的 tracking governor 只使用 14 个机械臂关节误差，夹爪不参与机械臂到位判定。
 - 每次 RTC 请求日志分段记录 observation preparation、request build/serialization、transport round
@@ -349,6 +353,18 @@ cd /home/jh/TianJi_Marvinpro/MarvinPro_deploy
   （日志目录名带任务描述 `rtc_redcones_600s_rec20_<时间>`；client 代码已变，bridge 可
   沿用）；观察长时间运行下 recovery 频率、`ignoring stale bridge event` 次数、叠放精度，
   以及 `(1,12)` 是否在抓取/搬运阶段复现。
+- **2026-09-01 中优先级修复批次**（接 bc18107 的 P1 修复，已经过 review）：bridge 三处——
+  ① `chunk_timeout_s` deadline 在 resume/merge 后重新武装（旧代码只在 Load 时武装，第二个
+  chunk 起失去超时保护，且 continuous checkpoint 下会误触发 `chunk_timed_out`）；
+  ② 版本滞后的 session heartbeat 仍刷新存活时间戳（语义变化见上文 heartbeat 条目）；
+  ③ tracking governor hard-freeze 且无 chunk deadline 时（RTC 模式）钉住最后一次发送目标，
+  不再每 tick 向实测位置重新 clip（旧行为下机械臂被推动/漂移时目标会跟随爬移）；
+  ④ 新增 input_mode publisher 活性门控（latched topic 无法用消息时效判断 publisher 死活，
+  改为 1 s 缓存的 ROS graph `count_publishers` 查询，backend 崩溃约 1 s 内关闭 gate）。
+  client 侧：删除约 430 行不可达的本地 synchronized 死代码（`_run_synchronized_schedule`
+  及其 helper）；`pyproject.toml` 补齐 `openpi-client`（uv sources 指向
+  `../OpenPI_UR/openpi/packages/openpi-client`）与 dev 组 pytest，本仓库 venv 可独立跑
+  全部测试（129 passed）。
 
 ## 待办与已知问题
 
@@ -442,6 +458,72 @@ fallback 和退出固定 hold 通过回归；真机任务成功率和完成时�
 目标；clipping 不能被统计后忽略；未通过离线测试和 dry-run 前不得运行 RTC 真机动作；不修改官方
 低层控制器参数，不把提高发布频率当作跟踪修复。
 
+### 真机验证三轮计划（2026-09-01）
+
+把当前所有需要真机验证的点整合为最多三轮 A/B 终端运行（终端 A = 控制器侧 bridge，终端 B = 本机
+client）。每轮只建立一次机器人现场状态，多段 client 运行顺序执行，每段独立 RUN_DIR。bridge 代码
+本次有改动，**第 2 轮首次启动 motion bridge 时脚本自动 rsync 同步新代码**；之后若 bridge 未重启
+可沿用。标准命令（doctor / dry-run / synchronized / shadow / merge1）见上文“真机快速开始”第 0-4
+节，此处只写差异与观察点。
+
+验证点 -> 轮次对照：legacy 缩进重排 smoke、全链路连通、夹爪标定（可选） -> 第 1 轮；
+synchronized/shadow/merge1->2 验收、hard-freeze 钉目标、input_mode 活性门控、(1,12) 观察 -> 第 2 轮；
+heartbeat 版本偏差、600 s 长跑（merge 10+ soak、recovery/stale-event 统计、d_pred/d_actual 约束、
+叠放偏差复查） -> 第 3 轮。
+
+#### 第 1 轮：无运动链路轮（机器人上电 + Apex 启动 Camera，不切 Custom/阻抗）
+
+- 终端 A：先 `--doctor --duration 8` 只读预检（所有输入有消息即可，此阶段 input_mode 允许
+  None/0）；如需夹爪标定，确认 bridge 已停后跑
+  `./scripts/record_gripper_feedback_on_controller.sh`（打开->闭合夹物->打开，看
+  changed/distinct/span/max_step）；然后启动不带 `--allow-motion` 的 dry-run bridge。
+- 终端 B：按“真机快速开始”第 1 节跑 dry-run（默认 prefetch 即 legacy 路径，10 s）。一次运行同时
+  覆盖：① 全链路——policy 输出 `(20,16)` finite、单次请求 < 2 s、相机/关节/夹爪 age 不超限、
+  `gripper_state_source=measured_feedback`；② legacy 路径 smoke——死代码删除+缩进重排后推理循环
+  正常跑完。注意 dry-run 覆盖不到 legacy 的 ActionCommand 发送段，该段仅靠代码阅读确认逻辑未变；
+  legacy 已非生产路径，不再安排带运动的 legacy 验收。
+
+#### 第 2 轮：受控运动 + 安全功能注入轮（Custom + 关节阻抗，短 episode）
+
+前提：Apex 完成 Robot Ready、Impedance Mode、安全起始姿态、Camera；切 Custom 后确认
+`input_mode=3`、状态 `(3,3)`；急停可触及。终端 A 启动 motion bridge（`--allow-motion
+--publish-hz 100 --local-log`），终端 B 按序：
+
+1. synchronized 回归 10 s（快速开始第 2 节）——验证新 bridge 轨迹路径基本运动正常。
+2. RTC shadow 20 s（第 3 节）。
+3. RTC 实际 merge `--max-rtc-merges 1`（第 4 节）；干净无抽动则接 `--max-rtc-merges 2`。
+4. 注入测试（在第 3 步或单独一次 20 s run 内进行）：
+   - **hard-freeze 钉目标**：free-space 段轻推单臂使 tracking error >= `0.16 rad` 触发 hard
+     freeze；telemetry 中 `sent_target` 必须保持 pinned、不随反馈爬移（旧行为会跟随爬移）；松手后
+     误差 <`0.12 rad` 解冻，回到 clip 包络的阶跃 <=`0.16 rad` 且操作员可接受。
+   - **input_mode 活性门控**：运行中 Apex 切 None -> gate 立即关闭（已有语义回归）；切回 Custom ->
+     恢复；全程正常运动不得误触发 `gate_reason="input_mode publisher is not live"`。可选进阶（需
+     现场安全确认后）：重启控制器上发布 `/tj/control/input_mode` 的 backend 节点，publisher 消失
+     约 1 s 内 gate 应关闭、节点恢复后自动放开。
+5. 全程观察 `robot_state` 是否再现 `(1,12)`（尤其抓取/搬运段）。
+
+#### 第 3 轮：600 s 长跑验收轮（15 Hz 原速 RTC）
+
+命令按 `cmd_tmp.md` 2026-08-31 09:47 段（`--episode-seconds 600 --max-rtc-recoveries 20`、
+time-scale 1，RUN_DIR 命名 `rtc_redcones_600s_rec20_<时间>`）。观察点：
+
+- **heartbeat 版本偏差修复**：全程不得出现误判的 heartbeat 超时清轨迹；若出现客户端事件线程卡死
+  但心跳线程仍活的僵尸场景，确认轨迹靠 plan 耗尽自然转 hold 兜底，而不是被误清。
+- recovery 频率、`ignoring stale bridge event` 次数（应约等于 0）。
+- `d_pred` 稳定为 4；所有成功 merge 满足 `1 <= d_actual <= d_pred <= 4`。
+- 叠放精度：复查此前厘米级偏差是否为 sync 模式 chunk 间停顿伪影。
+- `(1,12)` 是否复现。600 s/15 Hz 约 800 次 merge，自然覆盖 merge 10+ soak，不再单独排 20-merge
+  soak。
+
+不排入轮次（保持登记，无真机入口或外部依赖）：
+
+- chunk_timeout re-arm：客户端没有任何路径组合 `ResumeTrajectoryCommand + chunk_timeout_s`
+  （RTC 的 Load 不传该参数），属协议层防御，待未来 timed-sync 启用 `chunk_timeout_s` 时单独验证。
+- `(1,12)` 状态码定义：待机器人厂家确认。
+- 2026-08-10 起的 merge 拒绝注入清单（延迟突增/乱序/重复/旧 timeline 响应）：需要专用故障注入
+  手段，长期项，长跑日志中顺带留意。
+- 低优先级未修项（见下方登记）：修复后再排验证。
+
 ### 当前待办汇总
 
 - [ ] **2026-08-28 真机中止待厂家确认（robot_state=(1,12)）**：15 Hz 原速 RTC 运行
@@ -453,7 +535,8 @@ fallback 和退出固定 hold 通过回归；真机任务成功率和完成时�
   夹持。状态码 `(1,12)` 的定义在控制器固件侧，需向机器人厂家确认含义与触发条件后再决定对策
   （历史上曾记录到 `(2,3)`/`(1,3)` 瞬时抖动并自愈，本次未恢复）。重连机器人后先确认状态恢复
   `(3,3)`、Apex 无报警再重跑，复现时记录是否在抓取/搬运阶段。进展：18:01 重跑 60 s 全程
-  `(3,3)` 未复现（`logs/rtc_20260828_180126`）；厂家确认状态码含义前保持观察。
+  `(3,3)` 未复现（`logs/rtc_20260828_180126`）；厂家确认状态码含义前保持观察（复现观察已排入
+  三轮计划第 2、3 轮）。
 - [x] **recovery 竞态（18:07 运行第三次 recovery，2026-08-31 已修复，commit bc18107）**：
   hold 锁存命令被 bridge `trajectory_command_rejected` 拒绝时 client 直接升级
   `fatal_safety_hold`，但 bridge 实际已自行安全 hold（`measured_holding` event）。
@@ -464,11 +547,35 @@ fallback 和退出固定 hold 通过回归；真机任务成功率和完成时�
   现在抛出 `ObservationLagError` 并在拒绝事件中携带 `observation_lag`，RTC
   recovery 判为可恢复并重新观测重试）。pytest 121 passed；竞态的端到端有效性
   仍需真机 RTC 长跑确认。
+- [ ] **真机验证 2026-09-01 修复批次**（均只有单测覆盖，无法离线验证；已排入上方三轮计划，
+  ②③在第 2 轮注入测试，①在第 3 轮长跑）：① heartbeat 版本
+  偏差修复——真机 RTC 长跑中观察是否仍出现误判的 heartbeat 超时清轨迹，以及版本长期不同步的
+  客户端是否如预期靠 plan 耗尽转 hold 兜底；② hard-freeze 钉目标——阻抗模式下机械臂被推动或
+  漂移时确认保持 pinned 目标不跟随爬移，解冻瞬间从 pinned 值回到 clip 包络的阶跃（上限
+  0.16 rad）操作员可接受；③ input_mode publisher 活性门控——验证 backend 重启/崩溃时 gate
+  约 1 s 内关闭、正常运行不误触发；首次带此改动的真机运行前先 dry-run 观察 `gate_reason`。
+- [ ] **chunk_timeout re-arm 暂无真机链路覆盖**：当前客户端没有任何路径组合
+  `ResumeTrajectoryCommand + chunk_timeout_s`（RTC 的 Load 不传该参数），该修复仅单测覆盖，
+  属协议层防御；若未来 timed-sync 启用 `chunk_timeout_s` 需单独真机验证（三轮计划不排入，
+  见计划末尾说明）。
+- [ ] legacy discrete/prefetch 默认路径在死代码删除时经过大规模缩进重排（逻辑未变），下次
+  真机运行前跑一次 dry-run smoke 确认（已排入上方三轮计划第 1 轮）。
+- [ ] 低优先级未修项登记（2026-09-01 review 发现，均未修）：`--joint-limit-margin-rad` 两端
+  不校验非负（负值会把 URDF 限位放宽到限位之外，是唯一方向不 fail-safe 的未校验参数）；
+  telemetry writer 线程异常会导致 `close()` 的 queue join 永久挂起主线程；delay estimator
+  冷启动空样本（warmup/初次推理均被拒）时 `predicted_steps()` 的 RtcError 被判不可恢复
+  fatal；版本不匹配的 `StopCommand` 只清 legacy target 不清活动轨迹会话；Load 时
+  `knots[0]` 距实测位置无静态偏差检查（步长校验恒为空转，靠运行时 0.16 包络 + governor
+  兜底）；臂命令 BEST_EFFORT/depth1 与夹爪 RELIABLE/depth10 的 QoS 不一致；4 个 ROS
+  publish 在控制锁内执行；merge 事件的 boundary 跳变诊断基于无 blend 的差分，系统性
+  高估实际跳变。
 - [ ] 按 [`ROBOT_RTC_TESTS.md`](ROBOT_RTC_TESTS.md) 执行新 checkpoint 下的 dry-run ->
   synchronized -> RTC shadow -> `--max-rtc-merges 1` 真机验收；merge 数按 1 -> 2 -> 10 逐级放大，
-  不直接做 20-merge soak；每次使用独立 RUN_DIR，merge 与 fallback episode 分开统计。
+  不直接做 20-merge soak；每次使用独立 RUN_DIR，merge 与 fallback episode 分开统计。（已整合进
+  上方三轮计划：dry-run 在第 1 轮，synchronized/shadow/merge 1->2 在第 2 轮，merge 10+ soak 由
+  第 3 轮 600 s 长跑自然覆盖。）
 - [ ] RTC 实际 merge 真机运行后，复查堆叠放置数厘米偏差是否为 sync 模式 chunk 间停顿伪影
-  （见 [`BASELINE_RUN.md`](BASELINE_RUN.md) A/B 记录）。
+  （见 [`BASELINE_RUN.md`](BASELINE_RUN.md) A/B 记录；已排入三轮计划第 3 轮顺带观察）。
 - [ ] 离线提取成功 merge 与失败 merge 的旧/新边界，按关节对比位置、速度、加速度和 jerk；评估
   更长但仍受约束的 C2 blend；不得再直接放宽 jerk 上限。
 - [ ] H10/H20 对比必须固定机械臂初始姿态、物体布局和两侧夹爪状态，gripper clipping 单独统计。

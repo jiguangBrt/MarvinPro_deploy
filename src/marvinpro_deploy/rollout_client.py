@@ -619,15 +619,6 @@ class PublisherSnapshot:
     latched_plan_action: tuple[float, ...] | None
 
 
-@dataclass(frozen=True)
-class TrackingResult:
-    observation: RobotObservation
-    elapsed_s: float
-    max_error_rad: float
-    final_error_rad: float
-    worst_joint: str
-
-
 def _reference_delta(reference, target) -> float | None:
     if reference is None or target is None:
         return None
@@ -1191,276 +1182,6 @@ def _wait_for_plan_threshold(
         plan.wait_until_at_most(threshold, stop, timeout_s=0.05)
         if publisher.error is not None:
             raise RolloutError(f"action publisher failed: {publisher.error}")
-
-
-def _check_runtime_observation(
-    observation: RobotObservation,
-    *,
-    max_source_age_s: float,
-) -> None:
-    validate_observation(observation, max_source_age_s)
-    if not observation.motion_gate_open:
-        raise RolloutError(f"robot motion gate closed: {observation.gate_reason}")
-    status = observation.last_command_status
-    if status.startswith("rejected") or "failed" in status:
-        raise RolloutError(f"bridge {status}")
-
-
-def _wait_for_plan_dispatch(
-    connection: RobotConnection,
-    publisher: ActionPublisher,
-    stop: threading.Event,
-    *,
-    target_plan_steps_sent: int,
-    timeout_s: float,
-    max_source_age_s: float,
-) -> PublisherSnapshot:
-    deadline = time.monotonic() + timeout_s
-    while not stop.is_set():
-        if publisher.error is not None:
-            raise RolloutError(f"action publisher failed: {publisher.error}")
-        snapshot = publisher.snapshot()
-        if snapshot.plan_steps_sent >= target_plan_steps_sent:
-            return snapshot
-        observation = connection.latest()
-        _check_runtime_observation(observation, max_source_age_s=max_source_age_s)
-        if time.monotonic() >= deadline:
-            raise RolloutError(
-                "timed out waiting for the complete policy chunk to be dispatched "
-                f"({snapshot.plan_steps_sent}/{target_plan_steps_sent} plan ticks)"
-            )
-        stop.wait(0.01)
-    raise RolloutError("rollout stopped while dispatching a policy chunk")
-
-
-def _tracking_error(target_action: tuple[float, ...], observation: RobotObservation) -> tuple[float, int]:
-    errors = np.abs(
-        np.asarray(action_arms(target_action), dtype=np.float64) - np.asarray(observation.joints, dtype=np.float64)
-    )
-    worst_index = int(np.argmax(errors))
-    return float(errors[worst_index]), worst_index
-
-
-def _wait_for_target_tracking(
-    connection: RobotConnection,
-    publisher: ActionPublisher,
-    stop: threading.Event,
-    *,
-    target_action: tuple[float, ...],
-    tolerance_rad: float,
-    settle_seconds: float,
-    timeout_s: float,
-    max_source_age_s: float,
-) -> TrackingResult:
-    started = time.monotonic()
-    deadline = started + timeout_s
-    stable_since: float | None = None
-    max_error = 0.0
-    final_error = math.inf
-    worst_index = 0
-    observation = connection.latest()
-    last_seq = observation.seq
-
-    while not stop.is_set():
-        if publisher.error is not None:
-            raise RolloutError(f"action publisher failed while tracking: {publisher.error}")
-        _check_runtime_observation(observation, max_source_age_s=max_source_age_s)
-        final_error, current_worst_index = _tracking_error(target_action, observation)
-        max_error = max(max_error, final_error)
-        worst_index = current_worst_index
-        now = time.monotonic()
-        if final_error <= tolerance_rad:
-            if stable_since is None:
-                stable_since = now
-            if now - stable_since >= settle_seconds:
-                return TrackingResult(
-                    observation=observation,
-                    elapsed_s=now - started,
-                    max_error_rad=max_error,
-                    final_error_rad=final_error,
-                    worst_joint=JOINT_NAMES[worst_index],
-                )
-        else:
-            stable_since = None
-        if now >= deadline:
-            raise RolloutError(
-                f"tracking timeout after {timeout_s:.1f}s: max error {final_error:.5f}rad "
-                f"at {JOINT_NAMES[worst_index]} (limit {tolerance_rad:.5f}rad)"
-            )
-        try:
-            observation = connection.wait_for_observation(timeout_s=min(0.5, deadline - now), newer_than=last_seq)
-            last_seq = observation.seq
-        except RolloutError as exc:
-            if "timed out waiting" not in str(exc):
-                raise
-    raise RolloutError("rollout stopped while waiting for target tracking")
-
-
-def _hold_target_and_reobserve(
-    connection: RobotConnection,
-    publisher: ActionPublisher,
-    stop: threading.Event,
-    *,
-    target_action: tuple[float, ...],
-    tolerance_rad: float,
-    hold_seconds: float,
-    timeout_s: float,
-    max_source_age_s: float,
-) -> tuple[RobotObservation, float]:
-    started = time.monotonic()
-    deadline = started + timeout_s
-    hold_started: float | None = None
-    max_error = 0.0
-    observation = connection.latest()
-    last_seq = observation.seq
-
-    while not stop.is_set():
-        if publisher.error is not None:
-            raise RolloutError(f"action publisher failed while holding: {publisher.error}")
-        _check_runtime_observation(observation, max_source_age_s=max_source_age_s)
-        error, _ = _tracking_error(target_action, observation)
-        max_error = max(max_error, error)
-        now = time.monotonic()
-        if error <= tolerance_rad:
-            if hold_started is None:
-                hold_started = now
-            if now - hold_started >= hold_seconds:
-                fresh = connection.wait_for_observation(
-                    timeout_s=min(1.0, max(0.01, deadline - now)),
-                    newer_than=last_seq,
-                    require_motion_gate=True,
-                )
-                _check_runtime_observation(fresh, max_source_age_s=max_source_age_s)
-                return fresh, max_error
-        else:
-            hold_started = None
-        if now >= deadline:
-            raise RolloutError(
-                f"hold did not remain inside {tolerance_rad:.5f}rad for "
-                f"{hold_seconds:.2f}s before the {timeout_s:.1f}s timeout"
-            )
-        try:
-            observation = connection.wait_for_observation(timeout_s=min(0.5, deadline - now), newer_than=last_seq)
-            last_seq = observation.seq
-        except RolloutError as exc:
-            if "timed out waiting" not in str(exc):
-                raise
-    raise RolloutError("rollout stopped while holding the tracked target")
-
-
-def _run_synchronized_schedule(
-    args: argparse.Namespace,
-    connection: RobotConnection,
-    policy,
-    plan: ActionPlan,
-    publisher: ActionPublisher,
-    stop: threading.Event,
-    episode_deadline: float,
-) -> int:
-    inference_count = 0
-    next_observation = connection.latest(args.max_observation_age)
-
-    while not stop.is_set() and time.monotonic() < episode_deadline:
-        observation = next_observation
-        _check_runtime_observation(observation, max_source_age_s=args.max_source_age)
-        if plan.remaining() != 0:
-            raise RolloutError("synchronized scheduler found a non-empty action queue before inference")
-
-        chunk_number = inference_count + 1
-        print(f"\nChunk {chunk_number}: fresh observation seq={observation.seq}; inferring...", flush=True)
-        actions, timing = infer_actions(policy, observation, args.prompt)
-        inference_count += 1
-        arrival_observation = connection.latest(args.max_observation_age)
-        _check_runtime_observation(arrival_observation, max_source_age_s=args.max_source_age)
-        before_append = publisher.snapshot()
-        feedback_action = build_state16(
-            arrival_observation.joints,
-            arrival_observation.gripper_raw_left,
-            arrival_observation.gripper_raw_right,
-        )
-        fallback_anchor = before_append.latched_plan_action or feedback_action
-        appended = plan.append_interpolated(
-            actions,
-            observation.seq,
-            args.execute_steps,
-            fallback_anchor=fallback_anchor,
-            model_hz=args.model_hz,
-            playback_time_scale=args.playback_time_scale,
-            command_hz=args.control_hz,
-        )
-        if appended.queued_steps != 0:
-            raise RolloutError(f"synchronized scheduler appended behind {appended.queued_steps} queued ticks")
-
-        boundary_delta = _arm_delta(actions[0], appended.anchor_action)
-        dispatch_target = before_append.plan_steps_sent + appended.added_steps
-        dispatch_timeout = appended.added_steps / args.control_hz + 2.0
-        print(
-            f"  Inference complete in {timing['wall_ms']:.1f}ms; "
-            f"executing {appended.added_steps} targets at {args.control_hz:.1f}Hz."
-        )
-        print(f"  First-knot delta from held target: {boundary_delta:.5f}rad.")
-        dispatched = _wait_for_plan_dispatch(
-            connection,
-            publisher,
-            stop,
-            target_plan_steps_sent=dispatch_target,
-            timeout_s=dispatch_timeout,
-            max_source_age_s=args.max_source_age,
-        )
-        print("  Chunk dispatched; holding its final target and waiting for arm tracking...", flush=True)
-        tracking = _wait_for_target_tracking(
-            connection,
-            publisher,
-            stop,
-            target_action=appended.final_action,
-            tolerance_rad=args.tracking_tolerance_rad,
-            settle_seconds=args.tracking_settle_seconds,
-            timeout_s=args.tracking_timeout,
-            max_source_age_s=args.max_source_age,
-        )
-        print(
-            f"  Target reached in {tracking.elapsed_s:.2f}s: "
-            f"final error={tracking.final_error_rad:.5f}rad "
-            f"({tracking.worst_joint}); holding for {args.post_track_hold_seconds:.2f}s."
-        )
-        next_observation, hold_max_error = _hold_target_and_reobserve(
-            connection,
-            publisher,
-            stop,
-            target_action=appended.final_action,
-            tolerance_rad=args.tracking_tolerance_rad,
-            hold_seconds=args.post_track_hold_seconds,
-            timeout_s=args.tracking_timeout,
-            max_source_age_s=args.max_source_age,
-        )
-        after_hold = publisher.snapshot()
-        chunk_arm_clipped = after_hold.arm_clipped - before_append.arm_clipped
-        print(
-            f"  Hold stable; fresh observation seq={next_observation.seq} captured. "
-            f"Arm-clipped ticks in this chunk: {chunk_arm_clipped}."
-        )
-        LOGGER.debug(
-            "sync_chunk_diag chunk=%d source_seq=%d arrival_seq=%d reobserve_seq=%d "
-            "wall_ms=%.1f added=%d boundary_delta=%.5f dispatch_plan_ticks=%d "
-            "track_elapsed=%.3f track_peak_error=%.5f track_final=%.5f "
-            "hold_max_error=%.5f arm_clipped_chunk=%d arm_clipped_total=%d",
-            chunk_number,
-            observation.seq,
-            arrival_observation.seq,
-            next_observation.seq,
-            timing["wall_ms"],
-            appended.added_steps,
-            boundary_delta,
-            dispatched.plan_steps_sent,
-            tracking.elapsed_s,
-            tracking.max_error_rad,
-            tracking.final_error_rad,
-            hold_max_error,
-            chunk_arm_clipped,
-            after_hold.arm_clipped,
-        )
-
-    return inference_count
 
 
 class _CommandIds:
@@ -3170,7 +2891,9 @@ def run(args: argparse.Namespace) -> int:
                 and (args.prefetch_steps > 0 if args.playback_mode == "discrete" else args.chunk_prefetch_seconds > 0)
             ),
             refresh_observation_seq=args.playback_mode == "interpolated",
-            hold_last_plan_action=args.rollout_schedule == "synchronized",
+            # Only discrete/prefetch schedules reach this publisher; the
+            # synchronized hold semantics live in the trajectory path above.
+            hold_last_plan_action=False,
             telemetry=telemetry,
         )
         publisher.start()
@@ -3181,129 +2904,118 @@ def run(args: argparse.Namespace) -> int:
         previous_diagnostic_underruns = publisher.snapshot().underruns
         interpolated_prefetch_steps = math.ceil(args.chunk_prefetch_seconds * args.control_hz)
 
-        if args.rollout_schedule == "synchronized":
-            inference_count = _run_synchronized_schedule(
-                args,
-                connection,
-                policy,
-                plan,
-                publisher,
-                stop,
-                episode_deadline,
-            )
-        else:
-            while not stop.is_set() and time.monotonic() < episode_deadline:
-                observation = connection.latest(args.max_observation_age)
-                validate_observation(observation, args.max_source_age)
-                if args.execute and not observation.motion_gate_open:
-                    raise RolloutError(f"robot motion gate closed: {observation.gate_reason}")
+        while not stop.is_set() and time.monotonic() < episode_deadline:
+            observation = connection.latest(args.max_observation_age)
+            validate_observation(observation, args.max_source_age)
+            if args.execute and not observation.motion_gate_open:
+                raise RolloutError(f"robot motion gate closed: {observation.gate_reason}")
+            if (
+                args.execute
+                and observation.last_command_id is not None
+                and observation.last_command_id != last_status_command
+            ):
+                last_status_command = observation.last_command_id
                 if (
-                    args.execute
-                    and observation.last_command_id is not None
-                    and observation.last_command_id != last_status_command
+                    observation.last_command_status.startswith("rejected")
+                    or "failed" in observation.last_command_status
                 ):
-                    last_status_command = observation.last_command_id
-                    if (
-                        observation.last_command_status.startswith("rejected")
-                        or "failed" in observation.last_command_status
-                    ):
-                        raise RolloutError(f"bridge {observation.last_command_status}")
+                    raise RolloutError(f"bridge {observation.last_command_status}")
 
-                actions, timing = infer_actions(policy, observation, args.prompt)
-                inference_count += 1
-                arrival_observation = connection.latest(args.max_observation_age)
-                publisher_snapshot = publisher.snapshot()
-                feedback_action = build_state16(
-                    arrival_observation.joints,
-                    arrival_observation.gripper_raw_left,
-                    arrival_observation.gripper_raw_right,
+            actions, timing = infer_actions(policy, observation, args.prompt)
+            inference_count += 1
+            arrival_observation = connection.latest(args.max_observation_age)
+            publisher_snapshot = publisher.snapshot()
+            feedback_action = build_state16(
+                arrival_observation.joints,
+                arrival_observation.gripper_raw_left,
+                arrival_observation.gripper_raw_right,
+            )
+            underruns_since_last = publisher_snapshot.underruns - previous_diagnostic_underruns
+            previous_diagnostic_underruns = publisher_snapshot.underruns
+            LOGGER.debug(
+                "inference=%d seq=%d shape=%s range=[%.5f, %.5f] wall=%.1fms policy=%s",
+                inference_count,
+                observation.seq,
+                tuple(actions.shape),
+                float(actions.min()),
+                float(actions.max()),
+                timing["wall_ms"],
+                timing["policy_timing"],
+            )
+            if args.playback_mode == "interpolated":
+                fallback_anchor = (
+                    feedback_action
+                    if publisher_snapshot.last_action is None or publisher_snapshot.last_was_hold
+                    else publisher_snapshot.last_action
                 )
-                underruns_since_last = publisher_snapshot.underruns - previous_diagnostic_underruns
-                previous_diagnostic_underruns = publisher_snapshot.underruns
+                appended = plan.append_interpolated(
+                    actions,
+                    observation.seq,
+                    args.execute_steps,
+                    fallback_anchor=fallback_anchor,
+                    model_hz=args.model_hz,
+                    playback_time_scale=args.playback_time_scale,
+                    command_hz=args.control_hz,
+                )
                 LOGGER.debug(
-                    "inference=%d seq=%d shape=%s range=[%.5f, %.5f] wall=%.1fms policy=%s",
+                    "chunk_append_diag inference=%d source_seq=%d arrival_seq=%d frame_lag=%d "
+                    "wall_ms=%.1f queued_before=%d added=%d underruns_since_last=%d "
+                    "last_was_hold=%s anchor_to_last=%s new_to_anchor=%s new_to_feedback=%s",
                     inference_count,
                     observation.seq,
-                    tuple(actions.shape),
-                    float(actions.min()),
-                    float(actions.max()),
+                    arrival_observation.seq,
+                    arrival_observation.seq - observation.seq,
                     timing["wall_ms"],
-                    timing["policy_timing"],
-                )
-                if args.playback_mode == "interpolated":
-                    fallback_anchor = (
-                        feedback_action
-                        if publisher_snapshot.last_action is None or publisher_snapshot.last_was_hold
-                        else publisher_snapshot.last_action
-                    )
-                    appended = plan.append_interpolated(
-                        actions,
-                        observation.seq,
-                        args.execute_steps,
-                        fallback_anchor=fallback_anchor,
-                        model_hz=args.model_hz,
-                        playback_time_scale=args.playback_time_scale,
-                        command_hz=args.control_hz,
-                    )
-                    LOGGER.debug(
-                        "chunk_append_diag inference=%d source_seq=%d arrival_seq=%d frame_lag=%d "
-                        "wall_ms=%.1f queued_before=%d added=%d underruns_since_last=%d "
-                        "last_was_hold=%s anchor_to_last=%s new_to_anchor=%s new_to_feedback=%s",
-                        inference_count,
-                        observation.seq,
-                        arrival_observation.seq,
-                        arrival_observation.seq - observation.seq,
-                        timing["wall_ms"],
-                        appended.queued_steps,
-                        appended.added_steps,
-                        underruns_since_last,
-                        publisher_snapshot.last_was_hold,
-                        (
-                            "n/a"
-                            if publisher_snapshot.last_action is None
-                            else f"{_arm_delta(appended.anchor_action, publisher_snapshot.last_action):.5f}"
-                        ),
-                        _candidate_deltas(actions, appended.anchor_action),
-                        _candidate_deltas(actions, feedback_action),
-                    )
-                    _wait_for_plan_threshold(
-                        plan,
-                        publisher,
-                        stop,
-                        threshold=interpolated_prefetch_steps,
-                        episode_deadline=episode_deadline,
-                    )
-                else:
-                    replacement = plan.replace(actions, observation.seq, args.execute_steps)
-                    old_next_to_last = (
+                    appended.queued_steps,
+                    appended.added_steps,
+                    underruns_since_last,
+                    publisher_snapshot.last_was_hold,
+                    (
                         "n/a"
-                        if replacement.old_next_action is None or publisher_snapshot.last_action is None
-                        else f"{_arm_delta(replacement.old_next_action, publisher_snapshot.last_action):.5f}"
-                    )
-                    wall_steps = float(timing["wall_ms"]) * args.control_hz / 1000.0
-                    LOGGER.debug(
-                        "replan_diag inference=%d source_seq=%d arrival_seq=%d frame_lag=%d "
-                        "wall_steps=%.2f discarded=%d underruns_since_last=%d last_was_hold=%s "
-                        "old_next_to_last=%s new_to_last=%s new_to_feedback=%s",
-                        inference_count,
-                        observation.seq,
-                        arrival_observation.seq,
-                        arrival_observation.seq - observation.seq,
-                        wall_steps,
-                        replacement.discarded_steps,
-                        underruns_since_last,
-                        publisher_snapshot.last_was_hold,
-                        old_next_to_last,
-                        _candidate_deltas(actions, publisher_snapshot.last_action),
-                        _candidate_deltas(actions, feedback_action),
-                    )
-                    _wait_for_plan_threshold(
-                        plan,
-                        publisher,
-                        stop,
-                        threshold=args.prefetch_steps,
-                        episode_deadline=episode_deadline,
-                    )
+                        if publisher_snapshot.last_action is None
+                        else f"{_arm_delta(appended.anchor_action, publisher_snapshot.last_action):.5f}"
+                    ),
+                    _candidate_deltas(actions, appended.anchor_action),
+                    _candidate_deltas(actions, feedback_action),
+                )
+                _wait_for_plan_threshold(
+                    plan,
+                    publisher,
+                    stop,
+                    threshold=interpolated_prefetch_steps,
+                    episode_deadline=episode_deadline,
+                )
+            else:
+                replacement = plan.replace(actions, observation.seq, args.execute_steps)
+                old_next_to_last = (
+                    "n/a"
+                    if replacement.old_next_action is None or publisher_snapshot.last_action is None
+                    else f"{_arm_delta(replacement.old_next_action, publisher_snapshot.last_action):.5f}"
+                )
+                wall_steps = float(timing["wall_ms"]) * args.control_hz / 1000.0
+                LOGGER.debug(
+                    "replan_diag inference=%d source_seq=%d arrival_seq=%d frame_lag=%d "
+                    "wall_steps=%.2f discarded=%d underruns_since_last=%d last_was_hold=%s "
+                    "old_next_to_last=%s new_to_last=%s new_to_feedback=%s",
+                    inference_count,
+                    observation.seq,
+                    arrival_observation.seq,
+                    arrival_observation.seq - observation.seq,
+                    wall_steps,
+                    replacement.discarded_steps,
+                    underruns_since_last,
+                    publisher_snapshot.last_was_hold,
+                    old_next_to_last,
+                    _candidate_deltas(actions, publisher_snapshot.last_action),
+                    _candidate_deltas(actions, feedback_action),
+                )
+                _wait_for_plan_threshold(
+                    plan,
+                    publisher,
+                    stop,
+                    threshold=args.prefetch_steps,
+                    episode_deadline=episode_deadline,
+                )
 
         if publisher.error is not None:
             raise RolloutError(f"action publisher failed: {publisher.error}")

@@ -7,8 +7,17 @@ dependencies = [
     "av>=14.0; python_version >= '3.11'",
     "numpy>=1.23",
     "opencv-python>=4.10",
+    "openpi-client",
     "pillow>=9.0",
+    # Undeclared runtime dependency of openpi-client (websocket_client_policy
+    # imports typing_extensions); declared here so the local venv is complete.
+    "typing-extensions>=4.0",
 ]
+
+# openpi-client is not on PyPI; it lives in the sibling OpenPI checkout on this
+# deployment machine. Keep the path in sync if the checkout moves.
+[tool.uv.sources]
+openpi-client = { path = "../OpenPI_UR/openpi/packages/openpi-client", editable = true }
 
 [project.scripts]
 marvinpro-rollout = "marvinpro_deploy.rollout_client:main"
@@ -25,6 +34,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/marvinpro_deploy"]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
 
 [tool.ruff]
 line-length = 120
