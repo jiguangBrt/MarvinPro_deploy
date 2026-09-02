@@ -217,6 +217,36 @@ uv run python -m marvinpro_deploy.rollout_client \
   --log-file "$RUN_DIR/rtc-merge1.log"
 ```
 
+### 5. rollout 数据录制
+
+客户端可以向另一仓库的 collector 进程上报 episode 边界（`episode_start` / `episode_end`，每条事件
+一行 JSON，走本地 TCP）。纯属尽力而为的通知：collector 不在线时只在确认提示前打印
+`THIS EPISODE WILL NOT BE RECORDED` 并记 WARNING，不影响运动、安全门控和退出流程；`episode_start`
+没送达就不再补发 `episode_end`，collector 不会看到半截状态。
+
+终端启动顺序（collector 必须先就绪，否则客户端启动检查会告警）：
+
+```bash
+# 终端 A：collector，监听 127.0.0.1:7931（命令见其仓库 README）
+# 终端 B：bridge（同前，--allow-motion）
+# 终端 C：客户端，在原命令上追加：
+PYTHONPATH=/home/jh/TianJi_Marvinpro/MarvinPro_deploy/src \
+uv run python -m marvinpro_deploy.rollout_client \
+  ... \
+  --log-file "$RUN_DIR/client.log" \
+  --record-notify-host 127.0.0.1
+```
+
+`--record-notify-host` 默认空（关闭通知），`--record-notify-port` 默认 `7931`。`episode_start` 在
+操作员输入 `E` 且运动门控确认打开之后、动作开始前发出，携带 `task`（prompt）、`run_dir`
+（由 `--log-file` 推出的日志目录，没有则为 null）和 `ts`。dry-run（无 `--execute`）默认不通知，
+离线联调时显式加 `--record-notify-without-execute`。
+
+操作员裁定流程：episode 正常结束（跑满时长 / 达到 merge 上限）发 `status=completed`，collector
+收到 `episode_end` 后提示操作员输入 `s`/`f`/`d` 裁定该段数据；操作员 `Ctrl+C` 发
+`status=operator_stopped`（最常见的结束方式，在客户端清理阶段发出，不阻塞退出）；程序主动安全
+中止（`fatal_safety_hold`、门控失效等）发 `status=aborted`，collector 自动丢弃该段，不提示裁定。
+
 ### 现场操作约定与安全门控
 
 - 程序打印实机状态后，必须手动输入单个大写 `E` 才开始动作；不建议首次执行使用 `--yes`。

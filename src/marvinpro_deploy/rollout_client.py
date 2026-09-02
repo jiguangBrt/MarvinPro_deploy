@@ -6,6 +6,7 @@ import argparse
 import csv
 from collections import deque
 from dataclasses import dataclass, replace
+import json
 import logging
 import math
 from pathlib import Path
@@ -68,7 +69,7 @@ _ACTIVE_STATE_LOG_INTERVAL_S = 0.10
 _HOLD_STATE_LOG_INTERVAL_S = 1.0
 _ACTION_NAMES = JOINT_NAMES[:7] + ("Gripper_L",) + JOINT_NAMES[7:] + ("Gripper_R",)
 _TRACKING_PLAYBACK_TIME_SCALE = 3.0
-_TRACKING_ALLOWED_TIME_SCALES = (1.0, _TRACKING_PLAYBACK_TIME_SCALE)
+_TRACKING_ALLOWED_TIME_SCALES = (1.0, 1.5, _TRACKING_PLAYBACK_TIME_SCALE)
 
 
 class JointTelemetryRecorder:
@@ -259,6 +260,85 @@ class JointTelemetryRecorder:
         self._rows.join()
         self._writer_thread.join(timeout=1.0)
         self._file.close()
+
+
+class _RecordingNotifier:
+    """Best-effort episode boundary notifications for the data collector.
+
+    Each event is sent as one JSON line over a fresh TCP connection with a
+    short total timeout. Delivery is fire-and-forget: any failure is logged as
+    a WARNING and never blocks or alters the rollout.
+    """
+
+    def __init__(self, host: str, port: int, *, timeout_s: float = 0.5) -> None:
+        self.host = host
+        self.port = port
+        self.timeout_s = timeout_s
+        self._started = False
+        self._ended = False
+
+    def _send_line(self, payload: bytes) -> None:
+        deadline = time.monotonic() + self.timeout_s
+        with socket.create_connection((self.host, self.port), timeout=self.timeout_s) as sock:
+            sock.settimeout(max(0.01, deadline - time.monotonic()))
+            sock.sendall(payload)
+
+    def probe(self) -> bool:
+        """Return True when the collector currently accepts a TCP connection."""
+        try:
+            with socket.create_connection((self.host, self.port), timeout=self.timeout_s):
+                return True
+        except Exception as exc:
+            LOGGER.warning(
+                "record_notify_unreachable host=%s port=%d error=%r",
+                self.host,
+                self.port,
+                exc,
+            )
+            return False
+
+    def notify(self, event: dict) -> bool:
+        """Send one event as a JSON line; return True when it was delivered."""
+        try:
+            self._send_line(json.dumps(event).encode("utf-8") + b"\n")
+            return True
+        except Exception as exc:
+            LOGGER.warning(
+                "record_notify_failed event=%s host=%s port=%d error=%r",
+                event.get("cmd"),
+                self.host,
+                self.port,
+                exc,
+            )
+            return False
+
+    def episode_start(self, *, task: str, run_dir: str | None) -> bool:
+        delivered = self.notify(
+            {
+                "cmd": "episode_start",
+                "task": task,
+                "run_dir": run_dir,
+                "ts": time.time(),
+            }
+        )
+        # episode_end is only attempted after a delivered start, so the
+        # collector never sees an end for an episode it does not know about.
+        self._started = delivered
+        return delivered
+
+    def episode_end(self, status: str, reason: str) -> None:
+        """Send episode_end at most once per run, only after a delivered start."""
+        if not self._started or self._ended:
+            return
+        self._ended = True
+        self.notify(
+            {
+                "cmd": "episode_end",
+                "status": status,
+                "reason": reason,
+                "ts": time.time(),
+            }
+        )
 
 
 class RolloutError(RuntimeError):
@@ -1875,6 +1955,7 @@ def _run_trajectory_schedule(
     policy,
     observation: RobotObservation,
     warmup_latencies_ms: list[float],
+    notifier: _RecordingNotifier | None = None,
 ) -> int:
     session_id = uuid.uuid4().hex
     command_ids = _CommandIds()
@@ -1932,6 +2013,11 @@ def _run_trajectory_schedule(
                 )
             else:
                 LOGGER.info("timed_sync_completion status=clean clean_chunks=%d", result.clean_chunks)
+            if notifier is not None:
+                if result.exhausted:
+                    notifier.episode_end("aborted", "stuck_exhausted")
+                else:
+                    notifier.episode_end("completed", "clean_completion")
             holding = _hold_bridge_position(
                 connection,
                 command_ids,
@@ -2705,6 +2791,11 @@ def _run_trajectory_schedule(
             estimator.epoch,
             policy_connection_generation,
         )
+        if notifier is not None:
+            if rtc_final_status == "clean_completion":
+                notifier.episode_end("completed", rtc_final_status)
+            else:
+                notifier.episode_end("aborted", rtc_final_status)
         holding = _hold_bridge_position(
             connection,
             command_ids,
@@ -2737,6 +2828,17 @@ def run(args: argparse.Namespace) -> int:
     stop = threading.Event()
     publisher: ActionPublisher | None = None
     reason = "rollout completed"
+    notifier: _RecordingNotifier | None = None
+    # Notifications require --execute by default so a dry-run never creates a
+    # guaranteed-worthless pending episode in the collector (and never prints
+    # "collector not running" scares); --record-notify-without-execute opts
+    # back in for offline collector integration testing.
+    if getattr(args, "record_notify_host", None) and (
+        args.execute or getattr(args, "record_notify_without_execute", False)
+    ):
+        notifier = _RecordingNotifier(args.record_notify_host, args.record_notify_port)
+    end_status: str | None = None
+    end_reason = ""
     try:
         telemetry_path = getattr(args, "telemetry_file", None)
         if telemetry_path:
@@ -2860,9 +2962,27 @@ def run(args: argparse.Namespace) -> int:
 
         if args.execute:
             observation = _wait_for_ready(connection, args.ready_timeout)
+            if notifier is not None and not notifier.probe():
+                print("\nWARNING: DATA COLLECTOR IS NOT RUNNING")
+                print(
+                    f"  No recorder answered at {notifier.host}:{notifier.port}; "
+                    "THIS EPISODE WILL NOT BE RECORDED.",
+                    flush=True,
+                )
             observation = _confirm_and_refresh_execution_observation(args, connection, observation)
         else:
             print("\nDRY RUN: policy inference and safety filtering only; no actions will be sent.")
+
+        if notifier is not None:
+            log_file = getattr(args, "log_file", None)
+            run_dir = str(Path(log_file).expanduser().resolve().parent) if log_file else None
+            if not notifier.episode_start(task=args.prompt, run_dir=run_dir):
+                print("\nWARNING: DATA COLLECTOR DID NOT ACKNOWLEDGE episode_start")
+                print(
+                    f"  Delivery to {notifier.host}:{notifier.port} failed; "
+                    "THIS EPISODE WILL NOT BE RECORDED.",
+                    flush=True,
+                )
 
         if args.rollout_schedule in ("synchronized", "tracking", "rtc"):
             inference_count = _run_trajectory_schedule(
@@ -2871,6 +2991,7 @@ def run(args: argparse.Namespace) -> int:
                 policy,
                 observation,
                 warmup_latencies_ms,
+                notifier=notifier,
             )
             print(f"\nTrajectory rollout finished: {inference_count} inferences.")
             LOGGER.info("trajectory_rollout_finished inferences=%d", inference_count)
@@ -3019,6 +3140,10 @@ def run(args: argparse.Namespace) -> int:
 
         if publisher.error is not None:
             raise RolloutError(f"action publisher failed: {publisher.error}")
+        if notifier is not None:
+            # The episode's motion is complete; the Input Mode None handoff
+            # below is cleanup and must not delay the collector notification.
+            notifier.episode_end("completed", "clean_completion")
         episode_snapshot = publisher.snapshot()
         if args.execute:
             _wait_for_none_after_rollout(
@@ -3058,16 +3183,21 @@ def run(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         reason = "operator interrupted rollout"
         LOGGER.warning(reason)
+        end_status, end_reason = "operator_stopped", reason
         return 130
     except (ConnectionError, OSError, ProtocolError, RolloutError, SafetyError) as exc:
         reason = f"rollout aborted: {exc}"
         LOGGER.error(reason)
+        end_status, end_reason = "aborted", str(exc)
         return 1
     except Exception as exc:
         reason = f"rollout aborted by unexpected error: {exc}"
         LOGGER.exception(reason)
+        end_status, end_reason = "aborted", str(exc)
         return 1
     finally:
+        if notifier is not None and end_status is not None:
+            notifier.episode_end(end_status, end_reason)
         stop.set()
         if publisher is not None:
             publisher.plan.clear()
@@ -3221,6 +3351,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "defaults to <log-file stem>.telemetry.csv"
         ),
     )
+    parser.add_argument(
+        "--record-notify-host",
+        help=(
+            "TCP host of the data collector to notify about episode boundaries "
+            "(episode_start/episode_end as JSON lines); default disables notifications"
+        ),
+    )
+    parser.add_argument(
+        "--record-notify-port",
+        type=int,
+        default=7931,
+        help="TCP port of the data collector for episode boundary notifications",
+    )
+    parser.add_argument(
+        "--record-notify-without-execute",
+        action="store_true",
+        help=(
+            "send episode boundary notifications even without --execute (dry-run); "
+            "default is to notify only during real execution"
+        ),
+    )
     args = parser.parse_args(argv)
     if (
         args.episode_seconds <= 0
@@ -3292,6 +3443,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--warmup-inferences cannot be negative")
     if args.yes and not args.execute:
         parser.error("--yes is only meaningful with --execute")
+    if args.record_notify_without_execute and not args.record_notify_host:
+        parser.error("--record-notify-without-execute requires --record-notify-host")
     return args
 
 
