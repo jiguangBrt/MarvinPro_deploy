@@ -1353,6 +1353,33 @@ class RecordingNotifierTest(unittest.TestCase):
         finally:
             collector.close()
 
+    def test_episode_end_reports_delivery(self):
+        # never started -> False, nothing sent
+        notifier = _RecordingNotifier("127.0.0.1", unused_tcp_port())
+        self.assertFalse(notifier.episode_end("completed", "clean_completion"))
+
+        # delivered start + delivered end -> True; a second end -> False, nothing more sent
+        collector = FakeCollector()
+        try:
+            notifier = _RecordingNotifier("127.0.0.1", collector.port)
+            self.assertTrue(notifier.episode_start(task="stack cones", run_dir=None))
+            self.assertTrue(notifier.episode_end("completed", "clean_completion"))
+            self.assertFalse(notifier.episode_end("aborted", "duplicate"))
+            events = collector.wait_events(2)
+            time.sleep(0.1)
+            self.assertEqual(events, collector.snapshot())
+            self.assertEqual([event["cmd"] for event in events], ["episode_start", "episode_end"])
+        finally:
+            collector.close()
+
+        # started but the end notification fails (collector gone) -> False
+        collector = FakeCollector()
+        notifier = _RecordingNotifier("127.0.0.1", collector.port)
+        self.assertTrue(notifier.episode_start(task="stack cones", run_dir=None))
+        collector.close()
+        with self.assertLogs("marvinpro_rollout", level="WARNING"):
+            self.assertFalse(notifier.episode_end("completed", "clean_completion"))
+
     def test_record_notify_configuration_defaults_to_disabled(self):
         args = parse_args([])
         self.assertIsNone(args.record_notify_host)

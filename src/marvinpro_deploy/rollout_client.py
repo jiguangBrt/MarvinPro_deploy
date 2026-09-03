@@ -326,18 +326,46 @@ class _RecordingNotifier:
         self._started = delivered
         return delivered
 
-    def episode_end(self, status: str, reason: str) -> None:
-        """Send episode_end at most once per run, only after a delivered start."""
+    def episode_end(self, status: str, reason: str) -> bool:
+        """Send episode_end at most once per run, only after a delivered start.
+        Returns True only when the notification was actually delivered (never started,
+        already ended, or a failed send all return False)."""
         if not self._started or self._ended:
-            return
+            return False
         self._ended = True
-        self.notify(
+        return self.notify(
             {
                 "cmd": "episode_end",
                 "status": status,
                 "reason": reason,
                 "ts": time.time(),
             }
+        )
+
+
+def _report_episode_end(notifier: _RecordingNotifier | None, status: str, reason: str) -> None:
+    """Send episode_end through the notifier and print operator-facing feedback that matches the
+    actual delivery — a skipped or failed send must not claim the collector was notified."""
+    if notifier is None:
+        return
+    if notifier.episode_end(status, reason):
+        if status == "aborted":
+            print(
+                f"  Collector notified: episode_end aborted ({reason}); "
+                "it auto-discards aborted episodes — no ruling needed.",
+                flush=True,
+            )
+        else:
+            print(
+                f"  Collector notified: episode_end {status} ({reason}); "
+                "please rule s/f/d on the collector terminal.",
+                flush=True,
+            )
+    else:
+        print(
+            "  Collector episode_end not delivered (episode was never started on the collector, "
+            "or the notification failed); check the collector terminal if you expected a ruling.",
+            flush=True,
         )
 
 
@@ -2013,11 +2041,10 @@ def _run_trajectory_schedule(
                 )
             else:
                 LOGGER.info("timed_sync_completion status=clean clean_chunks=%d", result.clean_chunks)
-            if notifier is not None:
-                if result.exhausted:
-                    notifier.episode_end("aborted", "stuck_exhausted")
-                else:
-                    notifier.episode_end("completed", "clean_completion")
+            if result.exhausted:
+                _report_episode_end(notifier, "aborted", "stuck_exhausted")
+            else:
+                _report_episode_end(notifier, "completed", "clean_completion")
             holding = _hold_bridge_position(
                 connection,
                 command_ids,
@@ -2791,11 +2818,10 @@ def _run_trajectory_schedule(
             estimator.epoch,
             policy_connection_generation,
         )
-        if notifier is not None:
-            if rtc_final_status == "clean_completion":
-                notifier.episode_end("completed", rtc_final_status)
-            else:
-                notifier.episode_end("aborted", rtc_final_status)
+        if rtc_final_status == "clean_completion":
+            _report_episode_end(notifier, "completed", rtc_final_status)
+        else:
+            _report_episode_end(notifier, "aborted", rtc_final_status)
         holding = _hold_bridge_position(
             connection,
             command_ids,
@@ -3140,10 +3166,9 @@ def run(args: argparse.Namespace) -> int:
 
         if publisher.error is not None:
             raise RolloutError(f"action publisher failed: {publisher.error}")
-        if notifier is not None:
-            # The episode's motion is complete; the Input Mode None handoff
-            # below is cleanup and must not delay the collector notification.
-            notifier.episode_end("completed", "clean_completion")
+        # The episode's motion is complete; the Input Mode None handoff
+        # below is cleanup and must not delay the collector notification.
+        _report_episode_end(notifier, "completed", "clean_completion")
         episode_snapshot = publisher.snapshot()
         if args.execute:
             _wait_for_none_after_rollout(
@@ -3184,6 +3209,11 @@ def run(args: argparse.Namespace) -> int:
         reason = "operator interrupted rollout"
         LOGGER.warning(reason)
         end_status, end_reason = "operator_stopped", reason
+        print(
+            "\nOperator stop (Ctrl+C) — stopping motion and shutting down; "
+            "the collector is notified best-effort during cleanup, watch the collector terminal.",
+            flush=True,
+        )
         return 130
     except (ConnectionError, OSError, ProtocolError, RolloutError, SafetyError) as exc:
         reason = f"rollout aborted: {exc}"
@@ -3196,8 +3226,8 @@ def run(args: argparse.Namespace) -> int:
         end_status, end_reason = "aborted", str(exc)
         return 1
     finally:
-        if notifier is not None and end_status is not None:
-            notifier.episode_end(end_status, end_reason)
+        if end_status is not None:
+            _report_episode_end(notifier, end_status, end_reason)
         stop.set()
         if publisher is not None:
             publisher.plan.clear()

@@ -74,7 +74,11 @@ GRIPPER_OPEN_RAW = 0.0
 GRIPPER_CLOSED_RAW = 1.25
 TOPIC_GRIPPER_FEEDBACK_L = "/tj/info/gripper_feedback_L"
 TOPIC_GRIPPER_FEEDBACK_R = "/tj/info/gripper_feedback_R"
-TOPIC_QUAD_IMAGE = "/quad_tile/compressed"
+# The camera node publishes both a raw fisheye quad and an undistorted quad
+# (per-camera factory calibration, applied in the mosaic node). Official
+# recordings — and therefore the training datasets — use the undistorted
+# stream; subscribe to the same to keep policy input train/serve consistent.
+TOPIC_QUAD_IMAGE = "/quad_tile/compressed_undistorted"
 TOPIC_INPUT_MODE = "/tj/control/input_mode"
 TOPIC_ROBOT_STATE = "/tj/info/robot_state"
 TOPIC_ARM_STATE = "/tj/info/arm_state"

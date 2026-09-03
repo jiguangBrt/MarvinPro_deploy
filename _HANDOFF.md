@@ -37,7 +37,9 @@ CUDA_VISIBLE_DEVICES=2 uv run scripts/serve_policy.py --port=8000 --default-prom
 ### 已按当前设备固定的接口
 
 - 现场接口：机器人控制与状态 topic 使用 `/tj` 命名空间；四宫格相机使用根路径
-  `/quad_tile/compressed`，`CompressedImage.format` 为 `h264`，客户端用有状态 PyAV 解码连续 H264
+  `/quad_tile/compressed_undistorted`（相机节点同时发布原始鱼眼流 `/quad_tile/compressed` 和
+  去畸变流；官方录制与训练数据集用去畸变流，为保持训练/部署一致本链路也用去畸变流），
+  `CompressedImage.format` 为 `h264`，客户端用有状态 PyAV 解码连续 H264
   包再按训练布局切分。
 - 观测/动作顺序：`[左臂7, 左夹爪, 右臂7, 右夹爪]`。关节单位 rad；policy server 输出已经过
   `AbsoluteActions`，是绝对关节目标。
@@ -72,7 +74,7 @@ cd /home/jh/TianJi_Marvinpro/MarvinPro_deploy
 ./scripts/run_bridge_on_controller.sh --doctor --duration 8
 ```
 
-预检不创建动作 publisher。以下输入必须都有消息：`/tj/joint_states`、`/quad_tile/compressed`、
+预检不创建动作 publisher。以下输入必须都有消息：`/tj/joint_states`、`/quad_tile/compressed_undistorted`、
 `/tj/control/input_mode`、`/tj/info/robot_state`、`/tj/info/arm_state`、
 `/tj/info/gripper_feedback_L/R`。相机没有消息时先在 Apex 启动 Camera。执行前还必须看到
 `input_mode=3`、两个状态数组均为 `(3, 3)`（关节阻抗模式）；dry-run 阶段可以仍为 None/`0`。
