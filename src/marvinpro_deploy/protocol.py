@@ -1,6 +1,6 @@
 """Framed, bidirectional bridge protocol.
 
-Pickle is deliberately used so the Python 3.10 ROS process can transport JPEG
+Pickle is deliberately used so the Python 3.10 ROS process can transport H264
 bytes without extra dependencies. It is unsafe on an untrusted network: only
 expose this bridge on the private robot LAN.
 """

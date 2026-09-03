@@ -100,7 +100,7 @@ uv run python -m marvinpro_deploy.rollout_client \
   --log-level DEBUG
 ```
 
-通过条件：没有版本错误、state/image stale、JPEG 饥饿或 policy shape/finite 错误。结束后保留完整日志。
+通过条件：没有版本错误、state/image stale、H264 饥饿或 policy shape/finite 错误。结束后保留完整日志。
 
 ## 4. 单 chunk tracking governor
 
@@ -122,7 +122,7 @@ reference、settle 时长、state/image skew、clipping、freeze 和 delay。hol
 `$RUN_DIR/rollout.telemetry.csv`；也可以用 `--telemetry-file` 指定路径。该 CSV 逐条
 记录 bridge 收到的实测 14 关节、bridge 100 Hz 插帧后的 `sent_target`，以及 legacy/prefetch 客户端的
 插帧请求和 safety-filter 后发送值；后两者分别在 `client_reference_*` 与 `client_command_*` 列中，
-并用 `record_type=bridge_state` 或 `client_command` 区分来源。绘图命令为：
+并用 `record_type=bridge_state`、`client_command` 或 `client_hold` 区分来源。绘图命令为：
 
 ```bash
 PYTHONPATH=/home/jh/TianJi_Marvinpro/MarvinPro_deploy/src \
@@ -913,7 +913,8 @@ shape、`d_pred=5`、`s=9`、`schedule=linear` 均返回 `invalid_rtc_request`�
   clean_completion。但因 `--playback-time-scale 3`（5Hz knot rate、3 倍慢放）只完成了约半个任务。
   数据采集时已放慢示教速度，无需再慢放。
 - 据此放开 argparse 门控：`synchronized/tracking/rtc` 的 `--playback-time-scale` 白名单从仅 3
-  放宽为 1 或 3（`rollout_client.py` 的 `_TRACKING_ALLOWED_TIME_SCALES`），其余非法值仍拒绝；
+  放宽为 1 或 3（`rollout_client.py` 的 `_TRACKING_ALLOWED_TIME_SCALES`，2026-09-02 起含 1.5），
+  其余非法值仍拒绝；
   新增 `test_rtc_schedule_allows_native_fifteen_hz_playback_scale`，pytest 107 passed。
   下游全部走 `effective_knot_hz = model_hz / time_scale`，15Hz 下 d_pred≈3（上限 4）仍有余量。
   该改动只在 client 侧，bridge 不需要重传。下一步：time-scale 1 原速 60s 跑，评估叠放精度。

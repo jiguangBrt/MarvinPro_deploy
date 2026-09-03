@@ -3454,7 +3454,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ):
             parser.error(
                 "synchronized/tracking/rtc requires --control-hz 100 --model-hz 15 "
-                "--playback-time-scale 1 or 3 (15 Hz or 5 Hz knot rate)"
+                "--playback-time-scale 1, 1.5 or 3 (15 Hz, 10 Hz or 5 Hz knot rate)"
             )
         if args.execute_steps != RTC_HORIZON:
             parser.error(f"synchronized/tracking/rtc requires --execute-steps {RTC_HORIZON}")

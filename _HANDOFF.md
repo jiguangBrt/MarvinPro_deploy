@@ -115,8 +115,9 @@ printf '%s\n' "$PWD/$RUN_DIR" | tee /tmp/marvinpro_run_dir
 ```
 
 终端 B。注意本仓库 argparse 强制 trajectory schedule 使用 `--control-hz 100 --model-hz 15
---playback-time-scale 3 --execute-steps 20`（固定 5 Hz knot rate、H=20）；legacy sync 仓库当年
-验证的 `--playback-time-scale 2 --execute-steps 10` 会被本仓库直接拒绝：
+--execute-steps 20`（H=20），`--playback-time-scale` 只放行 1/1.5/3（15/10/5 Hz knot rate），
+3 是 baseline 配置；legacy sync 仓库当年验证的 `--playback-time-scale 2 --execute-steps 10`
+会被本仓库直接拒绝：
 
 ```bash
 cd /home/jh/OpenPI_UR/openpi
@@ -140,7 +141,8 @@ uv run python -m marvinpro_deploy.rollout_client \
 ```
 
 指定 `--log-file` 后，客户端自动把逐条 telemetry 写入同名 `<stem>.telemetry.csv`（每行对应一次
-bridge state update 或 client command；`record_type` 字段区分 `bridge_state` 和 `client_command`）。
+bridge state update 或 client command；`record_type` 字段区分 `bridge_state`、`client_command` 和
+`client_hold`）。
 测试后生成关节角与夹爪命令/实测 feedback 对照图：
 
 ```bash
@@ -222,9 +224,10 @@ uv run python -m marvinpro_deploy.rollout_client \
 ### 5. rollout 数据录制
 
 客户端可以向另一仓库的 collector 进程上报 episode 边界（`episode_start` / `episode_end`，每条事件
-一行 JSON，走本地 TCP）。纯属尽力而为的通知：collector 不在线时只在确认提示前打印
-`THIS EPISODE WILL NOT BE RECORDED` 并记 WARNING，不影响运动、安全门控和退出流程；`episode_start`
-没送达就不再补发 `episode_end`，collector 不会看到半截状态。
+一行 JSON，走本地 TCP）。纯属尽力而为的通知：collector 不在线时在确认提示前打印
+`THIS EPISODE WILL NOT BE RECORDED` 并记 WARNING；`episode_start` 投递失败时确认之后还会打印
+`DID NOT ACKNOWLEDGE` 与 `THIS EPISODE WILL NOT BE RECORDED`。两种情形都不影响运动、安全门控和
+退出流程；`episode_start` 没送达就不再补发 `episode_end`，collector 不会看到半截状态。
 
 终端启动顺序（collector 必须先就绪，否则客户端启动检查会告警）：
 
@@ -270,14 +273,14 @@ uv run python -m marvinpro_deploy.rollout_client \
   7. 目标位于当前 M6-696 URDF 硬限位内并保留 `0.02 rad` 边界；
   8. bridge 收到的 action 不超过 `0.25 s`，且对应观测不超过 8 帧。
 - action chunk 暂时耗尽时，客户端发送当前测量位姿作为 hold，不会重复执行过时的预测动作。
-- bridge 使用 pickle 传输 JPEG 和数据结构，只能暴露在可信的机器人私有网络，不应映射到公网。
+- bridge 使用 pickle 传输 H264 和数据结构，只能暴露在可信的机器人私有网络，不应映射到公网。
 
 ### 轨迹执行语义要点（protocol v10）
 
 - `synchronized`、`tracking` 和 `rtc` 使用 bridge 本地 100 Hz trajectory owner；控制 timer 只对
-  连续 phase 求值，不会按 100 Hz 自动消费模型动作。三种 schedule 固定 `--model-hz 15
-  --playback-time-scale 3`（名义 5 Hz knot rate）或 2026-08-28 起放开的 `--playback-time-scale 1`
-  （15 Hz 原速），其他倍率会被客户端拒绝。
+  连续 phase 求值，不会按 100 Hz 自动消费模型动作。三种 schedule 固定 `--model-hz 15`，
+  `--playback-time-scale` 白名单为 3（名义 5 Hz knot rate）、2026-08-28 起放开的 1（15 Hz 原速）
+  与 2026-09-02 起放开的 1.5（10 Hz），其他倍率会被客户端拒绝。
 - tracking governor：`error <= 0.02 rad` 时 phase rate 为 1；`0.02..0.16 rad` 按
   `(0.16-error)/0.14` 线性降低；`>= 0.16 rad` 硬冻结，降到 `<= 0.12 rad` 才解除锁存；joint state
   stale、timer overrun 和 arm clipping 直接硬冻结。臂关节 safety clipping 包络 `0.16 rad`。
@@ -381,9 +384,9 @@ cd /home/jh/TianJi_Marvinpro/MarvinPro_deploy
   自动回 RTC。
 - **代码已同步 GitHub**：`tmp` 与 `main` 均在 `1099ccd`
   （`git@github.com:jiguangBrt/MarvinPro_deploy`）。
-- **下一步**：按 `cmd_tmp.md` 2026-08-31 09:47 段命令重跑 15 Hz 原速 600 s RTC
-  （日志目录名带任务描述 `rtc_redcones_600s_rec20_<时间>`；client 代码已变，bridge 可
-  沿用）；观察长时间运行下 recovery 频率、`ignoring stale bridge event` 次数、叠放精度，
+- **下一步**：重跑 15 Hz 原速 600 s RTC（`--episode-seconds 600 --max-rtc-recoveries 20`、
+  time-scale 1，日志目录名带任务描述 `rtc_redcones_600s_rec20_<时间>`；client 代码已变，
+  bridge 可沿用）；观察长时间运行下 recovery 频率、`ignoring stale bridge event` 次数、叠放精度，
   以及 `(1,12)` 是否在抓取/搬运阶段复现。
 - **2026-09-01 中优先级修复批次**（接 bc18107 的 P1 修复，已经过 review）：bridge 三处——
   ① `chunk_timeout_s` deadline 在 resume/merge 后重新武装（旧代码只在 Load 时武装，第二个
@@ -536,8 +539,8 @@ heartbeat 版本偏差、600 s 长跑（merge 10+ soak、recovery/stale-event �
 
 #### 第 3 轮：600 s 长跑验收轮（15 Hz 原速 RTC）
 
-命令按 `cmd_tmp.md` 2026-08-31 09:47 段（`--episode-seconds 600 --max-rtc-recoveries 20`、
-time-scale 1，RUN_DIR 命名 `rtc_redcones_600s_rec20_<时间>`）。观察点：
+命令：`--episode-seconds 600 --max-rtc-recoveries 20`、time-scale 1，RUN_DIR 命名
+`rtc_redcones_600s_rec20_<时间>`。观察点：
 
 - **heartbeat 版本偏差修复**：全程不得出现误判的 heartbeat 超时清轨迹；若出现客户端事件线程卡死
   但心跳线程仍活的僵尸场景，确认轨迹靠 plan 耗尽自然转 hold 兜底，而不是被误清。
@@ -598,9 +601,8 @@ time-scale 1，RUN_DIR 命名 `rtc_redcones_600s_rec20_<时间>`）。观察点�
   冷启动空样本（warmup/初次推理均被拒）时 `predicted_steps()` 的 RtcError 被判不可恢复
   fatal；版本不匹配的 `StopCommand` 只清 legacy target 不清活动轨迹会话；Load 时
   `knots[0]` 距实测位置无静态偏差检查（步长校验恒为空转，靠运行时 0.16 包络 + governor
-  兜底）；臂命令 BEST_EFFORT/depth1 与夹爪 RELIABLE/depth10 的 QoS 不一致；4 个 ROS
-  publish 在控制锁内执行；merge 事件的 boundary 跳变诊断基于无 blend 的差分，系统性
-  高估实际跳变。
+  兜底）；臂命令 BEST_EFFORT/depth1 与夹爪 RELIABLE/depth10 的 QoS 不一致；merge 事件的
+  boundary 跳变诊断基于无 blend 的差分，系统性高估实际跳变。
 - [ ] 按 [`ROBOT_RTC_TESTS.md`](ROBOT_RTC_TESTS.md) 执行新 checkpoint 下的 dry-run ->
   synchronized -> RTC shadow -> `--max-rtc-merges 1` 真机验收；merge 数按 1 -> 2 -> 10 逐级放大，
   不直接做 20-merge soak；每次使用独立 RUN_DIR，merge 与 fallback episode 分开统计。（已整合进

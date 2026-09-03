@@ -22,8 +22,8 @@
 - 方案 B 遗留问题：堆叠放置位置仍偏数厘米；目前怀疑是 sync 模式 chunk 间停顿造成的伪影，
   待本仓库 RTC 实际 merge 真机运行后复查。
 - 注意参数差异：legacy sync 仓库的基线是 `--playback-time-scale 2 --execute-steps 10`；本仓库的
-  argparse 强制 trajectory schedule 使用 `--playback-time-scale 3 --execute-steps 20`（固定 5 Hz
-  knot rate、H=20），旧参数会被本仓库客户端直接拒绝。
+  argparse 强制 trajectory schedule 使用 `--execute-steps 20`（H=20），`--playback-time-scale`
+  白名单为 1/1.5/3（3 即 baseline 的 5 Hz knot rate），旧参数会被本仓库客户端直接拒绝。
 - `MarvinPro_deploy_legacy_sync` 仓库需要 `/tj` topic 命名空间和 H264 解码补丁才能工作：机器人现在以
   `apex_ros_namespace:=tj` 运行，相机发布 h264 四宫格。
 
