@@ -401,6 +401,38 @@ cd /home/jh/TianJi_Marvinpro/MarvinPro_deploy
   `../OpenPI_UR/openpi/packages/openpi-client`）与 dev 组 pytest，本仓库 venv 可独立跑
   全部测试（129 passed）。
 
+## 2026-09-04/05 RECAP 首轮采集与链路变更
+
+- **RECAP 首轮真机采集（2026-09-04 19:42–19:55，8 次运动 run）**：5 条提交进
+  `/home/jh/tianji_tools/data/recap_redcones_20260904`（4 失败 / 1 成功，ep_000000–ep_000004；
+  相机全程稳定 30 fps，数据集 validate 通过）。3 条未提交：194926 为 robot_state=(2,12) 安全
+  中止（见待办区 (1,12) 条目）；194328/195342 的 episode_start 到达时 collector 仍在裁决/编码
+  上一条而被忽略——操作纪律：终端 2 回到 `[IDLE] 已存=N` 之后再按 E。注意 client 的通知是
+  TCP 投递即成功，collector 忽略时 client 终端仍会打印 "please rule"，以 collector 终端为准。
+- **采集端生产参数变更（2026-09-05 起）**：`--playback-time-scale 1.5`（15 Hz knot 以 10 Hz 墙钟
+  播放）+ `--episode-seconds 230`。原因：本机到 192.168.50.73 的推理链路走 WiFi（wlp0s20f3；
+  机器人链路是有线 enp49s0），09-04 实测全链路延迟 p50≈220–250 ms、p95≈270–320 ms（峰值
+  621 ms），超过 15 Hz 的 d_max=4 预算（p95 ≤216 ms），d_pred 每次 run 全被钳到 4，rtc_late
+  25–54 次/run（merges 仅 11–34），RTC 时间占比仅 29–50%，其余为同步回退 chunk + recovery
+  保持。停顿伪影对 RECAP 是标签噪声（value 目标为剩余帧数回归、advantage 为逐帧
+  V(t+15)−V(t)，经 222 代码核实），均匀慢速是一致可学习映射；10 Hz 预算放宽到 ~350 ms 可
+  容纳实测 p95。不同 time-scale 数据不进同一数据集目录；WiFi 改有线后应评估回到 time-scale 1。
+- **RECAP 契约 Tmax 120 s→240 s**：222 `docs/pi05_recap_marvinpro.md` 已更新（222 仓库
+  commit 5dd5507），`build_recap_value_targets.py` 与 `build_recap_sidecar.py` 必须带
+  `--max-episode-seconds 240`（每帧奖励 −1/max_episode_frames 自动跟随，失败回报仍归一到 −1；
+  漏 flag 会被 `episode_rewards` 显式拒收，不静默出错）。
+- **collector 远程模式收尾 bug（2026-09-04 修复，tianji_tools 33863f9）**：episode_end 后
+  drain 无界，bridge 持续推流使收尾永追不平（真机现象：episode 结束后 images/ 仍持续写入
+  新 PNG），且结束后的画面会混入 episode；已按进入时队列深度有界化（之后到达的帧排除并
+  打印计数），59 测试全绿 + 真机 dryrun 验证。同批：录制中事件等待 50→10 ms、批 4→8，
+  消费速率追平 30 fps 相机。
+- **gripper_feedback_L 间歇断流（2026-09-04 17:47 一次）**：client 因观测缺一路超时退出
+  （"timed out waiting for robot observation"）；该 topic 当时几乎全丢，其后自行恢复（复测
+  ~450 Hz 正常），原因未明（疑似控制器 backend 暂时性问题）。再遇同类报错先只读 echo 四路
+  输入（关节/双夹爪/相机）定位。
+- **采集四终端快捷脚本**：`quickstarts/recap_t1..t4_*.sh`（gitignored，本地专用；参数在脚本
+  顶部变量区）。完整四终端顺序与裁决流程另见 222 doc 采集章节（2026-09-05 已同步为现状）。
+
 ## 待办与已知问题
 
 ### 已知性能问题与优化方向（2026-08-17 调研）
@@ -571,7 +603,12 @@ heartbeat 版本偏差、600 s 长跑（merge 10+ soak、recovery/stale-event �
   （历史上曾记录到 `(2,3)`/`(1,3)` 瞬时抖动并自愈，本次未恢复）。重连机器人后先确认状态恢复
   `(3,3)`、Apex 无报警再重跑，复现时记录是否在抓取/搬运阶段。进展：18:01 重跑 60 s 全程
   `(3,3)` 未复现（`logs/rtc_20260828_180126`）；厂家确认状态码含义前保持观察（复现观察已排入
-  三轮计划第 2、3 轮）。
+  三轮计划第 2、3 轮）。**2026-09-04 复现变体 `(2,12)`**（RECAP 采集 run
+  `logs/recap_redcones_20260904_194926`）：运动中掉出 `(3,3)` 后手臂失去阻抗下垂（Joint1 实测
+  1.72→1.10 rad，表观 tracking error 冲 3.3 rad——下垂是结果非原因，掉状态前 12 次 merge 全过、
+  tracking 均值 0.02 rad），中间曾短暂自愈，19:50:06 卡在 `(2,12)`；bridge 阻断发布 → client
+  `fatal_safety_hold` → collector 按 aborted 自动丢弃（无脏数据进数据集），下一条 run（19:51）
+  门控正常。厂家确认时需同时问 `(1,12)` 与 `(2,12)` 两个状态码。
 - [x] **recovery 竞态（18:07 运行第三次 recovery，2026-08-31 已修复，commit bc18107）**：
   hold 锁存命令被 bridge `trajectory_command_rejected` 拒绝时 client 直接升级
   `fatal_safety_hold`，但 bridge 实际已自行安全 hold（`measured_holding` event）。
