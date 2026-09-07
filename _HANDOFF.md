@@ -309,6 +309,22 @@ uv run python -m marvinpro_deploy.rollout_client \
 
 ## 常用运维工具
 
+回 stack_two_cones 任务起始位（2026-09-07 起）：目标位姿是当天遥操作示教的新 home
+（非厂家 `home_joints`），记录在 `src/marvinpro_deploy/go_home.py` 的
+`STACK_TWO_CONES_HOME`（L1..L7, R1..R7，rad，已与 109 集遥操数据集首帧分布交叉核对）。
+脚本复用官方 `planner_joint_node` 的 `/tj/control/movej`（梯形规划 0.2 rad/s、
+0.5 rad/s^2、500 Hz，与 Apex Home 同一规划器），临时把 input mode 切到 2（planner），
+到位（14 关节误差 <=0.01 rad 且速度 <=0.02 rad/s 稳定 0.2 s）后恢复原模式。
+前提：Apex 已完成 Robot Ready、rollout bridge 已停止（检测到会拒绝执行）、急停可触及。
+手臂到位后默认再张开双夹爪（任务起始位含夹爪张开；会释放夹持物，`--keep-grippers`
+跳过）；`--check` 只读、不动夹爪：
+
+```bash
+cd /home/jh/Openpi_deploy
+./scripts/go_home_on_controller.sh          # 回 home
+./scripts/go_home_on_controller.sh --check  # 只读：报告当前位姿与各关节偏差，不运动
+```
+
 夹爪直接控制（Apex Home 无法让夹爪完全张开时使用；先停止 rollout 和 bridge，确认 Apex 没有运行
 Teleop/Replay，执行闭合前让手和物体离开夹爪；若检测到 rollout bridge 仍在运行，脚本会拒绝发布）：
 
