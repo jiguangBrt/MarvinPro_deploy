@@ -78,7 +78,7 @@ from .safety import (
     validate_action,
 )
 from .tracking import TrackingGovernor
-from .trajectory_timeline import BLEND_CAPS_BY_KNOT_HZ, TrajectoryTimeline, blend_knot_candidates
+from .trajectory_timeline import DEFAULT_BLEND_CAPS, TrajectoryTimeline, blend_knot_candidates
 
 
 def _now() -> float:
@@ -720,22 +720,16 @@ class MarvinBridgeNode(Node):
         blend = timeline.blend
         if blend is None:
             raise SafetyError("RTC replacement is missing its C1/C2 blend")
-        # Validated per-rate envelopes calibrated from teleop demonstrations
-        # are the default; explicit CLI overrides bypass the table entirely.
+        # A single permissive envelope (trajectory_timeline.DEFAULT_BLEND_CAPS)
+        # applies at every knot rate; explicit CLI overrides tighten it.
         overrides = (
             self.rtc_blend_max_velocity_rad_s,
             self.rtc_blend_max_acceleration_rad_s2,
             self.rtc_blend_max_jerk_rad_s3,
         )
-        default_caps = BLEND_CAPS_BY_KNOT_HZ.get(timeline.knot_hz)
-        if default_caps is None and any(cap is None for cap in overrides):
-            raise SafetyError(
-                f"no validated blend envelope for knot rate {timeline.knot_hz}; "
-                "set all --rtc-blend-max-* overrides to run at an unvalidated rate"
-            )
         velocity_cap, acceleration_cap, jerk_cap = (
             override if override is not None else default
-            for override, default in zip(overrides, default_caps or (0.0, 0.0, 0.0))
+            for override, default in zip(overrides, DEFAULT_BLEND_CAPS)
         )
         duration_s = blend.duration_phases / timeline.knot_hz
         sample_count = max(1, int(math.ceil(duration_s * self.publish_hz)))
@@ -2070,22 +2064,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--rtc-blend-max-velocity-rad-s",
         type=float,
         default=None,
-        help="override the blend velocity cap (rad/s); default uses the validated "
-        "per-knot-rate envelope (5 Hz: 0.45, 15 Hz: 1.7)",
+        help="override the blend velocity cap (rad/s); default is the permissive "
+        "catch-all envelope (3.2), still clamped per joint by the URDF velocity limits",
     )
     parser.add_argument(
         "--rtc-blend-max-acceleration-rad-s2",
         type=float,
         default=None,
-        help="override the blend acceleration cap (rad/s^2); default uses the validated "
-        "per-knot-rate envelope (5 Hz: 2.0, 15 Hz: 18.0)",
+        help="override the blend acceleration cap (rad/s^2); default is the permissive "
+        "catch-all envelope (100.0)",
     )
     parser.add_argument(
         "--rtc-blend-max-jerk-rad-s3",
         type=float,
         default=None,
-        help="override the blend jerk cap (rad/s^3); default uses the validated "
-        "per-knot-rate envelope (5 Hz: 40, 15 Hz: 380)",
+        help="override the blend jerk cap (rad/s^3); default is the permissive "
+        "catch-all envelope (5000.0)",
     )
     args = parser.parse_args(argv)
     if args.publish_hz <= 0 or args.command_timeout <= 0 or args.duration <= 0:

@@ -5,7 +5,8 @@
 本文件是 Marvin Pro 真机部署的唯一入口文档。文档结构：`README.md` 为仓库索引；本文为当前生产
 配置、真机快速开始、状态快照和待办与已知问题；[`ROBOT_RTC_TESTS.md`](ROBOT_RTC_TESTS.md) 为
 RTC/轨迹测试计划、诊断工具和带日期的测试记录；[`BASELINE_RUN.md`](BASELINE_RUN.md) 为基线与
-真机 A/B 记录。
+真机 A/B 记录；[`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) 为面向现场操作员的排障速查（按终端
+输出对照停机原因）。
 
 部署链路：
 
@@ -177,7 +178,6 @@ uv run python -m marvinpro_deploy.rollout_client \
   --model-hz 15 \
   --playback-time-scale 3 \
   --execute-steps 20 \
-  --max-rtc-recoveries 3 \
   --max-stuck-replans 2 \
   --policy-connect-timeout 5 \
   --policy-request-timeout 2 \
@@ -212,7 +212,6 @@ uv run python -m marvinpro_deploy.rollout_client \
   --model-hz 15 \
   --playback-time-scale 3 \
   --execute-steps 20 \
-  --max-rtc-recoveries 3 \
   --max-stuck-replans 2 \
   --policy-connect-timeout 5 \
   --policy-request-timeout 2 \
@@ -394,14 +393,15 @@ cd /home/jh/TianJi_Marvinpro/MarvinPro_deploy
   属于旧 request 的 deadline 事件，client 误判 `rtc_fatal`（`bridge deadline event belongs
   to another request`）——已改为只告警并忽略（旧 request 已被 recovery 握手取代，事件不
   影响在飞的 request）；② `--max-rtc-recoveries` 默认 3，耗尽后永久切到 synchronized
-  fallback（非 RTC 精度不可用）——长跑命令改用 `--max-rtc-recoveries 20`。仅 client 侧
+  fallback（非 RTC 精度不可用）——长跑命令改用 `--max-rtc-recoveries 20`（**2026-09-08 起
+  默认改为不限次数**，见下方 2026-09-08 条目）。仅 client 侧
   `rollout_client.py`，bridge 不用重启；117 tests passed。注意：单次 recovery 中间仍会
   执行一段 synchronized 过渡 chunk（无延迟补偿，精度差属固有），跑完一个 clean chunk 即
   自动回 RTC。
 - **代码已同步 GitHub**：`tmp` 与 `main` 均在 `1099ccd`
   （`git@github.com:jiguangBrt/MarvinPro_deploy`）。
-- **下一步**：重跑 15 Hz 原速 600 s RTC（`--episode-seconds 600 --max-rtc-recoveries 20`、
-  time-scale 1，日志目录名带任务描述 `rtc_redcones_600s_rec20_<时间>`；client 代码已变，
+- **下一步**：重跑 15 Hz 原速 600 s RTC（`--episode-seconds 600`、recovery 不限次数、
+  time-scale 1，日志目录名带任务描述 `rtc_redcones_600s_<时间>`；client 代码已变，
   bridge 可沿用）；观察长时间运行下 recovery 频率、`ignoring stale bridge event` 次数、叠放精度，
   以及 `(1,12)` 是否在抓取/搬运阶段复现。
 - **2026-09-01 中优先级修复批次**（接 bc18107 的 P1 修复，已经过 review）：bridge 三处——
@@ -449,6 +449,43 @@ cd /home/jh/TianJi_Marvinpro/MarvinPro_deploy
 - **采集四终端快捷脚本**：`quickstarts/recap_t1..t4_*.sh`（gitignored，本地专用；参数在脚本
   顶部变量区）。完整四终端顺序与裁决流程另见 222 doc 采集章节（2026-09-05 已同步为现状）。
 
+## 2026-09-08 提前中止调查与 blend 包络/recovery 修复
+
+- **"任务没跑完 B 终端就停并显示 ROLLOUT COMPLETE" 的调查结论**：该提示在
+  `rollout_client.py` 的 RTC runner 结束段对 clean_completion 与中止状态（stuck_exhausted
+  等）都会打印，随后锁存 hold 并等最多 60 s（`--exit-mode-timeout`）让操作员切 Input Mode
+  None——"暂停"就是这个等待。真实结局以日志 `rtc_final_status=` / `rollout aborted:` 为准。
+  近几天提前终止的原因分布：9/4 19:49、9/7 16:14（运动后 ~10 s）、16:15（~50 s）为控制器
+  `robot_state` 掉出 `(3,3)` 到 `(2,12)`/`(1,12)`（bridge 阻断发布 → `fatal_safety_hold`，
+  待厂家确认问题复现变密）；9/5、9/7 下午（rtc_newmodel）、9/8（bottle）全部是
+  `c2_blend_infeasible` 主导（10 Hz 下 bridge 用 9/2 红锥标定的 `1.1/10/210` 覆盖包络，
+  新模型 merge 边界速度 1.10-1.19 rad/s 超 1.1、jerk 最高 1168 超 210，6/4/3/2-knot 全部
+  不可行 → 原子拒绝 → recovery 的同步过渡 chunk 同样被拒，最重的 run 0 merges/21 recoveries
+  → `stuck_exhausted`）；另有两次 bottle run 在 recovery 的 hold 稳定等待上超时中止
+  （下条）。日志证据：上述各 `logs/` 目录 client.log/bridge.log。
+- **blend 包络放宽（bridge 侧，`trajectory_timeline.py` + `robot_bridge.py`）**：
+  `BLEND_CAPS_BY_KNOT_HZ` 分速率验证包络退役，改为所有 knot rate 统一的宽松默认
+  `DEFAULT_BLEND_CAPS = (3.2, 100.0, 5000.0)`；未验证 knot rate 不再被拒绝，
+  `quickstarts/recap_t3_motion_bridge.sh` 的三个 `--rtc-blend-max-*` 覆盖已删除（CLI 仍可
+  显式收紧）。blend 速度仍逐关节受 URDF 上限 min 约束（≤3.1416 rad/s）；0.16 rad 反馈包络、
+  tracking governor、URDF 位置限位、heartbeat/状态门控不变。操作前提：现场保持人工急停可达。
+  **bridge 代码有改动，下次真机运行必须重启 bridge（启动脚本自动 rsync 重传）。**
+- **recovery 稳定等待修复（client 侧，`rollout_client.py`）**：RTC 失败路径锁存 measured
+  hold 之后的 `_wait_bridge_tracking` / `_fresh_observation_after_source_time` 原来没有
+  try/except，超时以裸 `rollout aborted: timed out waiting for robot state` 逃出 runner，
+  不记 `rtc_final_status`（9/8 两次 bottle run；实际 state 流正常、并非断连，是阻抗 hold
+  稳态残差 0.0105-0.0124 rad 卡在 0.01 阈值上）。现已捕获转为
+  `rtc_final_status=fatal_safety_hold` 并正常走 hold/通知/退出流程；`_wait_bridge_tracking`
+  超时报文改为 `timed out waiting for bridge hold tracking`。注意：hold 残差略大于 0.01 rad
+  时 recovery 仍会失败（只是现在报告准确）；若新任务频繁触发，下一步再评估 settle 阈值
+  margin。pytest 161 passed（含 3 个新回归测试）。
+- **`--max-rtc-recoveries` 默认改为不限次数（client 侧）**：耗尽后永久切 synchronized
+  fallback 的行为只在显式传入上限时保留；`rtc_recovery_exhausted` 日志的 `max=` 字段在
+  不限时打印 `unlimited`。recovery 之间仍有"锁存 hold → 停稳 → 同步过渡段"的物理间隔，
+  不会紧密空转；`stuck_exhausted` 与 `fatal_safety_hold` 兜底终止不变。
+  `quickstarts/recap_t4_rollout_client.sh` 的 `--max-rtc-recoveries 20` 已删除。
+  pytest 162 passed。
+
 ## 待办与已知问题
 
 ### 已知性能问题与优化方向（2026-08-17 调研）
@@ -477,7 +514,8 @@ cd /home/jh/TianJi_Marvinpro/MarvinPro_deploy
    生成 quintic C2 blend。2026-08-28 起 blend 窗口按**秒**恒定（目标 `0.6 s`，knot 数随 knot rate
    缩放：5 Hz 候选 `(3, 2)`；15 Hz 候选 `(9, 6, 3, 2)`，并按剩余 checkpoint 距离裁剪），blend
    上限为按 knot rate 查表的显式包络 `BLEND_CAPS_BY_KNOT_HZ`（CLI `--rtc-blend-max-*` 可整体
-   覆盖）：5 Hz 为运行验证过的 `0.45 / 2.0 / 40`；15 Hz 由 `stack_cones_slow_260826` 遥操作数据
+   覆盖；**2026-09-08 起该表退役，改为全速率宽松默认 `DEFAULT_BLEND_CAPS=(3.2, 100, 5000)`，
+   见上方"2026-09-08"条目**）：5 Hz 为运行验证过的 `0.45 / 2.0 / 40`；15 Hz 由 `stack_cones_slow_260826` 遥操作数据
    （104 集原生 15 Hz：p99.9 = `0.556/2.34/49.8`，示教最大值 = `1.167/14.2/289`）标定为
    `max(3x p99.9, 1.3x max)` = **`1.7 / 18.0 / 380`**，URDF 速度上限仍逐关节取 min。不要用立方
    缩放外推 jerk 上限——窗口按秒恒定后接缝 jerk 只随速度差线性增长，立方外推（1080）会是示教
@@ -587,7 +625,8 @@ heartbeat 版本偏差、600 s 长跑（merge 10+ soak、recovery/stale-event �
 
 #### 第 3 轮：600 s 长跑验收轮（15 Hz 原速 RTC）
 
-命令：`--episode-seconds 600 --max-rtc-recoveries 20`、time-scale 1，RUN_DIR 命名
+命令：`--episode-seconds 600`、time-scale 1（recovery 次数默认不限，无需再传
+`--max-rtc-recoveries`），RUN_DIR 命名
 `rtc_redcones_600s_rec20_<时间>`。观察点：
 
 - **heartbeat 版本偏差修复**：全程不得出现误判的 heartbeat 超时清轨迹；若出现客户端事件线程卡死

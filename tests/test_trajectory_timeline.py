@@ -1,7 +1,7 @@
 import unittest
 
 from marvinpro_deploy.trajectory_timeline import (
-    BLEND_CAPS_BY_KNOT_HZ,
+    DEFAULT_BLEND_CAPS,
     TrajectoryTimeline,
     blend_knot_candidates,
 )
@@ -198,18 +198,19 @@ class BlendKnotCandidatesTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "2..9 knots"):
             timeline.with_c2_handoff(knot(0), blend_knots=10)
 
-    def test_blend_envelopes_cover_only_validated_knot_rates(self):
-        self.assertEqual(set(BLEND_CAPS_BY_KNOT_HZ), {5.0, 15.0})
-        for velocity, acceleration, jerk in BLEND_CAPS_BY_KNOT_HZ.values():
-            self.assertGreater(velocity, 0.0)
-            self.assertGreater(acceleration, 0.0)
-            self.assertGreater(jerk, 0.0)
+    def test_default_blend_caps_are_permissive_for_any_knot_rate(self):
+        velocity, acceleration, jerk = DEFAULT_BLEND_CAPS
+        self.assertGreater(velocity, 0.0)
+        self.assertGreater(acceleration, 0.0)
+        self.assertGreater(jerk, 0.0)
+        # The permissive guard must stay above every derivative observed in
+        # teleop and real rollouts so it only rejects catastrophic handoffs.
         # Teleop calibration (stack_cones_slow_260826, native 15 Hz):
-        # demonstrated maxima were 1.167 / 14.2 / 289; envelopes must exceed them.
-        velocity_15, acceleration_15, jerk_15 = BLEND_CAPS_BY_KNOT_HZ[15.0]
-        self.assertGreaterEqual(velocity_15, 1.167)
-        self.assertGreaterEqual(acceleration_15, 14.2)
-        self.assertGreaterEqual(jerk_15, 289.0)
+        # demonstrated maxima were 1.167 / 14.2 / 289; 2026-09-05..08 real
+        # rollouts saw rejected blends up to 1.19 / 2.7 / 1168.
+        self.assertGreaterEqual(velocity, 1.167)
+        self.assertGreaterEqual(acceleration, 14.2)
+        self.assertGreaterEqual(jerk, 1168.0)
 
 
 if __name__ == "__main__":

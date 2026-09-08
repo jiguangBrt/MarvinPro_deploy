@@ -941,3 +941,22 @@ shape、`d_pred=5`、`s=9`、`schedule=linear` 均返回 `invalid_rtc_request`�
   137-170 约 15-19，速度 1.22 < 1.7，均可通过。pytest 113 passed。
   **bridge 代码有改动，下次跑必须重启 bridge（重跑 run_bridge_on_controller.sh 即重传）。**
 - 待验证：15Hz 完整 60s 跑的 merge 成功率、recoveries 数与叠放精度。
+
+## 2026-09-08 blend 包络退役为宽松默认
+
+- `BLEND_CAPS_BY_KNOT_HZ`（5Hz `0.45/2.0/40`、15Hz `1.7/18.0/380`）退役，改为所有 knot rate
+  统一的宽松默认 `DEFAULT_BLEND_CAPS = (3.2, 100.0, 5000.0)`（`trajectory_timeline.py`）；
+  未验证 knot rate 不再被拒绝。blend 速度仍逐关节受 URDF 速度上限 min 约束（实际 ≤3.1416
+  rad/s），`--rtc-blend-max-*` 仍可显式收紧。原因：包络需要逐模型标定，而 2026-09-05/07/08
+  真机 run（10Hz 红锥 RECAP、rtc_newmodel、bottle）反复因 merge 边界速度 1.10-1.19 rad/s
+  超 1.1 覆盖上限、jerk 264-1168 超 210 被判 `c2_blend_infeasible`，多次 run 0 merge 直接
+  `stuck_exhausted`。剩余安全层不变：0.16 rad 反馈包络、tracking governor、URDF 位置限位、
+  heartbeat/状态门控、人工急停。
+- 同批修复（client 侧）：RTC 失败路径锁存 measured hold 之后的 `_wait_bridge_tracking` /
+  `_fresh_observation_after_source_time` 等待补上 try/except，失败转为
+  `rtc_final_status=fatal_safety_hold` 并正常通知 collector `aborted`，不再以裸
+  `rollout aborted: timed out waiting for robot state` 逃出 runner（2026-09-08 两次 bottle
+  run 的误导性中止）；`_wait_bridge_tracking` 超时报文改为
+  `timed out waiting for bridge hold tracking`。
+- pytest 161 passed。**bridge 代码有改动（包络默认值），下次真机运行必须重启 bridge
+  （run_bridge_on_controller.sh 会自动 rsync 并重传）。**

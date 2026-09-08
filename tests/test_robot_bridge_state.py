@@ -100,8 +100,8 @@ def test_bridge_cli_uses_current_governor_and_safety_envelope_defaults():
     assert args.tracking_run_error_rad == 0.02
     assert args.tracking_resume_error_rad == 0.12
     assert args.tracking_stop_error_rad == 0.16
-    # Blend caps default to the validated per-knot-rate envelope table
-    # (BLEND_CAPS_BY_KNOT_HZ); CLI flags are explicit overrides.
+    # Blend caps default to the permissive catch-all envelope
+    # (DEFAULT_BLEND_CAPS); CLI flags are explicit overrides that tighten it.
     assert args.rtc_blend_max_velocity_rad_s is None
     assert args.rtc_blend_max_acceleration_rad_s2 is None
     assert args.rtc_blend_max_jerk_rad_s3 is None
@@ -115,6 +115,28 @@ def test_bridge_cli_rejects_validation_envelope_below_trajectory_clipping_envelo
             assert exc.code == 2
         else:
             raise AssertionError("bridge accepted a validation envelope below the clipping envelope")
+
+
+def test_blend_validation_without_overrides_uses_permissive_default_caps():
+    node = _bare_node()
+    node.rtc_blend_max_velocity_rad_s = None
+    node.rtc_blend_max_acceleration_rad_s2 = None
+    node.rtc_blend_max_jerk_rad_s3 = None
+    # 10 Hz had no entry in the retired per-rate envelope table and was
+    # refused outright; every knot rate now falls back to DEFAULT_BLEND_CAPS.
+    timeline = robot_bridge.TrajectoryTimeline(
+        tuple(_arm_action(index * 0.005) for index in range(robot_bridge.RTC_HORIZON)),
+        10.0,
+        robot_bridge.RTC_EXECUTION_HORIZON,
+    )
+    handoff = timeline.with_c2_handoff(_arm_action(0.0), blend_knots=6)
+
+    max_velocity, max_acceleration, max_jerk = node._validate_rtc_blend_locked(handoff)
+
+    default_velocity, default_acceleration, default_jerk = robot_bridge.DEFAULT_BLEND_CAPS
+    assert 0.0 < max_velocity <= default_velocity
+    assert 0.0 <= max_acceleration <= default_acceleration
+    assert 0.0 <= max_jerk <= default_jerk
 
 
 def test_gripper_feedback_parser_preserves_q_velocity_torque_and_temperatures():

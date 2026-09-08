@@ -14,16 +14,17 @@ _GRIPPER_INDICES = (7, 15)
 _BLEND_TARGET_SECONDS = 0.6
 _MAX_BLEND_KNOTS = 9
 
-# Validated blend safety envelopes per knot rate: (velocity rad/s,
-# acceleration rad/s^2, jerk rad/s^3). The 5 Hz values are operationally
-# validated; the 15 Hz values are calibrated from the stack_cones_slow_260826
-# teleop dataset (104 episodes at native 15 Hz: p99.9 = 0.556/2.34/49.8,
-# demonstrated max = 1.167/14.2/289) as max(3x p99.9, 1.3x max).
-# Rates without a validated envelope are refused by the bridge.
-BLEND_CAPS_BY_KNOT_HZ = {
-    5.0: (0.45, 2.0, 40.0),
-    15.0: (1.7, 18.0, 380.0),
-}
+# Permissive blend safety guard applied identically at every knot rate:
+# (velocity rad/s, acceleration rad/s^2, jerk rad/s^3). The earlier per-rate
+# validated envelopes (5 Hz: 0.45/2.0/40, 15 Hz: 1.7/18.0/380, calibrated from
+# the stack_cones_slow_260826 teleop dataset) were retired on 2026-09-08: they
+# needed per-model recalibration and repeatedly aborted real-robot rollouts
+# with c2_blend_infeasible (2026-09-05/07/08 runs). The remaining guard only
+# rejects catastrophic handoffs; the bridge additionally clamps blend velocity
+# to the per-joint URDF velocity limits, and the 0.16 rad feedback envelope,
+# tracking governor, joint position limits and the operator e-stop stay in
+# place as the primary safety layers.
+DEFAULT_BLEND_CAPS = (3.2, 100.0, 5000.0)
 
 
 def blend_knot_candidates(knot_hz: float, max_knots: int) -> list[int]:

@@ -1470,7 +1470,17 @@ def _wait_bridge_tracking(
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise RolloutError("timed out waiting for bridge hold tracking")
-        state = connection.wait_for_state(timeout_s=remaining, newer_than=last_seq, require_motion_gate=True)
+        try:
+            state = connection.wait_for_state(
+                timeout_s=remaining, newer_than=last_seq, require_motion_gate=True
+            )
+        except RolloutError as exc:
+            # A near-deadline expiry inside wait_for_state would otherwise leak
+            # the generic "timed out waiting for robot state" and look like a
+            # bridge disconnect; report the actual wait instead.
+            if "timed out waiting" in str(exc):
+                raise RolloutError("timed out waiting for bridge hold tracking") from exc
+            raise
         last_seq = state.state_seq
         if state.raw_reference is None:
             stable_source_time = None
@@ -1992,6 +2002,9 @@ def _run_trajectory_schedule(
     effective_knot_hz = args.model_hz / args.playback_time_scale
     estimator = DelayEstimator()
     overhead_ema_ms = _RTC_OVERHEAD_SEED_MS
+    max_recoveries_label = (
+        "unlimited" if args.max_rtc_recoveries is None else str(args.max_rtc_recoveries)
+    )
     for latency_ms in warmup_latencies_ms:
         _record_rtc_delay_sample(
             estimator, latency_ms + overhead_ema_ms, effective_knot_hz, source="warmup"
@@ -2439,26 +2452,36 @@ def _run_trajectory_schedule(
                     LOGGER.error("rtc_final_status=fatal_safety_hold code=%s", failure.reason_code)
                     break
 
-                _, stable_source_time = _wait_bridge_tracking(
-                    connection,
-                    tolerance_rad=args.tracking_tolerance_rad,
-                    settle_seconds=args.tracking_settle_seconds,
-                    timeout_s=args.tracking_timeout,
-                )
-                observation = _fresh_observation_after_source_time(
-                    connection,
-                    stable_source_time,
-                    timeout_s=args.tracking_timeout,
-                    max_source_age_s=args.max_source_age,
-                    max_state_image_skew_s=args.max_state_image_skew,
-                )
+                try:
+                    _, stable_source_time = _wait_bridge_tracking(
+                        connection,
+                        tolerance_rad=args.tracking_tolerance_rad,
+                        settle_seconds=args.tracking_settle_seconds,
+                        timeout_s=args.tracking_timeout,
+                    )
+                    observation = _fresh_observation_after_source_time(
+                        connection,
+                        stable_source_time,
+                        timeout_s=args.tracking_timeout,
+                        max_source_age_s=args.max_source_age,
+                        max_state_image_skew_s=args.max_state_image_skew,
+                    )
+                except (RolloutError, SafetyError) as settle_exc:
+                    rtc_final_status = "fatal_safety_hold"
+                    LOGGER.error(
+                        "rtc_final_status=fatal_safety_hold code=%s settle_error=%r",
+                        failure.reason_code,
+                        str(settle_exc),
+                    )
+                    break
 
                 recovery_succeeded = False
                 fallback_finished = False
                 while True:
                     rtc_recovery_count += 1
-                    recover_rtc = (
-                        not args.rtc_shadow and rtc_recovery_count <= args.max_rtc_recoveries
+                    recover_rtc = not args.rtc_shadow and (
+                        args.max_rtc_recoveries is None
+                        or rtc_recovery_count <= args.max_rtc_recoveries
                     )
                     if args.rtc_shadow:
                         LOGGER.info("rtc_shadow_fallback auto_recovery=false")
@@ -2516,7 +2539,10 @@ def _run_trajectory_schedule(
                         if (
                             fallback_failure.recoverable
                             and recover_rtc
-                            and rtc_recovery_count < args.max_rtc_recoveries
+                            and (
+                                args.max_rtc_recoveries is None
+                                or rtc_recovery_count < args.max_rtc_recoveries
+                            )
                         ):
                             old_epoch = estimator.epoch
                             new_epoch = estimator.reset_epoch()
@@ -2567,9 +2593,9 @@ def _run_trajectory_schedule(
                             # recovery number max+1.
                             LOGGER.warning(
                                 "rtc_recovery_exhausted; switching to timed synchronized "
-                                "fallback recovery_id=%d max=%d",
+                                "fallback recovery_id=%d max=%s",
                                 rtc_recovery_count,
-                                args.max_rtc_recoveries,
+                                max_recoveries_label,
                             )
                             try:
                                 holding = _latch_measured_hold_with_retry(
@@ -2640,10 +2666,10 @@ def _run_trajectory_schedule(
                             "clean_completion" if args.rtc_shadow else "recovery_exhausted"
                         )
                         LOGGER.warning(
-                            "rtc_final_status=recovery_exhausted recoveries=%d max=%d; "
+                            "rtc_final_status=recovery_exhausted recoveries=%d max=%s; "
                             "timed synchronized fallback completed",
                             rtc_recovery_count,
-                            args.max_rtc_recoveries,
+                            max_recoveries_label,
                         )
                         fallback_finished = True
                         break
@@ -2706,12 +2732,15 @@ def _run_trajectory_schedule(
                             rtc_final_status = "fatal_safety_hold"
                             fallback_finished = True
                             break
-                        if rtc_recovery_count >= args.max_rtc_recoveries:
+                        if (
+                            args.max_rtc_recoveries is not None
+                            and rtc_recovery_count >= args.max_rtc_recoveries
+                        ):
                             LOGGER.warning(
                                 "rtc_recovery_exhausted; switching to timed synchronized "
-                                "fallback after bootstrap failure recovery_id=%d max=%d",
+                                "fallback after bootstrap failure recovery_id=%d max=%s",
                                 rtc_recovery_count,
-                                args.max_rtc_recoveries,
+                                max_recoveries_label,
                             )
                             try:
                                 holding = _latch_measured_hold_with_retry(
@@ -3324,7 +3353,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="seconds added to the nominal synchronized H20 chunk duration",
     )
     parser.add_argument("--max-stuck-replans", type=int, default=2)
-    parser.add_argument("--max-rtc-recoveries", type=int, default=3)
+    parser.add_argument(
+        "--max-rtc-recoveries",
+        type=int,
+        default=None,
+        help="cap on RTC recovery attempts per episode; default is unlimited "
+        "(recoveries repeat until the episode ends or a fatal/stuck status stops it)",
+    )
     parser.add_argument("--policy-connect-timeout", type=float, default=5.0)
     parser.add_argument("--policy-request-timeout", type=float, default=2.0)
     parser.add_argument("--warmup-inferences", type=int, default=1)
@@ -3414,7 +3449,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         or args.tracking_timeout <= 0
         or args.sync_chunk_timeout_grace < 0
         or args.max_stuck_replans < 1
-        or args.max_rtc_recoveries < 1
+        or (args.max_rtc_recoveries is not None and args.max_rtc_recoveries < 1)
         or args.policy_connect_timeout <= 0
         or args.policy_request_timeout <= 0
         or args.exit_mode_timeout <= 0

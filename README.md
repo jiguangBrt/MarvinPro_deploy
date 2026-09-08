@@ -16,6 +16,8 @@ rollout 客户端运行在本机；机器人控制器只运行轻量 ROS bridge�
   日志约定、状态快照、待办与已知问题。
 - [`ROBOT_RTC_TESTS.md`](ROBOT_RTC_TESTS.md)：RTC/轨迹测试计划、调度与轨迹诊断工具、RTC 决策记录、
   异步 action chunk 错位分析，以及全部带日期的真机测试记录。
+- [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md)：现场排障速查——按终端输出对照机器人为什么停了、
+  怎么办（通俗版，面向操作员）。
 - [`BASELINE_RUN.md`](BASELINE_RUN.md)：基线记录——2026-08-07 历史 sync 基线（旧 checkpoint/prompt）
   和 2026-08-27/28 真机 A/B 结论。
 
