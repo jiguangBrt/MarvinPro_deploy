@@ -14,10 +14,12 @@ dependencies = [
     "typing-extensions>=4.0",
 ]
 
-# openpi-client is not on PyPI; it lives in the sibling OpenPI checkout on this
-# deployment machine. Keep the path in sync if the checkout moves.
+# openpi-client is not on PyPI, so a copy is vendored under vendor/ (from the
+# fork at github.com/jiguangBrt/openpi @ f572176, packages/openpi-client, which
+# carries local fixes that upstream lacks). To pick up upstream fixes, re-copy
+# that directory and re-run `uv lock`.
 [tool.uv.sources]
-openpi-client = { path = "../OpenPI_UR/openpi/packages/openpi-client", editable = true }
+openpi-client = { path = "vendor/openpi-client" }
 
 [project.scripts]
 marvinpro-rollout = "marvinpro_deploy.rollout_client:main"
@@ -36,7 +38,10 @@ build-backend = "hatchling.build"
 packages = ["src/marvinpro_deploy"]
 
 [dependency-groups]
-dev = ["pytest>=8.0"]
+dev = [
+    "matplotlib>=3.7",  # scripts/plot_rollout_joints.py
+    "pytest>=8.0",
+]
 
 [tool.ruff]
 line-length = 120

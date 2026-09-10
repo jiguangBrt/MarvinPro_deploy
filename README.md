@@ -32,10 +32,27 @@ rollout 客户端运行在本机；机器人控制器只运行轻量 ROS bridge�
   仅保留为 A/B 对照基线。
 - 每次真机运行必须使用全新 `RUN_DIR` 记录 bridge/client 日志和 telemetry CSV。
 
-## 本地测试
+## 从零开始部署（新机器）
 
 ```bash
-cd /home/jh/Openpi_deploy
+git clone https://github.com/jiguangBrt/MarvinPro_deploy.git
+cd MarvinPro_deploy
 uv sync
-PYTHONPATH=src .venv/bin/python -m pytest tests/ -q
+.venv/bin/python -m pytest tests/ -q
 ```
+
+`uv sync` 使用仓库内 vendor 的 `openpi-client`（`vendor/openpi-client`，见 `pyproject.toml` 的
+`[tool.uv.sources]`），不需要本机预先检出 OpenPI 仓库。`uv` 本身的安装见
+<https://docs.astral.sh/uv/>。
+
+注意：如果 shell 里 source 了 ROS（`PYTHONPATH` 指向 `/opt/ros/...`），pytest 自动加载 ROS 的
+`launch_testing` 插件会崩溃，运行时加前缀 `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`。
+
+运行前提（不在本仓库范围内）：
+
+- **rollout 客户端**：只依赖上面的 venv，通过 `--robot-host` / `--policy-host` 连现场设备；
+  默认值见 `src/marvinpro_deploy/config.py`，均可用命令行覆盖。
+- **机器人端 bridge**：运行在机器人控制器上，需要 ROS 2 环境和 `marvin_msgs` 消息包
+  （随控制器 Apex 环境提供）；用 `./scripts/run_bridge_on_controller.sh` 自动 rsync 到控制器执行。
+- **policy server**：GPU 机器上的 OpenPI 仓库 + 训练 checkpoint，启动命令见
+  [`_HANDOFF.md`](_HANDOFF.md)。

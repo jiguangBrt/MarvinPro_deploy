@@ -62,6 +62,9 @@ CUDA_VISIBLE_DEVICES=2 uv run scripts/serve_policy.py --port=8000 --default-prom
 推荐顺序：只读预检 -> dry-run -> synchronized 回归 -> RTC shadow -> RTC 实际 merge。每步的完整
 验收标准见 [`ROBOT_RTC_TESTS.md`](ROBOT_RTC_TESTS.md)。
 
+以下命令均在本仓库根目录执行；`uv run` 自动使用本仓库 venv（`uv sync` 后即可用，含
+openpi-client，不再依赖旁边的 OpenPI 检出）。bridge 相关脚本会自动 rsync 到机器人控制器执行。
+
 **每次真机运行必须记录日志。** 客户端 telemetry CSV 以 `"w"` 覆盖模式打开，复用同名文件会丢失
 上一段数据（2026-08-19 覆盖事故见 [`ROBOT_RTC_TESTS.md`](ROBOT_RTC_TESTS.md) 的 RTC 决策记录），
 因此每个 episode 必须使用全新 `RUN_DIR`（`logs/` 已被 `.gitignore` 忽略，按
@@ -71,7 +74,6 @@ CUDA_VISIBLE_DEVICES=2 uv run scripts/serve_policy.py --port=8000 --default-prom
 ### 0. 机器人端只读预检
 
 ```bash
-cd /home/jh/TianJi_Marvinpro/MarvinPro_deploy
 ./scripts/run_bridge_on_controller.sh --doctor --duration 8
 ```
 
@@ -85,8 +87,6 @@ cd /home/jh/TianJi_Marvinpro/MarvinPro_deploy
 终端 A 启动不允许运动的 bridge（`./scripts/run_bridge_on_controller.sh`），终端 B：
 
 ```bash
-cd /home/jh/OpenPI_UR/openpi
-PYTHONPATH=/home/jh/TianJi_Marvinpro/MarvinPro_deploy/src \
 uv run python -m marvinpro_deploy.rollout_client \
   --robot-host 6.6.7.100 \
   --policy-host 192.168.50.73 \
@@ -106,7 +106,6 @@ Camera 启动；不要在出厂打包姿态直接 Home；Input Mode 先保持 No
 motion bridge：
 
 ```bash
-cd /home/jh/TianJi_Marvinpro/MarvinPro_deploy
 RUN_DIR=logs/synchronized_$(date +%Y%m%d_%H%M%S) && mkdir -p "$RUN_DIR"
 printf '%s\n' "$PWD/$RUN_DIR" | tee /tmp/marvinpro_run_dir
 ./scripts/run_bridge_on_controller.sh \
@@ -121,9 +120,7 @@ printf '%s\n' "$PWD/$RUN_DIR" | tee /tmp/marvinpro_run_dir
 会被本仓库直接拒绝：
 
 ```bash
-cd /home/jh/OpenPI_UR/openpi
 export RUN_DIR="$(cat /tmp/marvinpro_run_dir)"
-PYTHONPATH=/home/jh/TianJi_Marvinpro/MarvinPro_deploy/src \
 uv run python -m marvinpro_deploy.rollout_client \
   --robot-host 6.6.7.100 \
   --policy-host 192.168.50.73 \
@@ -147,9 +144,7 @@ bridge state update 或 client command；`record_type` 字段区分 `bridge_stat
 测试后生成关节角与夹爪命令/实测 feedback 对照图：
 
 ```bash
-PYTHONPATH=/home/jh/TianJi_Marvinpro/MarvinPro_deploy/src \
-/home/jh/OpenPI_UR/openpi/.venv/bin/python \
-scripts/plot_rollout_joints.py \
+uv run python scripts/plot_rollout_joints.py \
   "$RUN_DIR/client.telemetry.csv" \
   -o "$RUN_DIR/joint_diagnostics.png"
 ```
@@ -160,9 +155,7 @@ synchronized 回归通过后，按同样的 RUN_DIR 约定运行 continuous RTC 
 合并，shadow 随后固定降级 synchronized，不自动重进 RTC）：
 
 ```bash
-cd /home/jh/OpenPI_UR/openpi
 export RUN_DIR="$(cat /tmp/marvinpro_run_dir)"
-PYTHONPATH=/home/jh/TianJi_Marvinpro/MarvinPro_deploy/src \
 uv run python -m marvinpro_deploy.rollout_client \
   --robot-host 6.6.7.100 \
   --policy-host 192.168.50.73 \
@@ -194,9 +187,7 @@ replacement merge 无抽动后，再按 [`ROBOT_RTC_TESTS.md`](ROBOT_RTC_TESTS.m
 尝试都要新建 `RUN_DIR`：
 
 ```bash
-cd /home/jh/OpenPI_UR/openpi
 export RUN_DIR="$(cat /tmp/marvinpro_run_dir)"
-PYTHONPATH=/home/jh/TianJi_Marvinpro/MarvinPro_deploy/src \
 uv run python -m marvinpro_deploy.rollout_client \
   --robot-host 6.6.7.100 \
   --policy-host 192.168.50.73 \
@@ -234,7 +225,6 @@ uv run python -m marvinpro_deploy.rollout_client \
 # 终端 A：collector，监听 127.0.0.1:7931（命令见其仓库 README）
 # 终端 B：bridge（同前，--allow-motion）
 # 终端 C：客户端，在原命令上追加：
-PYTHONPATH=/home/jh/TianJi_Marvinpro/MarvinPro_deploy/src \
 uv run python -m marvinpro_deploy.rollout_client \
   ... \
   --log-file "$RUN_DIR/client.log" \
@@ -319,7 +309,6 @@ uv run python -m marvinpro_deploy.rollout_client \
 跳过）；`--check` 只读、不动夹爪：
 
 ```bash
-cd /home/jh/Openpi_deploy
 ./scripts/go_home_on_controller.sh          # 回 home
 ./scripts/go_home_on_controller.sh --check  # 只读：报告当前位姿与各关节偏差，不运动
 ```
@@ -328,8 +317,6 @@ cd /home/jh/Openpi_deploy
 Teleop/Replay，执行闭合前让手和物体离开夹爪；若检测到 rollout bridge 仍在运行，脚本会拒绝发布）：
 
 ```bash
-cd /home/jh/TianJi_Marvinpro/MarvinPro_deploy
-
 # 同时完全打开 / 闭合左右夹爪
 ./scripts/control_gripper_on_controller.sh 0
 ./scripts/control_gripper_on_controller.sh 1
@@ -343,7 +330,6 @@ cd /home/jh/TianJi_Marvinpro/MarvinPro_deploy
 `logs/`，`Ctrl+C` 结束后看 `changed`、`distinct`、`span`、`max_step` 摘要）：
 
 ```bash
-cd /home/jh/TianJi_Marvinpro/MarvinPro_deploy
 ./scripts/record_gripper_feedback_on_controller.sh
 ```
 
@@ -416,6 +402,13 @@ cd /home/jh/TianJi_Marvinpro/MarvinPro_deploy
   及其 helper）；`pyproject.toml` 补齐 `openpi-client`（uv sources 指向
   `../OpenPI_UR/openpi/packages/openpi-client`）与 dev 组 pytest，本仓库 venv 可独立跑
   全部测试（129 passed）。
+- **部署可移植化（2026-09-10）**：`openpi-client` 的 uv source 从本机相对路径改为仓库内 vendor
+  副本 `vendor/openpi-client`（来自 fork `jiguangBrt/openpi` @ `f572176` 的
+  `packages/openpi-client`，与实机验证版本一致；曾尝试 git 子目录依赖，但 uv 会递归拉取 OpenPI
+  全部 submodule，新机器上不可行）；`quickstarts/` 纳入版本控制（`TROUBLESHOOTING.md` 引用的
+  T1-T4 采集脚本）；dev 组补 `matplotlib`（`scripts/plot_rollout_joints.py` 依赖）；README 增加
+  从零开始部署步骤，本文快速开始命令改为仓库根目录 + 本仓库 venv（`uv run`），不再引用
+  `/home/jh/...` 路径和 OpenPI 检出的 venv。新机器 `git clone && uv sync` 即可跑通全部测试。
 
 ## 2026-09-04/05 RECAP 首轮采集与链路变更
 
